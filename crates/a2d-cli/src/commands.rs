@@ -383,9 +383,9 @@ mod tests {
 
     #[test]
     fn an_unknown_importer_name_lists_the_valid_ones() {
-        let err = resolve_importer(Path::new("."), Some("genshin")).unwrap_err();
+        let err = resolve_importer(Path::new("."), Some("not_a_known_shape")).unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("genshin"), "{text}");
+        assert!(text.contains("not_a_known_shape"), "{text}");
         for name in ["generic", "spine_bytes", "unity_cubism", "unity_spine"] {
             assert!(text.contains(name), "{text}");
         }

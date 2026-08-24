@@ -249,8 +249,8 @@ fn an_unknown_importer_name_is_refused() {
     let dir = temp_dir("bad-game");
     Fixture::spine_json().write_to(dir.path());
     let mut out = Vec::new();
-    let err = a2d_cli::inspect(&mut out, dir.path(), Some("genshin")).unwrap_err();
-    assert!(err.to_string().contains("genshin"), "{err}");
+    let err = a2d_cli::inspect(&mut out, dir.path(), Some("not_a_known_shape")).unwrap_err();
+    assert!(err.to_string().contains("not_a_known_shape"), "{err}");
 }
 
 #[test]
