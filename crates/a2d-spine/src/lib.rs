@@ -8,6 +8,8 @@
 
 pub mod atlas;
 pub mod detect;
+pub mod json;
+pub mod normalize;
 pub mod reader;
 
 pub use atlas::parse_atlas;
