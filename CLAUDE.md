@@ -15,18 +15,23 @@ Unity-packaged variants. Target games for importers: 放置少女 (Depose Girls)
 
 Primary objective: **correct character playback for desktop viewing.** Nothing else.
 
-**Current phase:** Phase 1 complete for the Spine path; Phase 2 partially complete;
-Phase 6 implemented.
+**Current phase:** Phase 1 complete for the Spine path; Phase 2 feature-complete but its
+goal is unverified without real assets; Phase 6 implemented.
 
 Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x),
-`a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints, mixing,
+`a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints in all four
+modes, mixing,
 idle), `a2d-pack`, `a2d-import` (generic + aeons_echo), `a2d-render` (wgpu, batching, blend
 modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transparent frameless
 window, drag, scale, click-through, always-on-top, tray, config persistence), `a2d-cli`.
 
 Not implemented: `a2d-unity`, `a2d-cubism`.
 Known gaps, all reported rather than silently ignored: Spine 4.x and 2.x binary layouts,
-path constraints, transform constraints in local/relative mode.
+and path constraints, which are decoded into the IR but not yet evaluated.
+
+The four transform-constraint modes are pinned by property tests, not by comparison against
+the official runtime. The §11 cross-implementation check is still outstanding and is what
+would catch a term in the wrong place.
 
 `a2d-cubism` is blocked on the Cubism Core decision in §13.1, which is why §12's first
 task has not been started.

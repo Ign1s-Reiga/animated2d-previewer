@@ -121,7 +121,7 @@ animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開�
 | --- | --- |
 | `a2d-core` | **実装済み** — IR、数学、`AnimatedModel`、`RenderMesh`、エラー分類、`LoadReport` |
 | `a2d-spine` | **実装済み（3.x / JSON 4.x）** — atlas パーサ、内容ベースのバージョン検出、JSON デコーダ（2.x/3.x/4.x 方言）、バイナリデコーダ（3.x）、正規化 |
-| `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント、トラック／キュー／クロスフェード、idle ロジック |
+| `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント（world / local × absolute / relative の 4 モード）、トラック／キュー／クロスフェード、idle ロジック |
 | `a2d-pack` | **実装済み** — 決定論的な `model.bin`、`manifest.json`、`validate` |
 | `a2d-import` | **実装済み（generic / aeons_echo）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
 | `a2d-cli` | **実装済み** — `inspect` / `import` / `validate` / `preview`（実描画・PNG 出力対応） |
@@ -131,8 +131,8 @@ animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開�
 | `a2d-cubism` | **未実装** — MOC3 の扱いが未決定のため着手していません（下記「未決定事項」） |
 
 未対応の機能は黙って無視されるのではなく、`LoadReport` として `inspect` / `import` /
-`validate` に必ず出力されます。既知の未対応: Spine 4.x バイナリ、Spine 2.x バイナリ、
-path コンストレイント、transform コンストレイントの local / relative モード。
+`validate` に必ず出力されます。既知の未対応: Spine 4.x バイナリ、Spine 2.x バイナリ、path コンストレイント
+（IR には取り込まれますが、まだ評価されません）。
 
 ```bash
 animated2d preview character.a2dpack            # デスクトップビューアで開く
