@@ -19,9 +19,10 @@ Primary objective: **correct character playback for desktop viewing.** Nothing e
 
 Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x),
 `a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints, mixing,
-idle), `a2d-pack`, `a2d-import` (generic + aeons_echo), `a2d-cli`.
+idle), `a2d-pack`, `a2d-import` (generic + aeons_echo), `a2d-render` (wgpu, batching, blend
+modes, stencil clipping, offscreen render + read-back), `a2d-cli`.
 
-Not implemented: `a2d-render` (wgpu), `a2d-desktop`, `a2d-unity`, `a2d-cubism`.
+Not implemented: `a2d-desktop`, `a2d-unity`, `a2d-cubism`.
 Known gaps, all reported rather than silently ignored: Spine 4.x and 2.x binary layouts,
 path constraints, transform constraints in local/relative mode.
 

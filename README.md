@@ -11,9 +11,10 @@
 
 インポータの初期対象タイトル: 放置少女 / AEONS ECHO / NIKKE
 
-> **ステータス: Phase 1 実装済み（Spine 経路）**
-> Spine アセットの検出・デコード・正規化・パッケージ化・アニメーション評価と CLI が動作します。
-> GPU レンダラ、デスクトップウィンドウ、Cubism / Unity 経路は未実装です。
+> **ステータス: Phase 1 完了（Spine 経路）／Phase 2 一部完了**
+> Spine アセットの検出・デコード・正規化・パッケージ化・アニメーション評価・GPU 描画と
+> CLI が動作します。`animated2d preview` は実際に wgpu で描画し PNG を書き出せます。
+> デスクトップウィンドウと Cubism / Unity 経路は未実装です。
 > 詳細は下の「実装状況」を参照してください。
 
 ---
@@ -124,8 +125,8 @@ animated2d preview  <package>                # ビューアで直接開く
 | `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント、トラック／キュー／クロスフェード、idle ロジック |
 | `a2d-pack` | **実装済み** — 決定論的な `model.bin`、`manifest.json`、`validate` |
 | `a2d-import` | **実装済み（generic / aeons_echo）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
-| `a2d-cli` | **実装済み** — `inspect` / `import` / `validate` / `preview` |
-| `a2d-render` | **未実装** — wgpu レンダラ |
+| `a2d-cli` | **実装済み** — `inspect` / `import` / `validate` / `preview`（実描画・PNG 出力対応） |
+| `a2d-render` | **実装済み** — wgpu 描画、テクスチャキャッシュ、バッチング、4 ブレンドモード、ステンシルクリッピング、high-DPI、透過背景、オフスクリーン描画と読み戻し |
 | `a2d-desktop` | **未実装** — 透過ウィンドウ、トレイ |
 | `a2d-unity` | **未実装** — Unity serialized file リーダ |
 | `a2d-cubism` | **未実装** — MOC3 の扱いが未決定のため着手していません（下記「未決定事項」） |
@@ -133,6 +134,14 @@ animated2d preview  <package>                # ビューアで直接開く
 未対応の機能は黙って無視されるのではなく、`LoadReport` として `inspect` / `import` /
 `validate` に必ず出力されます。既知の未対応: Spine 4.x バイナリ、Spine 2.x バイナリ、
 path コンストレイント、transform コンストレイントの local / relative モード。
+
+```bash
+animated2d preview character.a2dpack -o frames/
+```
+
+`preview` は `0.0s / 0.25s / 0.5s / 1.0s` を描画し、メッシュ数・ドローコール数・
+三角形数・フレームバッファのフィンガープリントを表示します。`-o` を付けると各フレームを
+PNG として書き出します。GPU が無い環境ではエラーになります（テストはスキップされます）。
 
 ## 開発環境
 
