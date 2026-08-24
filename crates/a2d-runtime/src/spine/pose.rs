@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use a2d_core::ir::ids::{AttachmentId, BoneId, SkinId, SlotId};
-use a2d_core::ir::spine::{BoneLocal, ConstraintKind, SpineIr, TransformInherit, DEFAULT_SKIN};
+use a2d_core::ir::spine::{BoneLocal, ConstraintKind, SpineIr, TransformConstraint, TransformInherit, DEFAULT_SKIN};
 use a2d_core::{Affine2, Degradation, LoadReport, Rgb, Rgba, Vec2};
 
 /// Per-bone pose: the applied local transform plus the derived world transform.
@@ -585,17 +585,21 @@ impl SkeletonPose {
         let Some(constraint) = self.ir.transform_constraints.get(index).cloned() else { return };
         let Some(mix) = self.transform.get(index).copied() else { return };
 
-        if constraint.local || constraint.relative {
-            // Absolute-world is the mode target assets use. The other three are
-            // parsed and reported rather than silently mis-evaluated.
-            self.note_unsupported(if constraint.local {
-                "transform constraint in local mode"
-            } else {
-                "transform constraint in relative mode"
-            });
-            return;
+        // The reference runtime splits these four cases into four functions
+        // and so does this: they share the meaning of the fields and nothing
+        // else. `local` reads and writes the local transform of the bone where
+        // `world` works on the composed matrix; `relative` adds the transform
+        // of the target on top where absolute replaces it.
+        match (constraint.local, constraint.relative) {
+            (false, false) => self.apply_transform_absolute_world(&constraint, mix),
+            (false, true) => self.apply_transform_relative_world(&constraint, mix),
+            (true, false) => self.apply_transform_absolute_local(&constraint, mix),
+            (true, true) => self.apply_transform_relative_local(&constraint, mix),
         }
+    }
 
+    /// Replaces the world transform of each bone with that of the target.
+    fn apply_transform_absolute_world(&mut self, constraint: &TransformConstraint, mix: TransformPose) {
         let t = self.bones[constraint.target.index()].world;
         let reflect = if t.a * t.d - t.b * t.c > 0.0 { 1.0f32 } else { -1.0 };
         let offset_rotation = constraint.offset_rotation.to_radians() * reflect;
@@ -657,12 +661,151 @@ impl SkeletonPose {
             }
         }
 
-        if lowest != usize::MAX {
-            // The constraint wrote world transforms directly, so descendants
-            // must be recomputed — but not the constrained bones themselves.
-            let highest = constraint.bones.iter().map(|b| b.index()).max().unwrap_or(lowest);
-            self.update_world_from(highest + 1);
+        self.rebuild_below(&constraint.bones, lowest);
+    }
+
+    /// Adds the world transform of the target on top, rather than replacing.
+    fn apply_transform_relative_world(&mut self, constraint: &TransformConstraint, mix: TransformPose) {
+        let t = self.bones[constraint.target.index()].world;
+        let reflect = if t.a * t.d - t.b * t.c > 0.0 { 1.0f32 } else { -1.0 };
+        let offset_rotation = constraint.offset_rotation.to_radians() * reflect;
+        let offset_shear_y = constraint.offset_shear_y.to_radians() * reflect;
+
+        let mut lowest = usize::MAX;
+        for bone_id in &constraint.bones {
+            let i = bone_id.index();
+            let Some(pose) = self.bones.get_mut(i) else { continue };
+            let mut w = pose.world;
+            let mut modified = false;
+
+            if mix.mix_rotate != 0.0 {
+                // The rotation the bone already has is not subtracted. That
+                // single omission is the whole difference from absolute mode:
+                // the rotation of the target is added on top instead of matched.
+                let r = wrap_radians(t.c.atan2(t.a) + offset_rotation) * mix.mix_rotate;
+                let (sin, cos) = r.sin_cos();
+                let (a, b, c, d) = (w.a, w.b, w.c, w.d);
+                w.a = cos * a - sin * c;
+                w.b = cos * b - sin * d;
+                w.c = sin * a + cos * c;
+                w.d = sin * b + cos * d;
+                modified = true;
+            }
+            if mix.mix_x != 0.0 || mix.mix_y != 0.0 {
+                // The offset is rotated into the basis of the target and added,
+                // where absolute mode moves towards its world position.
+                let (x, y) = (constraint.offset_x, constraint.offset_y);
+                w.tx += (t.a * x + t.b * y) * mix.mix_x;
+                w.ty += (t.c * x + t.d * y) * mix.mix_y;
+                modified = true;
+            }
+            if mix.mix_scale_x != 0.0 {
+                let s = ((t.a * t.a + t.c * t.c).sqrt() - 1.0 + constraint.offset_scale_x) * mix.mix_scale_x + 1.0;
+                w.a *= s;
+                w.c *= s;
+                modified = true;
+            }
+            if mix.mix_scale_y != 0.0 {
+                let s = ((t.b * t.b + t.d * t.d).sqrt() - 1.0 + constraint.offset_scale_y) * mix.mix_scale_y + 1.0;
+                w.b *= s;
+                w.d *= s;
+                modified = true;
+            }
+            if mix.mix_shear_y > 0.0 {
+                let r = wrap_radians(t.d.atan2(t.b) - t.c.atan2(t.a));
+                let by = w.d.atan2(w.b);
+                let r = by + (r - std::f32::consts::FRAC_PI_2 + offset_shear_y) * mix.mix_shear_y;
+                let s = (w.b * w.b + w.d * w.d).sqrt();
+                w.b = r.cos() * s;
+                w.d = r.sin() * s;
+                modified = true;
+            }
+
+            if modified {
+                pose.world = w;
+                lowest = lowest.min(i);
+            }
         }
+
+        self.rebuild_below(&constraint.bones, lowest);
+    }
+
+    /// Replaces the *local* transform of each bone with that of the target.
+    ///
+    /// Local modes are easier to reason about but more expensive to apply: the
+    /// constrained bones themselves have to be recomposed, not just whatever
+    /// hangs off them.
+    fn apply_transform_absolute_local(&mut self, constraint: &TransformConstraint, mix: TransformPose) {
+        let t = self.bones[constraint.target.index()].local;
+
+        let mut lowest = usize::MAX;
+        for bone_id in &constraint.bones {
+            let i = bone_id.index();
+            let Some(pose) = self.bones.get_mut(i) else { continue };
+            let mut l = pose.local;
+
+            if mix.mix_rotate != 0.0 {
+                let r = wrap_degrees(t.rotation - l.rotation + constraint.offset_rotation);
+                l.rotation += r * mix.mix_rotate;
+            }
+            l.position.x += (t.position.x - l.position.x + constraint.offset_x) * mix.mix_x;
+            l.position.y += (t.position.y - l.position.y + constraint.offset_y) * mix.mix_y;
+            if mix.mix_scale_x != 0.0 {
+                l.scale.x += (t.scale.x - l.scale.x + constraint.offset_scale_x) * mix.mix_scale_x;
+            }
+            if mix.mix_scale_y != 0.0 {
+                l.scale.y += (t.scale.y - l.scale.y + constraint.offset_scale_y) * mix.mix_scale_y;
+            }
+            if mix.mix_shear_y != 0.0 {
+                let r = wrap_degrees(t.shear.y - l.shear.y + constraint.offset_shear_y);
+                l.shear.y += r * mix.mix_shear_y;
+            }
+
+            pose.local = l;
+            lowest = lowest.min(i);
+        }
+
+        if lowest != usize::MAX {
+            self.update_world_from(lowest);
+        }
+    }
+
+    /// Adds the local transform of the target to the one the bone already has.
+    fn apply_transform_relative_local(&mut self, constraint: &TransformConstraint, mix: TransformPose) {
+        let t = self.bones[constraint.target.index()].local;
+
+        let mut lowest = usize::MAX;
+        for bone_id in &constraint.bones {
+            let i = bone_id.index();
+            let Some(pose) = self.bones.get_mut(i) else { continue };
+            let mut l = pose.local;
+
+            l.rotation += (t.rotation + constraint.offset_rotation) * mix.mix_rotate;
+            l.position.x += (t.position.x + constraint.offset_x) * mix.mix_x;
+            l.position.y += (t.position.y + constraint.offset_y) * mix.mix_y;
+            // Scale composes by multiplication, so the neutral value is 1 and
+            // what the target contributes is its deviation from it.
+            l.scale.x *= (t.scale.x - 1.0 + constraint.offset_scale_x) * mix.mix_scale_x + 1.0;
+            l.scale.y *= (t.scale.y - 1.0 + constraint.offset_scale_y) * mix.mix_scale_y + 1.0;
+            l.shear.y += (t.shear.y + constraint.offset_shear_y) * mix.mix_shear_y;
+
+            pose.local = l;
+            lowest = lowest.min(i);
+        }
+
+        if lowest != usize::MAX {
+            self.update_world_from(lowest);
+        }
+    }
+
+    /// Rebuilds everything below a set of bones whose world matrices were
+    /// written directly, leaving those bones as the constraint left them.
+    fn rebuild_below(&mut self, bones: &[BoneId], lowest: usize) {
+        if lowest == usize::MAX {
+            return;
+        }
+        let highest = bones.iter().map(|b| b.index()).max().unwrap_or(lowest);
+        self.update_world_from(highest + 1);
     }
 
     /// World-space bounds of the current pose's bone origins.
@@ -761,6 +904,15 @@ fn solve_two_bone_nonuniform(
 }
 
 #[inline]
+/// Wraps degrees into `[-180, 180)`.
+///
+/// The local modes interpolate rotations in degrees, and without this a
+/// constraint would take the long way round whenever the two angles straddle
+/// the wrap point.
+fn wrap_degrees(r: f32) -> f32 {
+    r - (r / 360.0 + 0.5).floor() * 360.0
+}
+
 fn wrap_radians(mut r: f32) -> f32 {
     const PI2: f32 = std::f32::consts::PI * 2.0;
     if r > std::f32::consts::PI {
@@ -792,6 +944,210 @@ mod tests {
 
     fn at(x: f32, y: f32) -> BoneLocal {
         BoneLocal { position: Vec2::new(x, y), ..BoneLocal::default() }
+    }
+
+    // ---------------------------------------------------- transform constraints
+    //
+    // These pin down the four modes by the property that distinguishes each,
+    // not by numbers copied from a reference run: absolute replaces, relative
+    // adds, local works in the space the bone was authored in, world works on
+    // the composed matrix. Spec §17.4 cross-implementation comparison against
+    // the official runtime is still outstanding, and would be the thing to
+    // catch a term that is subtly in the wrong place.
+
+    struct Tc {
+        local: bool,
+        relative: bool,
+        target: BoneLocal,
+        constrained: BoneLocal,
+        mix: f32,
+        mix_shear_y: f32,
+        child: bool,
+    }
+
+    impl Tc {
+        fn new(local: bool, relative: bool) -> Self {
+            Tc {
+                local,
+                relative,
+                target: BoneLocal::default(),
+                constrained: BoneLocal::default(),
+                mix: 1.0,
+                mix_shear_y: 0.0,
+                child: false,
+            }
+        }
+
+        /// Bone 0 is the root, bone 1 the target, bone 2 the constrained bone,
+        /// and bone 3 its child when asked for. The target precedes the
+        /// constrained bone, which is the order a real skeleton is sorted into.
+        fn pose(self) -> SkeletonPose {
+            let mut bones = vec![
+                bone("root", None, BoneLocal::default(), 0.0),
+                bone("target", Some(0), self.target, 0.0),
+                bone("bone", Some(0), self.constrained, 0.0),
+            ];
+            if self.child {
+                bones.push(bone("child", Some(2), at(10.0, 0.0), 0.0));
+            }
+            let mut ir = SpineIr { bones, ..Default::default() };
+            ir.transform_constraints.push(TransformConstraint {
+                name: "tc".into(),
+                order: 0,
+                skin_required: false,
+                bones: vec![BoneId(2)],
+                target: BoneId(1),
+                offset_rotation: 0.0,
+                offset_x: 0.0,
+                offset_y: 0.0,
+                offset_scale_x: 0.0,
+                offset_scale_y: 0.0,
+                offset_shear_y: 0.0,
+                mix_rotate: self.mix,
+                mix_x: self.mix,
+                mix_y: self.mix,
+                mix_scale_x: self.mix,
+                mix_scale_y: self.mix,
+                mix_shear_y: self.mix_shear_y,
+                relative: self.relative,
+                local: self.local,
+            });
+            ir.rebuild_derived();
+            SkeletonPose::new(Arc::new(ir))
+        }
+    }
+
+    fn spun(rotation: f32) -> BoneLocal {
+        BoneLocal { rotation, ..BoneLocal::default() }
+    }
+
+    #[test]
+    fn a_zero_mix_leaves_every_mode_alone() {
+        for (local, relative) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut tc = Tc::new(local, relative);
+            tc.target = BoneLocal {
+                position: Vec2::new(50.0, 60.0),
+                rotation: 40.0,
+                scale: Vec2::new(3.0, 3.0),
+                shear: Vec2::ZERO,
+            };
+            tc.constrained = at(7.0, 8.0);
+            tc.mix = 0.0;
+            let pose = tc.pose();
+            let p = pose.bones[2].world.translation();
+            assert_close(p.x, 7.0, "x");
+            assert_close(p.y, 8.0, "y");
+            assert_close(pose.bones[2].world.rotation_x_rad(), 0.0, "rotation");
+        }
+    }
+
+    #[test]
+    fn absolute_world_matches_the_rotation_of_the_target() {
+        let mut tc = Tc::new(false, false);
+        tc.target = spun(30.0);
+        tc.constrained = spun(20.0);
+        let pose = tc.pose();
+        assert_close(pose.bones[2].world.rotation_x_rad().to_degrees(), 30.0, "matched");
+    }
+
+    #[test]
+    fn relative_world_adds_the_rotation_of_the_target() {
+        let mut tc = Tc::new(false, true);
+        tc.target = spun(30.0);
+        tc.constrained = spun(20.0);
+        let pose = tc.pose();
+        // 20 of its own plus 30 from the target, where absolute mode would
+        // have landed on 30 exactly.
+        assert_close(pose.bones[2].world.rotation_x_rad().to_degrees(), 50.0, "added");
+    }
+
+    #[test]
+    fn absolute_local_copies_the_local_transform_of_the_target() {
+        let mut tc = Tc::new(true, false);
+        tc.target =
+            BoneLocal { position: Vec2::new(5.0, 7.0), rotation: 30.0, scale: Vec2::new(2.0, 3.0), shear: Vec2::ZERO };
+        tc.constrained =
+            BoneLocal { position: Vec2::new(1.0, 2.0), rotation: 10.0, scale: Vec2::new(4.0, 5.0), shear: Vec2::ZERO };
+        let pose = tc.pose();
+        let l = pose.bones[2].local;
+        assert_close(l.rotation, 30.0, "rotation");
+        assert_close(l.position.x, 5.0, "x");
+        assert_close(l.position.y, 7.0, "y");
+        assert_close(l.scale.x, 2.0, "scale x");
+        assert_close(l.scale.y, 3.0, "scale y");
+        // The world transform must have been rebuilt from the new local one.
+        assert_close(pose.bones[2].world.translation().x, 5.0, "world x");
+    }
+
+    #[test]
+    fn relative_local_adds_the_local_transform_of_the_target() {
+        let mut tc = Tc::new(true, true);
+        tc.target =
+            BoneLocal { position: Vec2::new(5.0, 7.0), rotation: 30.0, scale: Vec2::new(3.0, 1.0), shear: Vec2::ZERO };
+        tc.constrained =
+            BoneLocal { position: Vec2::new(1.0, 2.0), rotation: 10.0, scale: Vec2::new(2.0, 1.0), shear: Vec2::ZERO };
+        let pose = tc.pose();
+        let l = pose.bones[2].local;
+        assert_close(l.rotation, 40.0, "rotation adds");
+        assert_close(l.position.x, 6.0, "x adds");
+        assert_close(l.position.y, 9.0, "y adds");
+        // Scale composes by multiplication: 2 * ((3 - 1) * 1 + 1).
+        assert_close(l.scale.x, 6.0, "scale multiplies");
+        assert_close(l.scale.y, 1.0, "a neutral target scale changes nothing");
+    }
+
+    #[test]
+    fn half_a_mix_lands_half_way_in_local_mode() {
+        let mut tc = Tc::new(true, false);
+        tc.target = spun(40.0);
+        tc.constrained = spun(20.0);
+        tc.mix = 0.5;
+        let pose = tc.pose();
+        assert_close(pose.bones[2].local.rotation, 30.0, "half way");
+    }
+
+    #[test]
+    fn a_local_mode_constraint_carries_its_children_with_it() {
+        // Regression: local modes write local transforms, so the constrained
+        // bone itself has to be recomposed and not only its descendants. A
+        // rebuild that started one bone too late would leave the child behind.
+        let mut tc = Tc::new(true, false);
+        tc.target = spun(90.0);
+        tc.child = true;
+        let pose = tc.pose();
+        let p = pose.bones[3].world.translation();
+        assert_close(p.x, 0.0, "child x");
+        assert_close(p.y, 10.0, "child y");
+    }
+
+    #[test]
+    fn the_local_modes_take_the_short_way_round() {
+        // 350 and 10 degrees are 20 apart, not 340.
+        let mut tc = Tc::new(true, false);
+        tc.target = spun(10.0);
+        tc.constrained = spun(350.0);
+        tc.mix = 0.5;
+        let pose = tc.pose();
+        assert_close(pose.bones[2].local.rotation, 360.0, "halfway the short way");
+    }
+
+    #[test]
+    fn wrapping_degrees_picks_the_nearer_direction() {
+        assert_close(wrap_degrees(0.0), 0.0, "zero");
+        assert_close(wrap_degrees(90.0), 90.0, "inside");
+        assert_close(wrap_degrees(190.0), -170.0, "just over");
+        assert_close(wrap_degrees(-190.0), 170.0, "just under");
+        assert_close(wrap_degrees(710.0), -10.0, "twice round");
+    }
+
+    #[test]
+    fn no_mode_is_reported_as_unsupported_any_more() {
+        for (local, relative) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut tc = Tc::new(local, relative);
+            tc.target = spun(30.0);
+            let pose = tc.pose();
+            assert!(pose.degradations().is_empty(), "local={local} relative={relative}: {:?}", pose.degradations());
+        }
     }
 
     #[test]
