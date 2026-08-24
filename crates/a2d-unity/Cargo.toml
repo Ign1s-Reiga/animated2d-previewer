@@ -9,3 +9,4 @@ description = "Unity serialized file and AssetBundle object graph reading."
 
 [dependencies]
 a2d-core.workspace = true
+lz4_flex.workspace = true

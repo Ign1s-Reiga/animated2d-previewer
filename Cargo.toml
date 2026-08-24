@@ -21,6 +21,9 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+# Decode-only LZ4 for Unity bundle blocks. `safe-decode` keeps it free of unsafe,
+# and the frame format is not needed: Unity stores raw blocks with known sizes.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "std"] }
 a2d-core    = { path = "crates/a2d-core" }
 a2d-spine   = { path = "crates/a2d-spine" }
 a2d-cubism  = { path = "crates/a2d-cubism" }
