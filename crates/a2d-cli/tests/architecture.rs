@@ -145,7 +145,7 @@ fn no_source_version_branch_appears_downstream_of_the_decoders() {
     // Invariant 2. The runtime and renderer must not be able to tell which
     // Spine version produced the IR, so they may not name one.
     let versions = ["spine 2.", "spine 3.", "spine 4.", "spine-3.", "spine-4.", "3.8.99", "4.1.23", "spineversion"];
-    let downstream = ["a2d-runtime", "a2d-render"];
+    let downstream = ["a2d-runtime", "a2d-render", "a2d-desktop"];
 
     for crate_name in downstream {
         for (path, text) in sources_of(crate_name) {
@@ -180,7 +180,17 @@ fn the_renderer_neutral_types_live_in_core() {
 #[test]
 fn library_crates_avoid_unwrap_on_data_dependent_paths() {
     // Rule §4.13. Test code is exempt: a panicking assertion is the point there.
-    let libraries = ["a2d-core", "a2d-spine", "a2d-cubism", "a2d-unity", "a2d-pack", "a2d-runtime", "a2d-import"];
+    let libraries = [
+        "a2d-core",
+        "a2d-spine",
+        "a2d-cubism",
+        "a2d-unity",
+        "a2d-pack",
+        "a2d-runtime",
+        "a2d-render",
+        "a2d-import",
+        "a2d-desktop",
+    ];
     let mut offenders = Vec::new();
 
     for crate_name in libraries {
