@@ -1,0 +1,11 @@
+[package]
+name = "a2d-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Animated2D core: IR types, math, shared model trait, errors."
+
+[dependencies]
+thiserror.workspace = true
