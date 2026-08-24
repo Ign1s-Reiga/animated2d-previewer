@@ -24,7 +24,7 @@ Primary objective: **correct character playback for desktop viewing.** Nothing e
 **Current phase:** Phase 1 complete for the Spine path; Phase 2 feature-complete but its
 goal is unverified without real assets; Phase 6 implemented.
 
-Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x),
+Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x and 4.0/4.1),
 `a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints in all four
 modes, path constraints, mixing,
 idle), `a2d-pack`, `a2d-import` (generic + spine_bytes), `a2d-render` (wgpu, batching, blend
@@ -32,7 +32,16 @@ modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transpare
 window, drag, scale, click-through, always-on-top, tray, config persistence), `a2d-cli`.
 
 Not implemented: `a2d-unity`, `a2d-cubism`.
-Known gaps, all reported rather than silently ignored: Spine 4.x and 2.x binary layouts.
+Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 binary layouts.
+
+**The 4.0/4.1 binary decoder has not been checked against a real export.** Its tests
+round-trip through the fixture writer, which proves the decoder and the writer agree with
+each other and nothing about whether either matches a file the Spine editor wrote — the
+fixture is authored from the same understanding of the layout that the decoder is. It
+therefore validates hard (counts against remaining bytes, string references against the
+table, and an exact end-of-file check) so a wrong layout fails loudly instead of returning
+a skeleton that animates wrongly, and every load reports the caveat. Decoding one real
+4.0 or 4.1 `.skel` is what would settle it; until then prefer the 4.x JSON dialect.
 
 The Spine constraint set is now complete: IK, transform in all four modes, and path.
 The transform modes and the path control-point layout are pinned by property tests and by

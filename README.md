@@ -122,7 +122,7 @@ animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開�
 | クレート | 状態 |
 | --- | --- |
 | `a2d-core` | **実装済み** — IR、数学、`AnimatedModel`、`RenderMesh`、エラー分類、`LoadReport` |
-| `a2d-spine` | **実装済み（3.x / JSON 4.x）** — atlas パーサ、内容ベースのバージョン検出、JSON デコーダ（2.x/3.x/4.x 方言）、バイナリデコーダ（3.x）、正規化 |
+| `a2d-spine` | **実装済み** — atlas パーサ、内容ベースのバージョン検出、JSON デコーダ（2.x/3.x/4.x 方言）、バイナリデコーダ（3.x / 4.0・4.1）、正規化 |
 | `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント（world / local × absolute / relative の 4 モード）、path コンストレイント（Tangent / Chain / ChainScale、4 種の spacing モード）、トラック／キュー／クロスフェード、idle ロジック |
 | `a2d-pack` | **実装済み** — 決定論的な `model.bin`、`manifest.json`、`validate` |
 | `a2d-import` | **実装済み（generic / spine_bytes）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
@@ -133,8 +133,15 @@ animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開�
 | `a2d-cubism` | **未実装** — MOC3 は独自パーサで読む方針が決定済み（Cubism Core は使いません）。実装は未着手 |
 
 未対応の機能は黙って無視されるのではなく、`LoadReport` として `inspect` / `import` /
-`validate` に必ず出力されます。既知の未対応: Spine 4.x バイナリ、Spine 2.x バイナリ。
+`validate` に必ず出力されます。既知の未対応: Spine 2.x バイナリ、Spine 4.2 バイナリ。
 Spine のコンストレイントは IK / transform / path すべて実装済みです。
+
+**4.0 / 4.1 バイナリデコーダは実物のエクスポートで未検証です。** テストは自前のライタとの
+往復のみで、これはデコーダとライタが一致していることしか示しません（フィクスチャ自体が
+デコーダと同じレイアウト理解で書かれているためです）。そのため、カウント値・文字列参照・
+ファイル終端を厳しく検証し、レイアウトが違えば静かに壊れた結果を返すのではなく明確な
+エラーで落ちるようにしてあります。読み込み時には毎回その旨を警告します。実物の
+`.skel` を 1 つデコードして比較するまでは、4.x は JSON 形式の利用を推奨します。
 
 ```bash
 animated2d preview character.a2dpack            # デスクトップビューアで開く
