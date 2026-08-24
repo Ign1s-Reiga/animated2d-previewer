@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use a2d_core::{AnimatedModel, DecodeError, LoadReport, RuntimeError};
 use a2d_desktop::{LoadedModel, Viewer, ViewerError};
@@ -231,26 +232,44 @@ const EXPORT_SIZE: u32 = 512;
 /// Without `-o`, opens the package in the desktop viewer (spec §14). With `-o`,
 /// renders the regression timestamps offscreen and writes them as PNGs, which
 /// is what a machine with no display or no compositor can still do.
-pub fn preview(out: &mut dyn std::io::Write, package_dir: &Path, frames_dir: Option<&Path>) -> Result<(), CliError> {
+pub fn preview(
+    out: &mut dyn std::io::Write,
+    package_dir: &Path,
+    frames_dir: Option<&Path>,
+    exit_after: Option<Duration>,
+) -> Result<(), CliError> {
     match frames_dir {
         Some(dir) => export_frames(out, package_dir, dir),
-        None => open_viewer(out, package_dir),
+        None => open_viewer(out, package_dir, exit_after),
     }
 }
 
-fn open_viewer(out: &mut dyn std::io::Write, package_dir: &Path) -> Result<(), CliError> {
+fn open_viewer(out: &mut dyn std::io::Write, package_dir: &Path, exit_after: Option<Duration>) -> Result<(), CliError> {
     writeln!(out, "Opening {} in the desktop viewer.", package_dir.display())?;
     writeln!(out, "  drag to move, scroll to scale, Space pauses, Tab cycles animations, Esc quits.")?;
-    writeln!(
-        out,
-        "  everything is also in the tray menu.
-"
-    )?;
+    writeln!(out, "  everything is also in the tray menu.")?;
+    if let Some(after) = exit_after {
+        writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;
+    }
+    writeln!(out)?;
 
     let mut report = LoadReport::new();
-    let result = a2d_desktop::run(vec![package_dir.to_path_buf()], &mut report);
+    let options = a2d_desktop::RunOptions { packages: vec![package_dir.to_path_buf()], exit_after };
+    let result = a2d_desktop::run(options, &mut report);
     print_report(out, &report)?;
-    result.map_err(CliError::from)
+
+    let summary = result?;
+    // Frames presented is the one observable proof that the window really drew,
+    // and it is what a smoke test asserts on.
+    writeln!(
+        out,
+        "
+Presented {} frames in {:.1}s ({:.0} fps).",
+        summary.frames,
+        summary.elapsed.as_secs_f32(),
+        summary.frames as f32 / summary.elapsed.as_secs_f32().max(f32::MIN_POSITIVE)
+    )?;
+    Ok(())
 }
 
 fn export_frames(out: &mut dyn std::io::Write, package_dir: &Path, frames_dir: &Path) -> Result<(), CliError> {

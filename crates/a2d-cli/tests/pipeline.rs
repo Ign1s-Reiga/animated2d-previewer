@@ -169,7 +169,7 @@ fn preview_exports_the_regression_timestamps() {
     // path is exercised by running the binary, not from here.
     let frames = dir.path().join("frames");
     let mut out = Vec::new();
-    match a2d_cli::preview(&mut out, &package_dir, Some(&frames)) {
+    match a2d_cli::preview(&mut out, &package_dir, Some(&frames), None) {
         Ok(()) => {}
         Err(e) if e.to_string().contains("no suitable GPU adapter") => {
             eprintln!("skipping: {e}");

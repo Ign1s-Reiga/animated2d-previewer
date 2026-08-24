@@ -34,17 +34,39 @@ const IDLE_MIX: Duration = Duration::from_millis(300);
 /// hand over a delta of minutes and teleport the character mid-animation.
 const MAX_FRAME_STEP: Duration = Duration::from_millis(100);
 
+/// How to run the viewer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Packages to open, tried in order. Whatever loads becomes the model list.
+    pub packages: Vec<PathBuf>,
+    /// Quit automatically after this long.
+    ///
+    /// For scripted screenshots, smoke tests and CI. It takes exactly the same
+    /// shutdown path as quitting by hand, so settings are saved the same way —
+    /// which is what makes it usable to *test* that path rather than a
+    /// separate one that only tests itself.
+    pub exit_after: Option<Duration>,
+}
+
+/// What a run did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSummary {
+    /// Frames actually presented. Zero means the window never drew, which is a
+    /// failure even when nothing errored.
+    pub frames: u64,
+    pub elapsed: Duration,
+}
+
 /// Runs the viewer until the user quits.
 ///
-/// `packages` are tried in order; whatever loads becomes the model list. The
-/// config supplies the remembered window placement and selection.
-pub fn run(packages: Vec<PathBuf>, report: &mut LoadReport) -> Result<(), ViewerError> {
+/// The config supplies the remembered window placement and selection.
+pub fn run(options: RunOptions, report: &mut LoadReport) -> Result<RunSummary, ViewerError> {
     let (config, config_report) = Config::load();
     report.absorb(config_report);
 
     // Packages named on the command line come first, but remembered ones are
     // kept so the selector still lists everything the user has opened before.
-    let mut paths = packages;
+    let mut paths = options.packages;
     for model in &config.models {
         if !paths.contains(&model.package) {
             paths.push(model.package.clone());
@@ -63,6 +85,7 @@ pub fn run(packages: Vec<PathBuf>, report: &mut LoadReport) -> Result<(), Viewer
     // always a next frame to draw.
     event_loop.set_control_flow(ControlFlow::Poll);
 
+    let started = Instant::now();
     let mut app = App {
         models,
         state,
@@ -72,12 +95,22 @@ pub fn run(packages: Vec<PathBuf>, report: &mut LoadReport) -> Result<(), Viewer
         last_frame: Instant::now(),
         cursor: Vec2::ZERO,
         report: std::mem::take(report),
+        exit_after: options.exit_after,
+        deadline: None,
+        active_since: None,
+        frames: 0,
+        saved: false,
     };
     let result = event_loop.run_app(&mut app);
     *report = std::mem::take(&mut app.report);
+    // A run that ended without passing through a quit path — a platform error,
+    // say — still gets its settings written.
     app.save_config(report);
     result.map_err(|e| unsupported(format!("the event loop failed: {e}")))?;
-    Ok(())
+    // Time spent drawing, falling back to the whole run if a window never came
+    // up. Counting start-up would report a frame rate the viewer never had.
+    let elapsed = app.active_since.map_or_else(|| started.elapsed(), |at| at.elapsed());
+    Ok(RunSummary { frames: app.frames, elapsed })
 }
 
 fn unsupported(message: String) -> ViewerError {
@@ -109,6 +142,23 @@ struct App {
     /// button events do not carry it.
     cursor: Vec2,
     report: LoadReport,
+    /// How long to run for, when a run is time-limited.
+    ///
+    /// Measured from when the window is up rather than from process start:
+    /// creating a device and uploading textures can take seconds on a cold
+    /// start, and a deadline ticking through that would quit before the first
+    /// frame was ever drawn.
+    exit_after: Option<Duration>,
+    /// The instant that deadline falls due, once there is a window.
+    deadline: Option<Instant>,
+    /// When the window came up, so the reported frame rate measures drawing
+    /// rather than start-up.
+    active_since: Option<Instant>,
+    /// Frames presented so far.
+    frames: u64,
+    /// Whether settings have already been written, so the belt-and-braces save
+    /// after the loop does not overwrite them with a torn-down state.
+    saved: bool,
 }
 
 impl App {
@@ -254,8 +304,10 @@ impl App {
         let camera = active.viewer.camera(viewport, scale, offset);
         if let Err(e) = active.viewer.render(&view, active.format, viewport, camera, flip) {
             self.report.note(format!("render failed: {e}"));
+            return;
         }
         frame.present();
+        self.frames += 1;
     }
 
     /// Applies the current state to the window.
@@ -342,6 +394,10 @@ impl App {
     }
 
     fn save_config(&mut self, report: &mut LoadReport) {
+        if self.saved {
+            return;
+        }
+        self.saved = true;
         if let Some(active) = &self.active {
             if let Ok(position) = active.window.outer_position() {
                 self.config.window.position = Some((position.x, position.y));
@@ -379,7 +435,10 @@ impl ApplicationHandler for App {
             // keyboard shortcuts still work.
             Err(e) => self.report.note(format!("the tray icon is unavailable: {e}")),
         }
-        self.last_frame = Instant::now();
+        let now = Instant::now();
+        self.last_frame = now;
+        self.active_since = Some(now);
+        self.deadline = self.exit_after.map(|d| now + d);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -443,6 +502,13 @@ impl ApplicationHandler for App {
         // Tray activations arrive on their own channel, not through winit.
         while let Some(command) = self.tray.as_ref().and_then(Tray::poll) {
             self.handle_command(command, event_loop);
+        }
+        // An elapsed deadline quits through `TrayCommand::Quit`, the same path
+        // Esc and the tray take, so a scripted run exercises the real shutdown.
+        if self.deadline.is_some_and(|at| Instant::now() >= at) {
+            self.deadline = None;
+            self.handle_command(TrayCommand::Quit, event_loop);
+            return;
         }
         if let Some(active) = &self.active {
             active.window.request_redraw();

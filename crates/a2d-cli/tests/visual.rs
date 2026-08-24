@@ -255,7 +255,7 @@ fn preview_writes_a_png_per_timestamp() {
     a2d_cli::import(&mut sink, dir.path(), &package_dir, None).expect("fixture should import");
 
     let mut out = Vec::new();
-    a2d_cli::preview(&mut out, &package_dir, Some(&frames)).expect("preview should render");
+    a2d_cli::preview(&mut out, &package_dir, Some(&frames), None).expect("preview should render");
     let text = String::from_utf8(out).expect("output should be UTF-8");
 
     for time in TIMESTAMPS {

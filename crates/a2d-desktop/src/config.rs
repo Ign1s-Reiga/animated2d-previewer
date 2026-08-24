@@ -227,12 +227,35 @@ impl Config {
     }
 }
 
-/// The directory settings live in.
+/// Environment variable that overrides where settings are kept.
 ///
-/// Resolved from environment variables rather than a crate: the rules are three
-/// lines per platform, and a dependency here would be more surface than the
-/// problem deserves.
+/// Exists for portable installs — running from a USB stick and keeping settings
+/// beside the binary — and it is what lets a test drive the real viewer without
+/// writing into the user's actual configuration.
+pub const CONFIG_DIR_ENV: &str = "A2D_CONFIG_DIR";
+
+/// The directory settings live in.
 pub fn config_dir() -> Option<PathBuf> {
+    config_dir_with(std::env::var_os(CONFIG_DIR_ENV))
+}
+
+/// The resolution rule, with the override passed in rather than read.
+///
+/// Taking the override as an argument keeps this testable: mutating the
+/// process environment from a test is both `unsafe` and racy against every
+/// other test running in parallel.
+///
+/// The platform bases are resolved from environment variables rather than a
+/// crate — the rules are three lines each, and a dependency would be more
+/// surface than the problem deserves.
+fn config_dir_with(override_dir: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(dir) = override_dir {
+        // An empty value is a mistake rather than a request to use the working
+        // directory, so it falls through to the platform default.
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
     } else if cfg!(target_os = "macos") {
@@ -457,10 +480,25 @@ mod tests {
     }
 
     #[test]
+    fn an_override_directory_is_used_verbatim() {
+        let dir = PathBuf::from("/somewhere/portable");
+        assert_eq!(config_dir_with(Some(dir.clone().into_os_string())), Some(dir));
+    }
+
+    #[test]
+    fn an_empty_override_falls_through_to_the_platform_default() {
+        // Otherwise an unset-but-present variable would drop settings into the
+        // working directory, wherever that happened to be.
+        let empty = config_dir_with(Some(std::ffi::OsString::new()));
+        assert_ne!(empty, Some(PathBuf::new()));
+        assert_eq!(empty, config_dir_with(None));
+    }
+
+    #[test]
     fn the_config_path_sits_under_an_animated2d_directory() {
         // The exact base varies by platform and environment; what must hold is
         // that settings are namespaced rather than dropped in a shared folder.
-        if let Some(path) = config_path() {
+        if let Some(path) = config_dir_with(None).map(|d| d.join("config.json")) {
             assert!(path.ends_with("animated2d/config.json") || path.ends_with("animated2d\\config.json"), "{path:?}");
         }
     }

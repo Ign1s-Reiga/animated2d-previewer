@@ -8,12 +8,15 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// A parsed command line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Only `PartialEq`: `--exit-after` is a float, so there is no total equality
+/// to derive.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Inspect { input: PathBuf, game: Option<String> },
     Import { input: PathBuf, output: PathBuf, game: Option<String> },
     Validate { package: PathBuf },
-    Preview { package: PathBuf, out: Option<PathBuf> },
+    Preview { package: PathBuf, out: Option<PathBuf>, exit_after: Option<f32> },
     Help,
     Version,
 }
@@ -52,42 +55,57 @@ where
     let rest = &args[1..];
     match first.as_str() {
         "inspect" => {
-            let (positional, game, output) = split_flags(rest)?;
-            if output.is_some() {
+            let split = split_flags(rest)?;
+            if split.output.is_some() {
                 return Err(err("`inspect` does not take -o/--output"));
             }
-            Ok(Command::Inspect { input: one_path(positional, "inspect <input>")?, game })
+            reject_exit_after(&split)?;
+            Ok(Command::Inspect { input: one_path(split.positional, "inspect <input>")?, game: split.game })
         }
         "import" => {
-            let (positional, game, output) = split_flags(rest)?;
-            let input = one_path(positional, "import <input> -o <output.a2dpack>")?;
-            let output = output.ok_or_else(|| err("`import` needs -o/--output <output.a2dpack>"))?;
-            Ok(Command::Import { input, output, game })
+            let split = split_flags(rest)?;
+            reject_exit_after(&split)?;
+            let output = split.output.clone().ok_or_else(|| err("`import` needs -o/--output <output.a2dpack>"))?;
+            let input = one_path(split.positional, "import <input> -o <output.a2dpack>")?;
+            Ok(Command::Import { input, output, game: split.game })
         }
         "validate" => {
-            let (positional, game, output) = split_flags(rest)?;
-            reject_extra(game, output)?;
-            Ok(Command::Validate { package: one_path(positional, "validate <package>")? })
+            let split = split_flags(rest)?;
+            reject_exit_after(&split)?;
+            reject_extra(split.game, split.output)?;
+            Ok(Command::Validate { package: one_path(split.positional, "validate <package>")? })
         }
         "preview" => {
-            let (positional, game, output) = split_flags(rest)?;
-            if game.is_some() {
+            let split = split_flags(rest)?;
+            if split.game.is_some() {
                 return Err(err("this command does not take --game"));
             }
             // `-o` names a directory to write the rendered frames into.
-            Ok(Command::Preview { package: one_path(positional, "preview <package>")?, out: output })
+            Ok(Command::Preview {
+                package: one_path(split.positional, "preview <package>")?,
+                out: split.output,
+                exit_after: split.exit_after,
+            })
         }
         other if other.starts_with('-') => Err(err(format!("unknown option `{other}`; try `animated2d help`"))),
         other => Err(err(format!("unknown command `{other}`; try `animated2d help`"))),
     }
 }
 
-type Split = (Vec<String>, Option<String>, Option<PathBuf>);
+/// Flags and positional arguments, separated.
+#[derive(Debug, Default)]
+struct Split {
+    positional: Vec<String>,
+    game: Option<String>,
+    output: Option<PathBuf>,
+    exit_after: Option<f32>,
+}
 
 fn split_flags(args: &[String]) -> Result<Split, ArgError> {
     let mut positional = Vec::new();
     let mut game = None;
     let mut output = None;
+    let mut exit_after = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -110,6 +128,15 @@ fn split_flags(args: &[String]) -> Result<Split, ArgError> {
                 output = Some(PathBuf::from(&arg["--output=".len()..]));
                 i += 1;
             }
+            "--exit-after" => {
+                let value = args.get(i + 1).ok_or_else(|| err("--exit-after needs a number of seconds"))?;
+                exit_after = Some(parse_seconds(value)?);
+                i += 2;
+            }
+            _ if arg.starts_with("--exit-after=") => {
+                exit_after = Some(parse_seconds(&arg["--exit-after=".len()..])?);
+                i += 1;
+            }
             // A lone `-` is a path, not a flag.
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 return Err(err(format!("unknown option `{arg}`")));
@@ -120,7 +147,15 @@ fn split_flags(args: &[String]) -> Result<Split, ArgError> {
             }
         }
     }
-    Ok((positional, game, output))
+    Ok(Split { positional, game, output, exit_after })
+}
+
+/// Parses a positive, finite number of seconds.
+fn parse_seconds(value: &str) -> Result<f32, ArgError> {
+    match value.parse::<f32>() {
+        Ok(seconds) if seconds.is_finite() && seconds > 0.0 => Ok(seconds),
+        _ => Err(err(format!("--exit-after needs a positive number of seconds, got {value:?}"))),
+    }
 }
 
 fn one_path(positional: Vec<String>, usage: &str) -> Result<PathBuf, ArgError> {
@@ -129,6 +164,13 @@ fn one_path(positional: Vec<String>, usage: &str) -> Result<PathBuf, ArgError> {
         0 => Err(err(format!("missing path; usage: animated2d {usage}"))),
         n => Err(err(format!("expected one path, got {n}; usage: animated2d {usage}"))),
     }
+}
+
+fn reject_exit_after(split: &Split) -> Result<(), ArgError> {
+    if split.exit_after.is_some() {
+        return Err(err("only `preview` takes --exit-after"));
+    }
+    Ok(())
 }
 
 fn reject_extra(game: Option<String>, output: Option<PathBuf>) -> Result<(), ArgError> {
@@ -152,7 +194,7 @@ COMMANDS:
     inspect  <input>                        identify assets and report what would load
     import   <input> -o <out.a2dpack>       reconstruct a normalized package
     validate <package.a2dpack>              check a package for missing or unsupported data
-    preview  <package.a2dpack> [-o <dir>]   render the package and report the frames
+    preview  <package.a2dpack> [-o <dir>]   open the viewer, or render frames to <dir>
     help                                    show this text
     version                                 show the version
 
@@ -161,6 +203,9 @@ OPTIONS:
                      (default: guessed from the assets present)
     -o, --output     destination package directory for `import`, or a directory
                      to write rendered PNG frames into for `preview`
+    --exit-after <s> `preview` only: quit the viewer after this many seconds.
+                     Takes the same shutdown path as quitting by hand, so it is
+                     usable for scripted screenshots and smoke tests.
 
 NOTES:
     <input> may be a single asset or a directory. Detection reads file contents,
@@ -239,7 +284,10 @@ mod tests {
     #[test]
     fn validate_and_preview_take_one_path_and_no_flags() {
         assert_eq!(parse_ok(&["validate", "p.a2dpack"]), Command::Validate { package: "p.a2dpack".into() });
-        assert_eq!(parse_ok(&["preview", "p.a2dpack"]), Command::Preview { package: "p.a2dpack".into(), out: None });
+        assert_eq!(
+            parse_ok(&["preview", "p.a2dpack"]),
+            Command::Preview { package: "p.a2dpack".into(), out: None, exit_after: None }
+        );
         assert!(parse(["validate", "p", "--game", "nikke"]).is_err());
         assert!(parse(["preview", "p", "--game", "nikke"]).is_err());
     }
@@ -248,8 +296,32 @@ mod tests {
     fn preview_takes_an_output_directory_for_frames() {
         assert_eq!(
             parse_ok(&["preview", "p.a2dpack", "-o", "frames"]),
-            Command::Preview { package: "p.a2dpack".into(), out: Some("frames".into()) }
+            Command::Preview { package: "p.a2dpack".into(), out: Some("frames".into()), exit_after: None }
         );
+    }
+
+    #[test]
+    fn preview_takes_a_scripted_exit_deadline() {
+        let expected = Command::Preview { package: "p".into(), out: None, exit_after: Some(2.5) };
+        assert_eq!(parse_ok(&["preview", "p", "--exit-after", "2.5"]), expected);
+        assert_eq!(parse_ok(&["preview", "p", "--exit-after=2.5"]), expected);
+    }
+
+    #[test]
+    fn a_nonsense_exit_deadline_is_refused() {
+        for value in ["0", "-1", "abc", "", "inf", "NaN"] {
+            let e = parse(["preview", "p", "--exit-after", value]).unwrap_err();
+            assert!(e.to_string().contains("positive number of seconds"), "for {value:?}: {e}");
+        }
+        assert!(parse(["preview", "p", "--exit-after"]).is_err());
+    }
+
+    #[test]
+    fn only_preview_takes_an_exit_deadline() {
+        for command in ["inspect", "validate"] {
+            let e = parse([command, "p", "--exit-after", "1"]).unwrap_err();
+            assert!(e.to_string().contains("only `preview`"), "for {command}: {e}");
+        }
     }
 
     #[test]

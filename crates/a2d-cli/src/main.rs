@@ -38,7 +38,9 @@ fn main() -> ExitCode {
             Ok(false) => return ExitCode::from(1),
             Err(e) => Err(e),
         },
-        Command::Preview { package, out: frames } => commands::preview(&mut out, &package, frames.as_deref()),
+        Command::Preview { package, out: frames, exit_after } => {
+            commands::preview(&mut out, &package, frames.as_deref(), exit_after.map(std::time::Duration::from_secs_f32))
+        }
     };
 
     match result {
