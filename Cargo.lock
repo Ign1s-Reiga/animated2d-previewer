@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "a2d-cli"
+version = "0.1.0"
+dependencies = [
+ "a2d-core",
+ "a2d-cubism",
+ "a2d-desktop",
+ "a2d-import",
+ "a2d-pack",
+ "a2d-render",
+ "a2d-runtime",
+ "a2d-spine",
+ "a2d-unity",
+]
+
+[[package]]
 name = "a2d-core"
 version = "0.1.0"
 dependencies = [
@@ -26,6 +41,17 @@ dependencies = [
  "a2d-pack",
  "a2d-render",
  "a2d-runtime",
+]
+
+[[package]]
+name = "a2d-import"
+version = "0.1.0"
+dependencies = [
+ "a2d-core",
+ "a2d-cubism",
+ "a2d-pack",
+ "a2d-spine",
+ "a2d-unity",
 ]
 
 [[package]]

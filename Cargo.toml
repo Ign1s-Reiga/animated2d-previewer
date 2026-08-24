@@ -10,6 +10,7 @@ members = [
     "crates/a2d-runtime",
     "crates/a2d-render",
     "crates/a2d-desktop",
+    "crates/a2d-cli",
 ]
 
 [workspace.package]

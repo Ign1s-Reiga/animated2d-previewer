@@ -1,0 +1,27 @@
+[package]
+name = "a2d-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The animated2d developer CLI."
+
+[lib]
+name = "a2d_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "animated2d"
+path = "src/main.rs"
+
+[dependencies]
+a2d-core.workspace = true
+a2d-spine.workspace = true
+a2d-cubism.workspace = true
+a2d-unity.workspace = true
+a2d-import.workspace = true
+a2d-pack.workspace = true
+a2d-runtime.workspace = true
+a2d-render.workspace = true
+a2d-desktop.workspace = true
