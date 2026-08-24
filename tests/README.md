@@ -33,6 +33,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Architecture | `crates/a2d-cli/tests/architecture.rs` | the layering rules in `CLAUDE.md` §3, enforced rather than reviewed |
 | GPU | `crates/a2d-render/tests/render.rs` | clear, tint, blend modes, draw order, stencil clipping, read-back, buffer growth — all against real pixels |
 | Visual regression | `crates/a2d-cli/tests/visual.rs` | fixed timestamps rendered through the whole stack; determinism and movement |
+| Viewer behaviour | `crates/a2d-desktop/src/{config,state,tray}.rs` | config persistence and clamping, drag/scale/selection, tray id mapping — all without opening a window |
 
 ## Tests that need a real asset
 
@@ -90,6 +91,21 @@ A2D_BASELINE_DIR=tests/fixtures/local/baseline cargo test -p a2d-cli --test visu
 ```
 
 Delete a baseline file to re-record it.
+
+## What the desktop tests do not cover
+
+`a2d-desktop` splits deliberately: `config`, `state` and `tray` hold the
+behaviour a user notices and are unit-tested with no window involved, while
+`app` is a thin `winit` layer that only translates events into calls on them.
+
+The window itself is **not** covered by an automated test. An event loop cannot
+be created off the main thread, so it cannot run under the test harness, and
+there is no assertion to make about pixels on a screen. It is verified by
+running it:
+
+```bash
+cargo run -p a2d-cli -- preview character.a2dpack
+```
 
 ## GPU tests
 
