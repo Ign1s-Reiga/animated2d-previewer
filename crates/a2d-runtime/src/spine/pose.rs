@@ -8,7 +8,10 @@
 use std::sync::Arc;
 
 use a2d_core::ir::ids::{AttachmentId, BoneId, SkinId, SlotId};
-use a2d_core::ir::spine::{BoneLocal, ConstraintKind, SpineIr, TransformConstraint, TransformInherit, DEFAULT_SKIN};
+use a2d_core::ir::spine::{
+    AttachmentKind, BoneLocal, ConstraintKind, PathConstraint, PathPositionMode, PathRotateMode, PathSpacingMode,
+    SpineIr, TransformConstraint, TransformInherit, VertexData, DEFAULT_SKIN,
+};
 use a2d_core::{Affine2, Degradation, LoadReport, Rgb, Rgba, Vec2};
 
 /// Per-bone pose: the applied local transform plus the derived world transform.
@@ -55,6 +58,19 @@ pub struct TransformPose {
     pub mix_shear_y: f32,
 }
 
+/// Runtime values for a path constraint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathPose {
+    /// Distance along the path of the first bone, in world units or as a
+    /// fraction of the path length depending on the position mode.
+    pub position: f32,
+    /// Gap between consecutive bones, interpreted by the spacing mode.
+    pub spacing: f32,
+    pub mix_rotate: f32,
+    pub mix_x: f32,
+    pub mix_y: f32,
+}
+
 /// The mutable pose of one skeleton instance.
 ///
 /// Several instances can share one [`SpineIr`], which is why the data is behind
@@ -73,6 +89,7 @@ pub struct SkeletonPose {
     pub scale: Vec2,
     pub ik: Vec<IkPose>,
     pub transform: Vec<TransformPose>,
+    pub path: Vec<PathPose>,
     /// Set once when an unsupported constraint mode is first encountered, so
     /// the report is not spammed once per frame.
     reported_unsupported: Vec<String>,
@@ -110,6 +127,17 @@ impl SkeletonPose {
                 mix_shear_y: c.mix_shear_y,
             })
             .collect();
+        let path = ir
+            .path_constraints
+            .iter()
+            .map(|c| PathPose {
+                position: c.position,
+                spacing: c.spacing,
+                mix_rotate: c.mix_rotate,
+                mix_x: c.mix_x,
+                mix_y: c.mix_y,
+            })
+            .collect();
 
         let mut pose = SkeletonPose {
             ir,
@@ -121,6 +149,7 @@ impl SkeletonPose {
             scale: Vec2::ONE,
             ik,
             transform,
+            path,
             reported_unsupported: Vec::new(),
         };
         pose.reset_to_setup();
@@ -170,8 +199,52 @@ impl SkeletonPose {
             pose.mix_scale_y = data.mix_scale_y;
             pose.mix_shear_y = data.mix_shear_y;
         }
+        for (pose, data) in self.path.iter_mut().zip(&self.ir.path_constraints) {
+            pose.position = data.position;
+            pose.spacing = data.spacing;
+            pose.mix_rotate = data.mix_rotate;
+            pose.mix_x = data.mix_x;
+            pose.mix_y = data.mix_y;
+        }
         self.reset_draw_order();
         self.reset_attachments_to_setup();
+    }
+
+    /// World positions for a vertex set, applying deform offsets and skinning.
+    ///
+    /// Rigid vertices ride the slot's bone; weighted ones are a weighted sum
+    /// over the bones that influence them. Deform offsets index vertices in the
+    /// rigid case and *influences* in the weighted one, which is why the two
+    /// branches read `deform` differently.
+    pub fn world_vertices(&self, vertices: &VertexData, deform: &[f32], slot_bone: Affine2) -> Vec<Vec2> {
+        match vertices {
+            VertexData::Rigid(local) => local
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let dx = deform.get(i * 2).copied().unwrap_or(0.0);
+                    let dy = deform.get(i * 2 + 1).copied().unwrap_or(0.0);
+                    slot_bone.transform_point(Vec2::new(v.x + dx, v.y + dy))
+                })
+                .collect(),
+            VertexData::Weighted(w) => {
+                let mut out = Vec::with_capacity(w.vertex_count());
+                for vertex in 0..w.vertex_count() {
+                    let start = w.offsets.get(vertex).copied().unwrap_or(0) as usize;
+                    let mut sum = Vec2::ZERO;
+                    for (n, influence) in w.influences_for(vertex).iter().enumerate() {
+                        let f = (start + n) * 2;
+                        let dx = deform.get(f).copied().unwrap_or(0.0);
+                        let dy = deform.get(f + 1).copied().unwrap_or(0.0);
+                        let local = Vec2::new(influence.position.x + dx, influence.position.y + dy);
+                        let Some(bone) = self.bones.get(influence.bone.index()) else { continue };
+                        sum += bone.world.transform_point(local) * influence.weight;
+                    }
+                    out.push(sum);
+                }
+                out
+            }
+        }
     }
 
     pub fn reset_draw_order(&mut self) {
@@ -328,9 +401,7 @@ impl SkeletonPose {
             match entry.kind {
                 ConstraintKind::Ik => self.apply_ik(entry.index as usize),
                 ConstraintKind::Transform => self.apply_transform_constraint(entry.index as usize),
-                // Path constraints are spec §6.5 priority 3 and are not
-                // evaluated yet. `degradations` reports it exactly once.
-                ConstraintKind::Path => self.note_unsupported("path constraint"),
+                ConstraintKind::Path => self.apply_path_constraint(entry.index as usize),
             }
         }
     }
@@ -798,6 +869,159 @@ impl SkeletonPose {
         }
     }
 
+    // ------------------------------------------------------------ path
+
+    /// Places a chain of bones along a path attachment.
+    ///
+    /// The path is whatever the target slot currently has attached, so it moves
+    /// with the skeleton and deforms with it. A slot with no path attached is
+    /// not an error: a skin may legitimately leave it off, and the constraint
+    /// then has nothing to follow.
+    fn apply_path_constraint(&mut self, index: usize) {
+        let Some(constraint) = self.ir.path_constraints.get(index).cloned() else { return };
+        let Some(pose) = self.path.get(index).copied() else { return };
+        if constraint.bones.is_empty() || (pose.mix_rotate == 0.0 && pose.mix_x == 0.0 && pose.mix_y == 0.0) {
+            return;
+        }
+
+        // Everything is read from the pose before anything is written back, so
+        // the whole chain is placed against one consistent skeleton.
+        let Some((geometry, slot_bone)) = self.path_geometry(&constraint) else { return };
+        if geometry.is_empty() {
+            self.note_unsupported("path attachment with too few control points");
+            return;
+        }
+
+        let tangents = constraint.rotate_mode == PathRotateMode::Tangent;
+        let chain_scale = constraint.rotate_mode == PathRotateMode::ChainScale;
+        let bone_count = constraint.bones.len();
+        // The chain modes aim each bone at where the next one sits, so they need
+        // one sample beyond the last bone. Tangent mode reads the direction of
+        // the path itself and does not.
+        let sample_count = if tangents { bone_count } else { bone_count + 1 };
+
+        // Setup lengths, and the same lengths under the current world scale.
+        let setup_lengths: Vec<f32> =
+            constraint.bones.iter().map(|b| self.ir.bones.get(b.index()).map_or(0.0, |x| x.length)).collect();
+        let world_lengths: Vec<f32> = constraint
+            .bones
+            .iter()
+            .zip(&setup_lengths)
+            .map(|(id, setup)| {
+                if *setup < PATH_EPSILON {
+                    return 0.0;
+                }
+                let w = self.bones[id.index()].world;
+                Vec2::new(setup * w.a, setup * w.c).length()
+            })
+            .collect();
+
+        let path_length = geometry.length();
+        let spaces = path_spaces(&constraint, pose.spacing, path_length, sample_count, &setup_lengths, &world_lengths);
+
+        // Sample the path once per bone, walking forward by the gaps.
+        let mut distance = match constraint.position_mode {
+            PathPositionMode::Percent => pose.position * path_length,
+            PathPositionMode::Fixed => pose.position,
+        };
+        let mut samples = Vec::with_capacity(sample_count);
+        for space in spaces.iter().take(sample_count) {
+            distance += space;
+            let Some(sample) = geometry.sample(distance) else { return };
+            samples.push(sample);
+        }
+
+        // A non-zero offset rotates the bone away from the path, and reflects
+        // with the slot so a mirrored skeleton bends the same way.
+        let offset_rotation = if constraint.offset_rotation == 0.0 {
+            0.0
+        } else {
+            let reflect = if slot_bone.a * slot_bone.d - slot_bone.b * slot_bone.c > 0.0 { 1.0f32 } else { -1.0 };
+            constraint.offset_rotation.to_radians() * reflect
+        };
+        // With no offset, a chain also drags the next bone onto its own tip
+        // instead of onto the path, which is what keeps the chain joined up
+        // rather than merely parallel to the path.
+        let tip = constraint.offset_rotation == 0.0 && constraint.rotate_mode == PathRotateMode::Chain;
+
+        let mut here = samples[0].point;
+        let mut lowest = usize::MAX;
+        for i in 0..bone_count {
+            let bone_index = constraint.bones[i].index();
+            let Some(bone) = self.bones.get_mut(bone_index) else { continue };
+            let mut w = bone.world;
+
+            w.tx += (here.x - w.tx) * pose.mix_x;
+            w.ty += (here.y - w.ty) * pose.mix_y;
+
+            // Where the next bone goes, before any tip correction. Tangent
+            // mode samples one point per bone and so has none to spare past the
+            // last one, which only the chain modes would have read anyway.
+            let mut next = samples.get(i + 1).map_or(here, |s| s.point);
+            let delta = next - here;
+
+            if pose.mix_rotate != 0.0 {
+                // A chain aims at the next sample; a degenerate gap has no
+                // direction of its own, so the path tangent stands in.
+                let aim = if tangents {
+                    // Tangent mode follows the path itself rather than the
+                    // shape of the chain.
+                    samples[i].angle
+                } else if delta.length_squared() < PATH_EPSILON * PATH_EPSILON {
+                    // Two samples coincide, so there is no direction between
+                    // them; the path's own direction stands in.
+                    samples.get(i + 1).map_or(samples[i].angle, |s| s.angle)
+                } else {
+                    delta.angle_rad()
+                };
+
+                if chain_scale && world_lengths[i] > PATH_EPSILON {
+                    let s = (delta.length() / world_lengths[i] - 1.0) * pose.mix_rotate + 1.0;
+                    w.a *= s;
+                    w.c *= s;
+                }
+
+                let mut r = aim - w.c.atan2(w.a);
+                if tip {
+                    // Blend the next position between the path sample and where
+                    // this bone's tip actually lands once rotated.
+                    let (sin, cos) = r.sin_cos();
+                    let length = setup_lengths[i];
+                    let point = Vec2::new(length * (cos * w.a - sin * w.c), length * (sin * w.a + cos * w.c));
+                    next += (point - delta) * pose.mix_rotate;
+                } else {
+                    r += offset_rotation;
+                }
+                r = wrap_radians(r) * pose.mix_rotate;
+
+                let (sin, cos) = r.sin_cos();
+                let (a, b, c, d) = (w.a, w.b, w.c, w.d);
+                w.a = cos * a - sin * c;
+                w.b = cos * b - sin * d;
+                w.c = sin * a + cos * c;
+                w.d = sin * b + cos * d;
+            }
+
+            bone.world = w;
+            lowest = lowest.min(bone_index);
+            here = next;
+        }
+
+        self.rebuild_below(&constraint.bones, lowest);
+    }
+
+    /// Resolves the path a constraint follows and measures it in world space.
+    fn path_geometry(&self, constraint: &PathConstraint) -> Option<(PathGeometry, Affine2)> {
+        let slot_index = constraint.target_slot.index();
+        let slot_pose = self.slots.get(slot_index)?;
+        let attachment = self.ir.attachment(slot_pose.attachment?)?;
+        let AttachmentKind::Path(path) = &attachment.kind else { return None };
+        let slot_bone = self.bones.get(self.ir.slots.get(slot_index)?.bone.index())?.world;
+        let world = self.world_vertices(&path.vertices, &slot_pose.deform, slot_bone);
+        let geometry = PathGeometry::measure(&world, path.closed, path.constant_speed, &path.lengths);
+        Some((geometry, slot_bone))
+    }
+
     /// Rebuilds everything below a set of bones whose world matrices were
     /// written directly, leaving those bones as the constraint left them.
     fn rebuild_below(&mut self, bones: &[BoneId], lowest: usize) {
@@ -903,7 +1127,227 @@ fn solve_two_bone_nonuniform(
     }
 }
 
-#[inline]
+/// Distances below this are treated as zero.
+const PATH_EPSILON: f32 = 1e-5;
+/// Samples per curve used to build a constant-speed arc-length table.
+///
+/// Sixteen is enough that the residual error is far below a pixel for the curve
+/// sizes a character rig uses, and the table is built once per frame per path.
+const PATH_SAMPLES: usize = 16;
+
+/// One place on a path: where it is, and which way the path points there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PathSample {
+    point: Vec2,
+    angle: f32,
+}
+
+/// A path attachment measured in world space, ready to be sampled by distance.
+struct PathGeometry {
+    curves: Vec<[Vec2; 4]>,
+    /// Cumulative length at the end of each curve.
+    ends: Vec<f32>,
+    /// Per-curve arc-length tables, cumulative within the curve. Empty when the
+    /// authored lengths are used instead of measured ones.
+    tables: Vec<Vec<f32>>,
+    closed: bool,
+}
+
+impl PathGeometry {
+    fn measure(world: &[Vec2], closed: bool, constant_speed: bool, authored: &[f32]) -> PathGeometry {
+        let curves = path_curves(world, closed);
+        let mut ends = Vec::with_capacity(curves.len());
+        let mut tables = Vec::new();
+
+        // A path authored without constant speed carries its own cumulative
+        // lengths and is walked by curve parameter; one with constant speed has
+        // to be measured, so that equal distances are equal along the curve
+        // rather than equal in parameter.
+        if constant_speed || authored.len() < curves.len() {
+            let mut total = 0.0;
+            for curve in &curves {
+                let mut table = Vec::with_capacity(PATH_SAMPLES + 1);
+                table.push(0.0);
+                let mut run = 0.0;
+                let mut previous = bezier_point(curve, 0.0);
+                for step in 1..=PATH_SAMPLES {
+                    let point = bezier_point(curve, step as f32 / PATH_SAMPLES as f32);
+                    run += (point - previous).length();
+                    table.push(run);
+                    previous = point;
+                }
+                total += run;
+                ends.push(total);
+                tables.push(table);
+            }
+        } else {
+            ends.extend_from_slice(&authored[..curves.len()]);
+        }
+
+        PathGeometry { curves, ends, tables, closed }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.curves.is_empty()
+    }
+
+    fn length(&self) -> f32 {
+        self.ends.last().copied().unwrap_or(0.0)
+    }
+
+    /// The place `distance` along the path.
+    ///
+    /// A closed path wraps. An open one extends along its end tangents, so a
+    /// bone pushed past either end keeps going in a straight line rather than
+    /// piling up at the last control point.
+    fn sample(&self, distance: f32) -> Option<PathSample> {
+        let total = self.length();
+        let mut distance = distance;
+
+        if self.closed {
+            if total <= PATH_EPSILON {
+                return None;
+            }
+            distance = distance.rem_euclid(total);
+        } else if distance < 0.0 {
+            let curve = self.curves.first()?;
+            let direction = unit_tangent(curve, 0.0);
+            return Some(PathSample {
+                point: bezier_point(curve, 0.0) + direction * distance,
+                angle: direction.angle_rad(),
+            });
+        } else if distance > total {
+            let curve = self.curves.last()?;
+            let direction = unit_tangent(curve, 1.0);
+            return Some(PathSample {
+                point: bezier_point(curve, 1.0) + direction * (distance - total),
+                angle: direction.angle_rad(),
+            });
+        }
+
+        let mut index = 0;
+        while index + 1 < self.ends.len() && distance > self.ends[index] {
+            index += 1;
+        }
+        let start = if index == 0 { 0.0 } else { self.ends[index - 1] };
+        let span = self.ends[index] - start;
+        let fraction = if span > PATH_EPSILON { (distance - start) / span } else { 0.0 };
+
+        let curve = self.curves.get(index)?;
+        let t = match self.tables.get(index) {
+            Some(table) => arc_length_to_t(table, fraction),
+            None => fraction,
+        };
+        Some(PathSample { point: bezier_point(curve, t), angle: unit_tangent(curve, t).angle_rad() })
+    }
+}
+
+/// Splits a path attachment's control points into cubic segments.
+///
+/// Anchors sit at vertices 1, 4, 7, ..., with two handles between each pair.
+/// Vertex 0 and the final vertex are the leading and trailing handles: unused
+/// by an open path, and the handles of the wrapping segment when closed.
+fn path_curves(world: &[Vec2], closed: bool) -> Vec<[Vec2; 4]> {
+    let count = world.len();
+    let mut curves = Vec::new();
+    if count < 3 {
+        return curves;
+    }
+    let mut i = 1;
+    while i + 3 < count {
+        curves.push([world[i], world[i + 1], world[i + 2], world[i + 3]]);
+        i += 3;
+    }
+    if closed {
+        curves.push([world[count - 2], world[count - 1], world[0], world[1]]);
+    }
+    curves
+}
+
+/// The gap in world units before each sample, with `spaces[0]` always zero so
+/// the first bone lands exactly on the position the constraint asks for.
+fn path_spaces(
+    constraint: &PathConstraint,
+    spacing: f32,
+    path_length: f32,
+    sample_count: usize,
+    setup_lengths: &[f32],
+    world_lengths: &[f32],
+) -> Vec<f32> {
+    let mut spaces = vec![0.0f32; sample_count];
+    // `spaces[0]` stays zero: the gaps sit *before* each sample, so the first
+    // bone lands exactly on the position the constraint asks for.
+    for (b, space) in spaces.iter_mut().enumerate().skip(1).map(|(i, s)| (i - 1, s)) {
+        let (setup, world) =
+            (setup_lengths.get(b).copied().unwrap_or(0.0), world_lengths.get(b).copied().unwrap_or(0.0));
+        *space = match constraint.spacing_mode {
+            // A fraction of the whole path, so a chain keeps its share of the
+            // path as the path grows or shrinks.
+            PathSpacingMode::Percent => spacing * path_length,
+            // Proportional to bone length, normalised below.
+            PathSpacingMode::Proportional => world,
+            // World units, scaled by how much the bone itself is scaled.
+            _ if setup < PATH_EPSILON => spacing,
+            PathSpacingMode::Length => (setup + spacing) * world / setup,
+            PathSpacingMode::Fixed => spacing * world / setup,
+        };
+    }
+
+    if constraint.spacing_mode == PathSpacingMode::Proportional {
+        // Spread the bones over `spacing` of the path, sharing it out in
+        // proportion to their lengths.
+        let sum: f32 = spaces.iter().sum();
+        let factor = if sum > PATH_EPSILON { spacing * path_length / sum } else { 0.0 };
+        for space in spaces.iter_mut() {
+            *space *= factor;
+        }
+    }
+    spaces
+}
+
+/// Maps a fraction of a curve's arc length to its Bézier parameter.
+fn arc_length_to_t(table: &[f32], fraction: f32) -> f32 {
+    let steps = table.len().saturating_sub(1);
+    let total = table.last().copied().unwrap_or(0.0);
+    if steps == 0 || total <= PATH_EPSILON {
+        return fraction;
+    }
+    let target = fraction.clamp(0.0, 1.0) * total;
+    // The table is monotonic, so walking it and interpolating inside the
+    // bracketing pair is both correct and cheap at this resolution.
+    for i in 1..=steps {
+        if table[i] >= target {
+            let span = table[i] - table[i - 1];
+            let within = if span > PATH_EPSILON { (target - table[i - 1]) / span } else { 0.0 };
+            return (i as f32 - 1.0 + within) / steps as f32;
+        }
+    }
+    1.0
+}
+
+fn bezier_point(c: &[Vec2; 4], t: f32) -> Vec2 {
+    let u = 1.0 - t;
+    c[0] * (u * u * u) + c[1] * (3.0 * u * u * t) + c[2] * (3.0 * u * t * t) + c[3] * (t * t * t)
+}
+
+/// Unit direction of the curve at `t`.
+///
+/// A cubic can have a zero-length derivative where two control points coincide,
+/// which is common at the ends of an authored path; the neighbouring chord
+/// stands in there so the direction is never arbitrary.
+fn unit_tangent(c: &[Vec2; 4], t: f32) -> Vec2 {
+    let u = 1.0 - t;
+    let d = (c[1] - c[0]) * (3.0 * u * u) + (c[2] - c[1]) * (6.0 * u * t) + (c[3] - c[2]) * (3.0 * t * t);
+    if d.length() > PATH_EPSILON {
+        return d / d.length();
+    }
+    let chord = c[3] - c[0];
+    if chord.length() > PATH_EPSILON {
+        return chord / chord.length();
+    }
+    Vec2::new(1.0, 0.0)
+}
+
 /// Wraps degrees into `[-180, 180)`.
 ///
 /// The local modes interpolate rotations in degrees, and without this a
@@ -913,6 +1357,7 @@ fn wrap_degrees(r: f32) -> f32 {
     r - (r / 360.0 + 0.5).floor() * 360.0
 }
 
+#[inline]
 fn wrap_radians(mut r: f32) -> f32 {
     const PI2: f32 = std::f32::consts::PI * 2.0;
     if r > std::f32::consts::PI {
@@ -926,7 +1371,7 @@ fn wrap_radians(mut r: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use a2d_core::ir::spine::{Bone, IkConstraint, Slot};
+    use a2d_core::ir::spine::{Attachment, Bone, IkConstraint, PathAttachment, Skin, SkinEntry, Slot};
 
     fn assert_close(a: f32, b: f32, what: &str) {
         assert!((a - b).abs() < 1e-3, "{what}: {a} != {b}");
@@ -1432,11 +1877,276 @@ mod tests {
         assert_eq!(pose.bones[0].local.position, Vec2::new(1.0, 2.0));
     }
 
+    // ------------------------------------------------------- path constraints
+    //
+    // A straight path is the fixture of choice: its arc length is exactly the
+    // distance between its ends, so where each bone should land can be worked
+    // out by hand instead of copied from a reference run. The control-point
+    // layout -- anchors at vertices 1, 4, 7, ... with the first and last
+    // vertices as unused handles -- is inferred from the two places the
+    // reference runtime indexes into it, and is what the §11 cross-check
+    // against the official runtime would confirm.
+
+    /// A straight horizontal path from `(0, 0)` to `(length, 0)` as one cubic,
+    /// with handles placed so the parameterisation is uniform.
+    fn straight_path(length: f32) -> Vec<Vec2> {
+        vec![
+            Vec2::new(-1.0, 0.0),               // leading handle, unused
+            Vec2::new(0.0, 0.0),                // anchor: the start
+            Vec2::new(length / 3.0, 0.0),       // handle
+            Vec2::new(length * 2.0 / 3.0, 0.0), // handle
+            Vec2::new(length, 0.0),             // anchor: the end
+            Vec2::new(length + 1.0, 0.0),       // trailing handle, unused
+        ]
+    }
+
+    struct Pc {
+        vertices: Vec<Vec2>,
+        closed: bool,
+        constant_speed: bool,
+        lengths: Vec<f32>,
+        bones: usize,
+        bone_length: f32,
+        position: f32,
+        spacing: f32,
+        position_mode: PathPositionMode,
+        spacing_mode: PathSpacingMode,
+        rotate_mode: PathRotateMode,
+        offset_rotation: f32,
+        mix: f32,
+    }
+
+    impl Pc {
+        fn new(bones: usize) -> Self {
+            Pc {
+                vertices: straight_path(100.0),
+                closed: false,
+                constant_speed: true,
+                lengths: Vec::new(),
+                bones,
+                bone_length: 10.0,
+                position: 0.0,
+                spacing: 10.0,
+                position_mode: PathPositionMode::Fixed,
+                spacing_mode: PathSpacingMode::Fixed,
+                rotate_mode: PathRotateMode::Tangent,
+                offset_rotation: 0.0,
+                mix: 1.0,
+            }
+        }
+
+        /// Bone 0 carries the path slot; the constrained bones follow it.
+        fn pose(self) -> SkeletonPose {
+            let mut bones = vec![bone("root", None, BoneLocal::default(), 0.0)];
+            for i in 0..self.bones {
+                bones.push(bone(&format!("b{i}"), Some(0), BoneLocal::default(), self.bone_length));
+            }
+            let count = self.vertices.len();
+            let mut ir = SpineIr {
+                bones,
+                slots: vec![Slot { setup_attachment: Some("route".into()), ..Slot::new("route", BoneId(0)) }],
+                attachments: vec![Attachment {
+                    name: "route".into(),
+                    kind: AttachmentKind::Path(PathAttachment {
+                        closed: self.closed,
+                        constant_speed: self.constant_speed,
+                        lengths: self.lengths.clone(),
+                        vertices: VertexData::Rigid(self.vertices.clone()),
+                        color: Rgba::WHITE,
+                    }),
+                }],
+                skins: vec![Skin::new("default")],
+                ..Default::default()
+            };
+            let _ = count;
+            ir.skins[0].entries.push(SkinEntry {
+                slot: SlotId(0),
+                name: "route".into(),
+                attachment: a2d_core::ir::ids::AttachmentId(0),
+            });
+            ir.path_constraints.push(PathConstraint {
+                name: "pc".into(),
+                order: 0,
+                skin_required: false,
+                bones: (0..self.bones).map(|i| BoneId(i as u16 + 1)).collect(),
+                target_slot: SlotId(0),
+                position_mode: self.position_mode,
+                spacing_mode: self.spacing_mode,
+                rotate_mode: self.rotate_mode,
+                offset_rotation: self.offset_rotation,
+                position: self.position,
+                spacing: self.spacing,
+                mix_rotate: self.mix,
+                mix_x: self.mix,
+                mix_y: self.mix,
+            });
+            ir.rebuild_derived();
+            SkeletonPose::new(Arc::new(ir))
+        }
+    }
+
     #[test]
-    fn path_constraints_are_reported_as_unsupported_exactly_once() {
-        use a2d_core::ir::spine::{PathConstraint, PathPositionMode, PathRotateMode, PathSpacingMode};
+    fn a_chain_is_laid_out_along_a_straight_path() {
+        // Fixed spacing with unit bone scale means the gaps are the spacing
+        // outright: bones land at 0, 10, 20 along a 100-unit path.
+        let mut pc = Pc::new(3);
+        pc.spacing = 10.0;
+        let pose = pc.pose();
+        for (i, expected) in [0.0, 10.0, 20.0].into_iter().enumerate() {
+            let p = pose.bones[i + 1].world.translation();
+            assert_close(p.x, expected, &format!("bone {i} x"));
+            assert_close(p.y, 0.0, &format!("bone {i} y"));
+        }
+    }
+
+    #[test]
+    fn the_position_offsets_the_whole_chain() {
+        let mut pc = Pc::new(2);
+        pc.position = 25.0;
+        pc.spacing = 10.0;
+        let pose = pc.pose();
+        assert_close(pose.bones[1].world.translation().x, 25.0, "first");
+        assert_close(pose.bones[2].world.translation().x, 35.0, "second");
+    }
+
+    #[test]
+    fn percent_position_is_a_fraction_of_the_path() {
+        let mut pc = Pc::new(1);
+        pc.position_mode = PathPositionMode::Percent;
+        pc.position = 0.25;
+        let pose = pc.pose();
+        assert_close(pose.bones[1].world.translation().x, 25.0, "quarter of the way");
+    }
+
+    #[test]
+    fn percent_spacing_is_a_fraction_of_the_path() {
+        let mut pc = Pc::new(2);
+        pc.spacing_mode = PathSpacingMode::Percent;
+        pc.spacing = 0.2;
+        let pose = pc.pose();
+        assert_close(pose.bones[1].world.translation().x, 0.0, "first");
+        assert_close(pose.bones[2].world.translation().x, 20.0, "a fifth of 100");
+    }
+
+    #[test]
+    fn length_spacing_adds_the_bone_length_to_the_gap() {
+        // Length mode places bones a bone-length plus the spacing apart, which
+        // is what keeps a chain of bones touching end to end.
+        let mut pc = Pc::new(2);
+        pc.spacing_mode = PathSpacingMode::Length;
+        pc.bone_length = 10.0;
+        pc.spacing = 5.0;
+        let pose = pc.pose();
+        assert_close(pose.bones[2].world.translation().x, 15.0, "length plus spacing");
+    }
+
+    #[test]
+    fn tangent_mode_points_every_bone_along_the_path() {
+        let mut pc = Pc::new(2);
+        pc.rotate_mode = PathRotateMode::Tangent;
+        pc.vertices = straight_path(100.0).into_iter().map(|v| Vec2::new(v.y, v.x)).collect();
+        let pose = pc.pose();
+        // The path now runs straight up, so the bones should too.
+        for i in 1..=2 {
+            assert_close(pose.bones[i].world.rotation_x_rad().to_degrees(), 90.0, "points up");
+        }
+    }
+
+    #[test]
+    fn a_zero_mix_leaves_the_chain_where_it_was() {
+        let mut pc = Pc::new(2);
+        pc.position = 50.0;
+        pc.mix = 0.0;
+        let pose = pc.pose();
+        assert_close(pose.bones[1].world.translation().x, 0.0, "untouched");
+        assert_close(pose.bones[2].world.translation().x, 0.0, "untouched");
+    }
+
+    #[test]
+    fn half_a_translation_mix_lands_half_way_there() {
+        let mut pc = Pc::new(1);
+        pc.position = 40.0;
+        pc.mix = 0.5;
+        let pose = pc.pose();
+        // From 0 towards 40, half way.
+        assert_close(pose.bones[1].world.translation().x, 20.0, "half way");
+    }
+
+    #[test]
+    fn running_off_the_end_continues_in_a_straight_line() {
+        // An open path must extrapolate rather than pile bones up on the last
+        // control point, or a chain longer than its path collapses.
+        let mut pc = Pc::new(2);
+        pc.position = 95.0;
+        pc.spacing = 20.0;
+        let pose = pc.pose();
+        assert_close(pose.bones[1].world.translation().x, 95.0, "still on the path");
+        assert_close(pose.bones[2].world.translation().x, 115.0, "past the end");
+    }
+
+    #[test]
+    fn a_negative_position_extrapolates_backwards() {
+        let mut pc = Pc::new(1);
+        pc.position = -15.0;
+        let pose = pc.pose();
+        assert_close(pose.bones[1].world.translation().x, -15.0, "before the start");
+    }
+
+    #[test]
+    fn a_closed_path_wraps_instead_of_extrapolating() {
+        // Four cubics round a square, 100 a side: the corners are the anchors.
+        let mut pc = Pc::new(1);
+        pc.closed = true;
+        pc.vertices = square_path(100.0);
+        pc.position = 410.0; // once round (400) plus 10
+        let pose = pc.pose();
+        let p = pose.bones[1].world.translation();
+        assert_close(p.x, 10.0, "wrapped x");
+        assert_close(p.y, 0.0, "wrapped y");
+    }
+
+    /// A closed square path, side `side`, anticlockwise from the origin.
+    ///
+    /// Closed layout, for four segments: anchors at 1, 4, 7, 10, and the
+    /// wrapping segment is `[10, 11, 0, 1]` -- so its two handles sit at
+    /// opposite ends of the array. Handles lie on the edges, keeping each side
+    /// straight and every side exactly `side` long.
+    fn square_path(side: f32) -> Vec<Vec2> {
+        let a = [Vec2::ZERO, Vec2::new(side, 0.0), Vec2::new(side, side), Vec2::new(0.0, side)];
+        vec![
+            lerp_vec(a[3], a[0], 2.0 / 3.0), // second handle of the wrapping segment
+            a[0],
+            lerp_vec(a[0], a[1], 1.0 / 3.0),
+            lerp_vec(a[0], a[1], 2.0 / 3.0),
+            a[1],
+            lerp_vec(a[1], a[2], 1.0 / 3.0),
+            lerp_vec(a[1], a[2], 2.0 / 3.0),
+            a[2],
+            lerp_vec(a[2], a[3], 1.0 / 3.0),
+            lerp_vec(a[2], a[3], 2.0 / 3.0),
+            a[3],
+            lerp_vec(a[3], a[0], 1.0 / 3.0), // first handle of the wrapping segment
+        ]
+    }
+
+    fn lerp_vec(a: Vec2, b: Vec2, t: f32) -> Vec2 {
+        a + (b - a) * t
+    }
+
+    #[test]
+    fn a_path_with_too_few_points_is_reported_rather_than_guessed() {
+        let mut pc = Pc::new(1);
+        pc.vertices = vec![Vec2::ZERO, Vec2::new(1.0, 0.0)];
+        let pose = pc.pose();
+        assert!(!pose.degradations().is_empty(), "a degenerate path should be reported");
+    }
+
+    #[test]
+    fn a_slot_with_no_path_attached_is_not_an_error() {
+        // A skin may leave the path off; the constraint then has nothing to do
+        // and must not report a problem.
         let mut ir = SpineIr {
-            bones: vec![bone("root", None, BoneLocal::default(), 0.0)],
+            bones: vec![bone("root", None, BoneLocal::default(), 0.0), bone("b", Some(0), at(5.0, 0.0), 10.0)],
             slots: vec![Slot::new("route", BoneId(0))],
             ..Default::default()
         };
@@ -1444,7 +2154,7 @@ mod tests {
             name: "pc".into(),
             order: 0,
             skin_required: false,
-            bones: vec![BoneId(0)],
+            bones: vec![BoneId(1)],
             target_slot: SlotId(0),
             position_mode: PathPositionMode::default(),
             spacing_mode: PathSpacingMode::default(),
@@ -1457,13 +2167,21 @@ mod tests {
             mix_y: 1.0,
         });
         ir.rebuild_derived();
-        let mut pose = SkeletonPose::new(Arc::new(ir));
-        for _ in 0..10 {
-            pose.update_world_transforms();
-        }
-        assert_eq!(pose.degradations().len(), 1);
-        let mut report = LoadReport::new();
-        pose.absorb_degradations(&mut report);
-        assert!(report.to_string().contains("path constraint"), "{report}");
+        let pose = SkeletonPose::new(Arc::new(ir));
+        assert!(pose.degradations().is_empty(), "{:?}", pose.degradations());
+        // The bone keeps its own placement.
+        assert_close(pose.bones[1].world.translation().x, 5.0, "left alone");
+    }
+
+    #[test]
+    fn an_authored_length_is_used_when_the_path_is_not_constant_speed() {
+        // The authored cumulative length stands in for measuring, so a path
+        // declaring itself 200 long puts the half-way bone at parameter 0.5.
+        let mut pc = Pc::new(1);
+        pc.constant_speed = false;
+        pc.lengths = vec![200.0];
+        pc.position = 100.0;
+        let pose = pc.pose();
+        assert_close(pose.bones[1].world.translation().x, 50.0, "half the curve, not half the geometry");
     }
 }

@@ -303,12 +303,82 @@ fn apply_timeline(
             p.mix_shear_y = lerp(from[5], to[5], alpha);
         }
 
-        // Path constraints are not evaluated yet; `SkeletonPose` reports that
-        // once, so animating their mixes is silently inert rather than wrong.
-        Timeline::PathPosition { .. } | Timeline::PathSpacing { .. } => {}
-        Timeline::PathMix { .. } => {
-            let _: Option<&Vec<PathMixKey>> = None;
+        Timeline::PathPosition { constraint, keys } => {
+            let i = constraint.index();
+            let Some(setup) = pose.ir().path_constraints.get(i).map(|c| c.position) else { return };
+            let Some(value) = sample_scalar(keys, time) else {
+                if blend == MixBlend::Setup {
+                    if let Some(p) = pose.path.get_mut(i) {
+                        p.position = setup;
+                    }
+                }
+                return;
+            };
+            let Some(p) = pose.path.get_mut(i) else { return };
+            p.position = match blend {
+                MixBlend::Add => p.position + (value - setup) * alpha,
+                MixBlend::Setup => lerp(setup, value, alpha),
+                MixBlend::Replace => lerp(p.position, value, alpha),
+            };
         }
+
+        Timeline::PathSpacing { constraint, keys } => {
+            let i = constraint.index();
+            let Some(setup) = pose.ir().path_constraints.get(i).map(|c| c.spacing) else { return };
+            let Some(value) = sample_scalar(keys, time) else {
+                if blend == MixBlend::Setup {
+                    if let Some(p) = pose.path.get_mut(i) {
+                        p.spacing = setup;
+                    }
+                }
+                return;
+            };
+            let Some(p) = pose.path.get_mut(i) else { return };
+            p.spacing = match blend {
+                MixBlend::Add => p.spacing + (value - setup) * alpha,
+                MixBlend::Setup => lerp(setup, value, alpha),
+                MixBlend::Replace => lerp(p.spacing, value, alpha),
+            };
+        }
+
+        Timeline::PathMix { constraint, keys } => {
+            let i = constraint.index();
+            let Some(setup) = pose.ir().path_constraints.get(i).cloned() else { return };
+            let Some(key) = search_keys(keys, time, |k| k.time) else {
+                if blend == MixBlend::Setup {
+                    if let Some(p) = pose.path.get_mut(i) {
+                        p.mix_rotate = setup.mix_rotate;
+                        p.mix_x = setup.mix_x;
+                        p.mix_y = setup.mix_y;
+                    }
+                }
+                return;
+            };
+            let k = interpolate_path_mix(keys, key, time);
+            let Some(p) = pose.path.get_mut(i) else { return };
+            let from = if blend == MixBlend::Setup {
+                [setup.mix_rotate, setup.mix_x, setup.mix_y]
+            } else {
+                [p.mix_rotate, p.mix_x, p.mix_y]
+            };
+            p.mix_rotate = lerp(from[0], k.mix_rotate, alpha);
+            p.mix_x = lerp(from[1], k.mix_x, alpha);
+            p.mix_y = lerp(from[2], k.mix_y, alpha);
+        }
+    }
+}
+
+/// Interpolates a path mix keyframe, all three channels sharing one curve.
+fn interpolate_path_mix(keys: &[PathMixKey], i: usize, time: f32) -> PathMixKey {
+    let a = keys[i];
+    let Some(t) = span_t(keys, i, time, |k| k.time) else { return a };
+    let b = keys[i + 1];
+    let t = a.interp.apply(t);
+    PathMixKey {
+        mix_rotate: lerp(a.mix_rotate, b.mix_rotate, t),
+        mix_x: lerp(a.mix_x, b.mix_x, t),
+        mix_y: lerp(a.mix_y, b.mix_y, t),
+        ..a
     }
 }
 

@@ -175,35 +175,11 @@ fn skinned_mesh(
 }
 
 /// World positions for a vertex set, applying deform offsets and skinning.
+///
+/// Lives on the pose because path constraints need exactly the same geometry:
+/// the path they follow is an attachment, skinned and deformed like any other.
 fn deform_positions(pose: &SkeletonPose, vertices: &VertexData, deform: &[f32], slot_bone: Affine2) -> Vec<Vec2> {
-    match vertices {
-        VertexData::Rigid(local) => local
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let dx = deform.get(i * 2).copied().unwrap_or(0.0);
-                let dy = deform.get(i * 2 + 1).copied().unwrap_or(0.0);
-                slot_bone.transform_point(Vec2::new(v.x + dx, v.y + dy))
-            })
-            .collect(),
-        VertexData::Weighted(w) => {
-            let mut out = Vec::with_capacity(w.vertex_count());
-            for vertex in 0..w.vertex_count() {
-                let start = w.offsets.get(vertex).copied().unwrap_or(0) as usize;
-                let mut sum = Vec2::ZERO;
-                for (n, influence) in w.influences_for(vertex).iter().enumerate() {
-                    let f = (start + n) * 2;
-                    let dx = deform.get(f).copied().unwrap_or(0.0);
-                    let dy = deform.get(f + 1).copied().unwrap_or(0.0);
-                    let local = Vec2::new(influence.position.x + dx, influence.position.y + dy);
-                    let Some(bone) = pose.bones.get(influence.bone.index()) else { continue };
-                    sum += bone.world.transform_point(local) * influence.weight;
-                }
-                out.push(sum);
-            }
-            out
-        }
-    }
+    pose.world_vertices(vertices, deform, slot_bone)
 }
 
 /// World-space polygon for a clipping or bounding-box attachment.
