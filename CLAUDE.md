@@ -20,18 +20,19 @@ goal is unverified without real assets; Phase 6 implemented.
 
 Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x),
 `a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints in all four
-modes, mixing,
+modes, path constraints, mixing,
 idle), `a2d-pack`, `a2d-import` (generic + aeons_echo), `a2d-render` (wgpu, batching, blend
 modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transparent frameless
 window, drag, scale, click-through, always-on-top, tray, config persistence), `a2d-cli`.
 
 Not implemented: `a2d-unity`, `a2d-cubism`.
-Known gaps, all reported rather than silently ignored: Spine 4.x and 2.x binary layouts,
-and path constraints, which are decoded into the IR but not yet evaluated.
+Known gaps, all reported rather than silently ignored: Spine 4.x and 2.x binary layouts.
 
-The four transform-constraint modes are pinned by property tests, not by comparison against
-the official runtime. The §11 cross-implementation check is still outstanding and is what
-would catch a term in the wrong place.
+The Spine constraint set is now complete: IK, transform in all four modes, and path.
+The transform modes and the path control-point layout are pinned by property tests and by
+hand-computed geometry, not by comparison against the official runtime. The §11
+cross-implementation check is still outstanding and is what would catch a term in the
+wrong place or a misread vertex layout.
 
 `a2d-cubism` is blocked on the Cubism Core decision in §13.1, which is why §12's first
 task has not been started.
@@ -335,9 +336,14 @@ at least one visual regression test exists per runtime family.
 
 ## 13. Open decisions — ask the user, do not decide silently
 
-1. **Cubism Core.** Live2D's official Cubism Core is a proprietary native library with license
-   terms; an independent MOC3 parser is technically possible but is a legal/effort tradeoff.
-   This choice changes the whole `a2d-cubism` design. **Ask before writing MOC3 code.**
+1. **Cubism Core — DECIDED (2026-08-24): independent MOC3 parser.**
+   `a2d-cubism` decodes MOC3 in Rust and does **not** link Live2D's proprietary Cubism Core.
+   This keeps the project redistributable and free of proprietary binaries (§11, §16), at the
+   cost of reverse-engineering an undocumented binary format. Consequences to hold to:
+   parameter and deformer evaluation must be derived and tested, not assumed; every
+   unrecognised MOC3 section is reported as a `Degradation`, never skipped silently; and
+   visual parity against a known-good viewer is the acceptance bar, per §11 cross-impl.
+   Do not add Cubism Core as a fallback without asking again.
 2. **Desktop shell.** Default plan is `winit` + `wgpu` + `tray-icon` (transparent, click-through,
    always-on-top all work, and the wgpu surface is owned directly). Tauri v2 is the alternative if
    a Next.js control panel is wanted — but compositing wgpu under a WebView adds real friction.

@@ -121,18 +121,18 @@ animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開�
 | --- | --- |
 | `a2d-core` | **実装済み** — IR、数学、`AnimatedModel`、`RenderMesh`、エラー分類、`LoadReport` |
 | `a2d-spine` | **実装済み（3.x / JSON 4.x）** — atlas パーサ、内容ベースのバージョン検出、JSON デコーダ（2.x/3.x/4.x 方言）、バイナリデコーダ（3.x）、正規化 |
-| `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント（world / local × absolute / relative の 4 モード）、トラック／キュー／クロスフェード、idle ロジック |
+| `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント（world / local × absolute / relative の 4 モード）、path コンストレイント（Tangent / Chain / ChainScale、4 種の spacing モード）、トラック／キュー／クロスフェード、idle ロジック |
 | `a2d-pack` | **実装済み** — 決定論的な `model.bin`、`manifest.json`、`validate` |
 | `a2d-import` | **実装済み（generic / aeons_echo）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
 | `a2d-cli` | **実装済み** — `inspect` / `import` / `validate` / `preview`（実描画・PNG 出力対応） |
 | `a2d-render` | **実装済み** — wgpu 描画、テクスチャキャッシュ、バッチング、4 ブレンドモード、ステンシルクリッピング、high-DPI、透過背景、オフスクリーン描画と読み戻し |
 | `a2d-desktop` | **実装済み** — 透過フレームレスウィンドウ、ドラッグ、スクロール拡縮、クリックスルー、最前面、トレイメニュー、モデル／アニメーション選択、設定永続化 |
 | `a2d-unity` | **未実装** — Unity serialized file リーダ |
-| `a2d-cubism` | **未実装** — MOC3 の扱いが未決定のため着手していません（下記「未決定事項」） |
+| `a2d-cubism` | **未実装** — MOC3 は独自パーサで読む方針が決定済み（Cubism Core は使いません）。実装は未着手 |
 
 未対応の機能は黙って無視されるのではなく、`LoadReport` として `inspect` / `import` /
-`validate` に必ず出力されます。既知の未対応: Spine 4.x バイナリ、Spine 2.x バイナリ、path コンストレイント
-（IR には取り込まれますが、まだ評価されません）。
+`validate` に必ず出力されます。既知の未対応: Spine 4.x バイナリ、Spine 2.x バイナリ。
+Spine のコンストレイントは IK / transform / path すべて実装済みです。
 
 ```bash
 animated2d preview character.a2dpack            # デスクトップビューアで開く
