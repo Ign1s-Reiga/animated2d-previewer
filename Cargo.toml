@@ -5,6 +5,7 @@ members = [
     "crates/a2d-spine",
     "crates/a2d-cubism",
     "crates/a2d-unity",
+    "crates/a2d-import",
     "crates/a2d-pack",
     "crates/a2d-runtime",
     "crates/a2d-render",
@@ -23,6 +24,7 @@ a2d-core    = { path = "crates/a2d-core" }
 a2d-spine   = { path = "crates/a2d-spine" }
 a2d-cubism  = { path = "crates/a2d-cubism" }
 a2d-unity   = { path = "crates/a2d-unity" }
+a2d-import  = { path = "crates/a2d-import" }
 a2d-pack    = { path = "crates/a2d-pack" }
 a2d-runtime = { path = "crates/a2d-runtime" }
 a2d-render  = { path = "crates/a2d-render" }

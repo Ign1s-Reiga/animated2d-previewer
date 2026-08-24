@@ -10,12 +10,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "a2d-cubism"
+version = "0.1.0"
+dependencies = [
+ "a2d-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "a2d-desktop"
+version = "0.1.0"
+dependencies = [
+ "a2d-core",
+ "a2d-pack",
+ "a2d-render",
+ "a2d-runtime",
+]
+
+[[package]]
 name = "a2d-pack"
 version = "0.1.0"
 dependencies = [
  "a2d-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "a2d-render"
+version = "0.1.0"
+dependencies = [
+ "a2d-core",
 ]
 
 [[package]]
@@ -32,6 +58,13 @@ dependencies = [
  "a2d-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "a2d-unity"
+version = "0.1.0"
+dependencies = [
+ "a2d-core",
 ]
 
 [[package]]

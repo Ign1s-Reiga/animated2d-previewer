@@ -1,0 +1,15 @@
+[package]
+name = "a2d-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Game-specific asset discovery and reconstruction."
+
+[dependencies]
+a2d-core.workspace = true
+a2d-unity.workspace = true
+a2d-spine.workspace = true
+a2d-cubism.workspace = true
+a2d-pack.workspace = true
