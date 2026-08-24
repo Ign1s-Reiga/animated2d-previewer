@@ -125,11 +125,11 @@ animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開�
 | `a2d-spine` | **実装済み** — atlas パーサ、内容ベースのバージョン検出、JSON デコーダ（2.x/3.x/4.x 方言）、バイナリデコーダ（3.x / 4.0・4.1）、正規化 |
 | `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント（world / local × absolute / relative の 4 モード）、path コンストレイント（Tangent / Chain / ChainScale、4 種の spacing モード）、トラック／キュー／クロスフェード、idle ロジック |
 | `a2d-pack` | **実装済み** — 決定論的な `model.bin`、`manifest.json`、`validate` |
-| `a2d-import` | **実装済み（generic / spine_bytes）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
+| `a2d-import` | **実装済み（generic / spine_bytes / unity_cubism の調査まで）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
 | `a2d-cli` | **実装済み** — `inspect` / `import` / `validate` / `preview`（実描画・PNG 出力対応） |
 | `a2d-render` | **実装済み** — wgpu 描画、テクスチャキャッシュ、バッチング、4 ブレンドモード、ステンシルクリッピング、high-DPI、透過背景、オフスクリーン描画と読み戻し |
 | `a2d-desktop` | **実装済み** — 透過フレームレスウィンドウ、ドラッグ、スクロール拡縮、クリックスルー、最前面、トレイメニュー、モデル／アニメーション選択、設定永続化 |
-| `a2d-unity` | **未実装** — Unity serialized file リーダ |
+| `a2d-unity` | **実装済み（読み取り）** — UnityFS コンテナ、serialized file、オブジェクト目録。実バンドルで検証済み |
 | `a2d-cubism` | **未実装** — MOC3 は独自パーサで読む方針が決定済み（Cubism Core は使いません）。実装は未着手 |
 
 未対応の機能は黙って無視されるのではなく、`LoadReport` として `inspect` / `import` /

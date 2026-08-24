@@ -218,7 +218,7 @@ fn read_mono_script(file: &SerializedFile, object: &Object) -> Result<ScriptInfo
 
 /// The bundle's `m_Container`: authored path to object.
 ///
-/// This is what preserves `assets/.../zjmoushi.asset` after the editor is gone,
+/// This is what preserves an asset's authored path after the editor is gone,
 /// and it is the only reliable way to tell which of many `MonoBehaviour`s is the
 /// model, the fade list, or a motion.
 fn read_asset_bundle_container(file: &SerializedFile, object: &Object) -> Result<HashMap<i64, String>, DecodeError> {

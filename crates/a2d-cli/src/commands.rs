@@ -97,8 +97,17 @@ fn resolve_importer(input: &Path, requested: Option<&str>) -> Result<Importer, D
 
 /// `animated2d inspect <input>`
 pub fn inspect(out: &mut dyn std::io::Write, input: &Path, game: Option<&str>) -> Result<(), CliError> {
-    let importer = resolve_importer(input, game)?;
     writeln!(out, "Input:    {}", input.display())?;
+
+    // A Unity bundle holds a whole model rather than files on disk, so it is
+    // opened directly. Which importer applies cannot be told from the container
+    // alone -- Spine and Cubism ship in identical archives -- so the answer
+    // comes from what is inside, and is printed there rather than guessed here.
+    if let Some(bytes) = unity_bundle_bytes(input) {
+        return inspect_unity_bundle(out, &bytes);
+    }
+
+    let importer = resolve_importer(input, game)?;
     writeln!(out, "Importer: {}", importer.as_str())?;
 
     // Identify every file first, so a directory that holds nothing loadable
@@ -333,6 +342,84 @@ Rendered frames:"
 }
 
 /// Classifies every file at `path` for the `inspect` listing.
+/// Reads `input` when it is a Unity bundle, by content rather than by name.
+fn unity_bundle_bytes(input: &Path) -> Option<Vec<u8>> {
+    if !input.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(input).ok()?;
+    matches!(a2d_import::classify(&bytes), a2d_import::AssetKind::UnityBundle { .. }).then_some(bytes)
+}
+
+/// Prints the structured inventory of a Unity bundle (spec §12).
+fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<(), CliError> {
+    let mut report = LoadReport::new();
+    let inventory = a2d_import::inspect_bundle(bytes, &mut report)?;
+
+    writeln!(out, "Importer: {}", if inventory.is_cubism() { "unity_cubism" } else { "(undetermined)" })?;
+    writeln!(out, "\nUnity bundle")?;
+    writeln!(out, "  built with:  {}", inventory.unity_revision)?;
+    writeln!(out, "  objects:     {}", inventory.object_count)?;
+
+    match &inventory.moc {
+        Some(moc) => {
+            writeln!(out, "\nCubism model: {}", moc.name)?;
+            writeln!(out, "  moc3:        {} bytes, format version {}", moc.bytes.len(), moc.version)?;
+            if let Some(path) = &moc.asset_path {
+                writeln!(out, "  authored at: {path}")?;
+            }
+            writeln!(out, "  parameters:  {}", inventory.parameters)?;
+            writeln!(out, "  parts:       {}", inventory.parts)?;
+            writeln!(out, "  drawables:   {}", inventory.drawables)?;
+            writeln!(out, "  hierarchy:   {} GameObjects", inventory.game_objects)?;
+        }
+        None => writeln!(out, "\nNo CubismMoc found: this bundle holds no Live2D model.")?,
+    }
+
+    writeln!(out, "\n  textures:")?;
+    if inventory.textures.is_empty() {
+        writeln!(out, "    (none)")?;
+    }
+    for texture in &inventory.textures {
+        match &texture.asset_path {
+            Some(path) => writeln!(out, "    {}  ({path})", texture.name)?,
+            None => writeln!(out, "    {}", texture.name)?,
+        }
+    }
+
+    writeln!(out, "\n  motions:")?;
+    if inventory.motions.is_empty() {
+        writeln!(out, "    (none)")?;
+    }
+    for motion in &inventory.motions {
+        // Fade data is what preserves a motion's original identity, so whether
+        // it survived is worth saying per motion rather than as a total.
+        let fade = if motion.has_fade_data { "" } else { "  (no fade data)" };
+        writeln!(out, "    {}{fade}", motion.name)?;
+    }
+
+    if !inventory.animator_controllers.is_empty() {
+        writeln!(out, "\n  animator controllers:")?;
+        for name in &inventory.animator_controllers {
+            writeln!(out, "    {name}")?;
+        }
+    }
+
+    if !inventory.fade_sources.is_empty() {
+        writeln!(out, "\n  original motion sources:")?;
+        for path in &inventory.fade_sources {
+            writeln!(out, "    {path}")?;
+        }
+    }
+
+    print_report(out, &report)?;
+    writeln!(
+        out,
+        "\nReconstruction is not implemented yet: this reports what the bundle holds, \nnot a package that can be loaded."
+    )?;
+    Ok(())
+}
+
 fn classify_path(path: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if path.is_file() {

@@ -31,7 +31,9 @@ idle), `a2d-pack`, `a2d-import` (generic + spine_bytes), `a2d-render` (wgpu, bat
 modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transparent frameless
 window, drag, scale, click-through, always-on-top, tray, config persistence), `a2d-cli`.
 
-Not implemented: `a2d-unity`, `a2d-cubism`.
+Partly implemented: `a2d-unity` (UnityFS container, serialized files, object inventory) and
+`a2d-import`'s `unity_cubism` discovery, which reports what a bundle holds. Not implemented:
+`a2d-cubism`, and reconstruction of a loadable package from a bundle.
 Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 binary layouts.
 
 **The 4.0/4.1 binary decoder has not been checked against a real export.** Its tests
@@ -363,9 +365,12 @@ at least one visual regression test exists per runtime family.
    always-on-top all work, and the wgpu surface is owned directly). Tauri v2 is the alternative if
    a Next.js control panel is wanted — but compositing wgpu under a WebView adds real friction.
    Current plan: native window for the character, optional separate control panel later.
-3. **Unity deserialization.** Third-party crates exist for Unity serialized files; maturity varies
-   and must be verified against the actual bundle before adopting. Falling back to a
-   purpose-built minimal reader in `a2d-unity` is acceptable — the importer boundary contains it.
+3. **Unity deserialization — DECIDED (2026-08-25): purpose-built reader.**
+   `a2d-unity` reads UnityFS containers and serialized files itself. The Rust options are young,
+   the surface actually needed is small, and the importer boundary contains the cost. One
+   dependency is taken — `lz4_flex`, decode-only — because a hand-rolled LZ4 bug would corrupt
+   everything downstream silently. Validated against a real 2022.3 bundle: the object count and
+   class histogram match UnityPy's exactly on the same file.
 4. **Language.** If Rust is rejected, the module boundaries in §3 are the part that must survive;
    the crate names are not.
 

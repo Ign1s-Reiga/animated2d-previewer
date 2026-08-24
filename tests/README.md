@@ -33,6 +33,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Architecture | `crates/a2d-cli/tests/architecture.rs` | the layering rules in `CLAUDE.md` §3, enforced rather than reviewed |
 | GPU | `crates/a2d-render/tests/render.rs` | clear, tint, blend modes, draw order, stencil clipping, read-back, buffer growth — all against real pixels |
 | Visual regression | `crates/a2d-cli/tests/visual.rs` | fixed timestamps rendered through the whole stack; determinism and movement |
+| Real-asset | `crates/a2d-unity/tests/real_bundle.rs`, `crates/a2d-cli/tests/unity_inspect.rs` | a real Unity bundle parses, every object is addressable, and the inventory holds what §12 asks for — `#[ignore]`, gated on `A2D_FIXTURE_CUBISM` |
 | Constraint geometry | `crates/a2d-runtime/src/spine/pose.rs` | IK, the four transform-constraint modes, and path constraints against hand-computed geometry — a straight path and a square one have exactly known arc lengths |
 | Viewer behaviour | `crates/a2d-desktop/src/{config,state,tray}.rs` | config persistence and clamping, drag/scale/selection, tray id mapping — all without opening a window |
 | Subprocess | `crates/a2d-cli/tests/viewer_process.rs` | the real binary opens a window, presents frames, and writes settings on the way out |
@@ -64,6 +65,7 @@ Document each new variable in the table below.
 | `A2D_REQUIRE_GPU` | any value; turns a missing-GPU skip into a failure | every GPU test |
 | `A2D_BASELINE_DIR` | a directory of baseline frames | `a2d-cli --test visual` |
 | `A2D_CONFIG_DIR` | a directory to keep `config.json` in, instead of the per-user one | the viewer; `a2d-cli --test viewer_process` |
+| `A2D_FIXTURE_CUBISM` | a Unity AssetBundle holding a Cubism model | `a2d-unity --test real_bundle`, `a2d-cli --test unity_inspect` |
 
 ## Visual regression
 

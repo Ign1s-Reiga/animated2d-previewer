@@ -10,7 +10,9 @@
 pub mod detect;
 pub mod games;
 pub mod generic;
+pub mod unity_cubism;
 
 pub use detect::{classify, AssetKind};
 pub use games::{guess_importer, Importer};
 pub use generic::{normalize_asset_stem, SpineSourceSet};
+pub use unity_cubism::{inspect_bundle, CubismInventory, MocPayload, MotionEntry, TextureEntry};
