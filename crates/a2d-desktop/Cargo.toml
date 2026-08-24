@@ -12,3 +12,18 @@ a2d-core.workspace = true
 a2d-runtime.workspace = true
 a2d-render.workspace = true
 a2d-pack.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Window, input and the event loop. 0.30 moved to the `ApplicationHandler`
+# trait, which is what the app module implements.
+winit = "0.30"
+# System tray. Separate from winit because winit deliberately does not do tray.
+tray-icon = "0.24"
+# The renderer's surface needs the raw window handle types; taking them from
+# `raw-window-handle` directly keeps the version pinned to what winit exports.
+raw-window-handle = "0.6"
+# Rendering into a window surface needs the same wgpu the renderer uses.
+wgpu = "26"
+pollster = "1"
