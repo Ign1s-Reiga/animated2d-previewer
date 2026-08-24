@@ -230,14 +230,21 @@ impl App {
 
         let frame = match active.surface.get_current_texture() {
             Ok(frame) => frame,
-            // Lost and outdated surfaces are routine on resize or a display
-            // change; reconfiguring and drawing next frame is the fix.
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            // Routine and self-correcting: the compositor was busy this frame.
+            Err(wgpu::SurfaceError::Timeout) => return,
+            // Anything else means the swapchain no longer matches the window --
+            // a resize, a display change, a driver reset, or a cold start where
+            // it was not ready yet. Reconfiguring and drawing next frame is the
+            // fix; returning alone would leave a recoverable surface stuck for
+            // the rest of the run.
+            Err(e) => {
+                if !matches!(e, wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) {
+                    self.report.note(format!("the surface had to be rebuilt: {e}"));
+                }
                 let (w, h) = (active.surface_config.width, active.surface_config.height);
                 self.resize(w, h);
                 return;
             }
-            Err(_) => return,
         };
 
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
