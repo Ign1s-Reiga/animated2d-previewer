@@ -9,3 +9,18 @@ description = "Source-format-neutral GPU renderer."
 
 [dependencies]
 a2d-core.workspace = true
+thiserror.workspace = true
+
+# Rendering backend. `wgpu` reaches D3D12 / Vulkan / Metal through one API,
+# which is what lets the same renderer serve the desktop host and headless
+# tests without a second code path.
+wgpu = "26"
+# Vertex structs are cast to bytes for upload; `bytemuck` does that without
+# `unsafe`, which this crate forbids.
+bytemuck = { version = "1", features = ["derive"] }
+# Adapter and device requests are async. Callers are not, and the GPU handshake
+# happens once at startup, so blocking on it is the honest shape.
+pollster = "1"
+# Texture pages arrive as encoded PNG bytes. `png` is a small pure-Rust decoder;
+# a full image library would be far more dependency than one format needs.
+png = "0.18"

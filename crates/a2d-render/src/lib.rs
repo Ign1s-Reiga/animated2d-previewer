@@ -1,23 +1,50 @@
 //! Source-format-neutral GPU renderer.
 //!
-//! # Status: not implemented
+//! Draws [`a2d_core::RenderList`]s with `wgpu`. It never learns what produced
+//! one: no source format, no version, no game. The
+//! [`RenderMesh`](a2d_core::RenderMesh) contract is the entire interface, and
+//! an architecture test enforces that this crate cannot even depend on the
+//! layers that would let it find out.
 //!
-//! This crate will consume [`a2d_core::RenderList`] and draw it with `wgpu`.
-//! Nothing else is decided yet, and nothing is stubbed out here on purpose:
-//! rule §4.10 says not to invent an abstraction before two implementations
-//! need it, and there is not yet one.
+//! # Shape of the API
 //!
-//! What it must support (spec §11): textured triangle meshes, alpha / additive
-//! / multiply blending, draw ordering, mesh deformation, weighted skinning,
-//! clipping masks, per-slot colour, high-DPI scaling, transparent backgrounds.
+//! [`Renderer`] draws into a plain `wgpu::TextureView`. A windowed host passes
+//! a surface texture; tests pass an [`OffscreenTarget`] and read the pixels
+//! back. Both go through the same code, which is what makes visual regression
+//! testing meaningful — there is no second path to drift from.
 //!
-//! The contract it consumes is already fixed and tested:
-//! [`RenderMesh`](a2d_core::RenderMesh) carries world-space vertices, atlas
-//! UVs, a texture handle, tint, dark tint, blend mode, an optional mask handle,
-//! and a z-order. [`RenderList`](a2d_core::RenderList) additionally carries the
-//! clipping polygons those mask handles refer to.
+//! ```no_run
+//! use a2d_render::{Camera, FrameSettings, GpuContext, OffscreenTarget, Renderer, Viewport};
 //!
-//! **This crate must never depend on `a2d-spine`, `a2d-cubism`, `a2d-unity` or
-//! `a2d-import`.** That is checked by `crates/a2d-cli/tests/architecture.rs`.
+//! # fn main() -> Result<(), a2d_render::RenderError> {
+//! let gpu = GpuContext::headless()?;
+//! let mut renderer = Renderer::new(gpu.clone());
+//! let target = OffscreenTarget::new(&gpu, 256, 256)?;
+//!
+//! let list = a2d_core::RenderList::new(); // filled by `AnimatedModel::emit`
+//! let settings = FrameSettings::new(Viewport::new(256, 256), Camera::default());
+//! renderer.render(target.view(), target.format(), settings, &list)?;
+//!
+//! let pixels = target.read_pixels(&gpu)?;
+//! # let _ = pixels;
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
+
+pub mod batch;
+pub mod camera;
+pub mod gpu;
+pub mod pipeline;
+pub mod renderer;
+pub mod target;
+pub mod texture;
+
+pub use batch::{DrawBatch, FrameGeometry, MaskShape, Vertex};
+pub use camera::{Camera, Viewport};
+pub use gpu::{GpuContext, RenderError};
+pub use pipeline::{blend_state, Pipelines, DEPTH_STENCIL_FORMAT};
+pub use renderer::{FrameSettings, FrameStats, Renderer};
+pub use target::OffscreenTarget;
+pub use texture::{decode_png, encode_png, ImageDiff, Rgba8Image, SamplerConfig, TextureCache};
