@@ -9,8 +9,9 @@ use crate::math::Vec2;
 /// Texture minification/magnification filter requested by the atlas.
 ///
 /// The renderer maps these onto its own sampler descriptors; unmapped values
-/// fall back to linear and are reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// fall back to linear and are reported. `Hash` because the renderer keys its
+/// sampler cache on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TextureFilter {
     Nearest,
     #[default]
@@ -23,7 +24,7 @@ pub enum TextureFilter {
 }
 
 /// Texture coordinate wrapping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TextureWrap {
     MirroredRepeat,
     #[default]
