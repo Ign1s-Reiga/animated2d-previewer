@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/a2d-core",
     "crates/a2d-spine",
+    "crates/a2d-runtime",
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ publish = false
 [workspace.dependencies]
 a2d-core    = { path = "crates/a2d-core" }
 a2d-spine   = { path = "crates/a2d-spine" }
+a2d-runtime = { path = "crates/a2d-runtime" }
 
 thiserror   = "2"
 serde       = { version = "1", features = ["derive"] }

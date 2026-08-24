@@ -1,0 +1,11 @@
+[package]
+name = "a2d-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Deterministic animation evaluation over the normalized IR."
+
+[dependencies]
+a2d-core.workspace = true
