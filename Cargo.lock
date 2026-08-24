@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "a2d-runtime"
+version = "0.1.0"
+dependencies = [
+ "a2d-core",
+]
+
+[[package]]
 name = "a2d-spine"
 version = "0.1.0"
 dependencies = [
