@@ -215,6 +215,31 @@ cargo fmt --all
 
 ---
 
+## ライセンス
+
+本リポジトリの**ソースコード**は、以下のいずれかのライセンスの下で提供されます。
+利用者はどちらかを選択できます。
+
+- Apache License, Version 2.0
+  ([LICENSE-APACHE](LICENSE-APACHE) または <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT License
+  ([LICENSE-MIT](LICENSE-MIT) または <http://opensource.org/licenses/MIT>)
+
+Rust エコシステムの慣例に従ったデュアルライセンスです。各クレートの `Cargo.toml` にも
+`license = "MIT OR Apache-2.0"` として記載しています（`publish = false` のため
+crates.io へは公開されません）。
+
+このライセンスが適用されるのは本リポジトリのコードのみです。ゲームアセットおよび
+proprietary SDK バイナリはリポジトリに含まれておらず、それらの権利は各権利者に帰属します。
+
+### コントリビューション
+
+明示的に別段の定めをしない限り、Apache-2.0 ライセンス第 5 条の定義に従い、
+本プロジェクトへ意図的に提出されたコントリビューションは上記のデュアルライセンスの下で
+ライセンスされ、追加の条件は付されません。
+
+---
+
 ## 免責
 
 本プロジェクトは、利用者自身が所有するソフトウェアから自分で抽出したアセットを、
