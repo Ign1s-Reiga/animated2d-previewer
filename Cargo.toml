@@ -3,8 +3,12 @@ resolver = "2"
 members = [
     "crates/a2d-core",
     "crates/a2d-spine",
+    "crates/a2d-cubism",
+    "crates/a2d-unity",
     "crates/a2d-pack",
     "crates/a2d-runtime",
+    "crates/a2d-render",
+    "crates/a2d-desktop",
 ]
 
 [workspace.package]
@@ -17,8 +21,12 @@ publish = false
 [workspace.dependencies]
 a2d-core    = { path = "crates/a2d-core" }
 a2d-spine   = { path = "crates/a2d-spine" }
+a2d-cubism  = { path = "crates/a2d-cubism" }
+a2d-unity   = { path = "crates/a2d-unity" }
 a2d-pack    = { path = "crates/a2d-pack" }
 a2d-runtime = { path = "crates/a2d-runtime" }
+a2d-render  = { path = "crates/a2d-render" }
+a2d-desktop = { path = "crates/a2d-desktop" }
 
 thiserror   = "2"
 serde       = { version = "1", features = ["derive"] }

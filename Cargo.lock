@@ -10,6 +10,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "a2d-pack"
+version = "0.1.0"
+dependencies = [
+ "a2d-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "a2d-runtime"
 version = "0.1.0"
 dependencies = [
