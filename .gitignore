@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+
+# Extracted game assets and proprietary SDK binaries are never committed.
+# Real fixtures live here and stay local. See tests/README.md.
+tests/fixtures/local/*
+!tests/fixtures/local/.gitkeep
+
+# Imported packages are build output.
+*.a2dpack/
