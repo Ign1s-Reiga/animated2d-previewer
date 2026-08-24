@@ -31,6 +31,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Golden | `crates/a2d-cli/tests/pipeline.rs` | `source asset → importer → IR → deterministic serialize` compared against a committed expected manifest |
 | Robustness | `crates/a2d-spine/src/binary/mod.rs`, `crates/a2d-pack/src/package.rs` | every truncation and single-byte corruption of a fixture must return an error, never panic |
 | Architecture | `crates/a2d-cli/tests/architecture.rs` | the layering rules in `CLAUDE.md` §3, enforced rather than reviewed |
+| GPU | `crates/a2d-render/tests/render.rs` | clear, tint, blend modes, draw order, stencil clipping, read-back, buffer growth — all against real pixels |
+| Visual regression | `crates/a2d-cli/tests/visual.rs` | fixed timestamps rendered through the whole stack; determinism and movement |
 
 ## Tests that need a real asset
 
@@ -56,13 +58,48 @@ Document each new variable in the table below.
 
 | Variable | Points at | Used by |
 | --- | --- | --- |
-| _(none yet)_ | | |
+| `A2D_REQUIRE_GPU` | any value; turns a missing-GPU skip into a failure | every GPU test |
+| `A2D_BASELINE_DIR` | a directory of baseline frames | `a2d-cli --test visual` |
 
 ## Visual regression
 
 Spec §17.3 asks for renders at fixed timestamps (`0.0s / 0.25s / 0.5s / 1.0s`)
-compared by image or framebuffer hash. The runtime half is in place:
-`GenericSpineModel::pose_at` scrubs to an exact time without looping or firing
-events, and `animated2d preview` prints the mesh count and bounds at those four
-timestamps. The image comparison itself needs the GPU renderer, which is not
-built yet — see the roadmap in `README.md`.
+compared by image or framebuffer hash. `crates/a2d-cli/tests/visual.rs` does
+this for the Generic Spine family, driving the whole stack: source assets →
+importer → IR → runtime → renderer → pixels.
+
+### Why no pixel baseline is committed
+
+Rasterisation differs by a least significant bit between GPUs and driver
+versions, so a baseline recorded on one machine fails on every other one. A test
+that fails for reasons unrelated to the change is worse than no test. The
+always-on assertions are therefore the properties that hold on *any* correct
+renderer:
+
+- rendering is deterministic — the same pose twice is byte-identical;
+- the animation moves — distinct timestamps produce distinct frames;
+- the character is drawn — pixels are covered, and not the whole frame.
+
+### Pinning exact pixels locally
+
+Point `A2D_BASELINE_DIR` at a directory. The first run records the baselines;
+later runs compare against them with a 2/255 per-channel tolerance.
+
+```bash
+A2D_BASELINE_DIR=tests/fixtures/local/baseline cargo test -p a2d-cli --test visual
+```
+
+Delete a baseline file to re-record it.
+
+## GPU tests
+
+`crates/a2d-render/tests/render.rs` and the visual regression tests need a
+graphics adapter. Where none is available they skip with a note, so the suite
+still passes on a headless box.
+
+Set `A2D_REQUIRE_GPU=1` to turn that skip into a failure — which is what CI on a
+machine that *should* have a GPU wants:
+
+```bash
+A2D_REQUIRE_GPU=1 cargo test --workspace
+```
