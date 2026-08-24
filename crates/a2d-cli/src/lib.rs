@@ -10,4 +10,4 @@ pub mod args;
 pub mod commands;
 
 pub use args::{parse, ArgError, Command, HELP};
-pub use commands::{import, inspect, preview, print_report, validate, CliError};
+pub use commands::{import, inspect, preview, print_report, validate, CliError, REGRESSION_TIMESTAMPS};

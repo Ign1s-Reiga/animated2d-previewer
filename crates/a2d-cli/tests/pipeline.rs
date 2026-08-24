@@ -164,7 +164,19 @@ fn preview_poses_the_regression_timestamps() {
     let package_dir = dir.path().join("hero.a2dpack");
     capture(|out| a2d_cli::import(out, dir.path(), &package_dir, None).map_err(|e| e.to_string()));
 
-    let text = capture(|out| a2d_cli::preview(out, &package_dir).map_err(|e| e.to_string()));
+    let mut out = Vec::new();
+    match a2d_cli::preview(&mut out, &package_dir, None) {
+        Ok(()) => {}
+        // `preview` renders for real now, so a machine with no GPU cannot run
+        // it. That is a property of the machine, not a fault in the package.
+        Err(e) if e.to_string().contains("no suitable GPU adapter") => {
+            eprintln!("skipping: {e}");
+            return;
+        }
+        Err(e) => panic!("preview failed: {e}\n{}", String::from_utf8_lossy(&out)),
+    }
+    let text = String::from_utf8(out).expect("output should be UTF-8");
+
     assert!(text.contains("Model:     hero"), "{text}");
     assert!(text.contains("Animation: idle"), "{text}");
     for time in ["t=0", "t=0.25", "t=0.5", "t=1"] {
@@ -172,6 +184,7 @@ fn preview_poses_the_regression_timestamps() {
     }
     // Both slots draw at every frame.
     assert!(text.contains("2 meshes"), "{text}");
+    assert!(text.contains("fingerprint"), "{text}");
 }
 
 #[test]

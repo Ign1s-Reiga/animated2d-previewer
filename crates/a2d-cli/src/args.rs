@@ -13,7 +13,7 @@ pub enum Command {
     Inspect { input: PathBuf, game: Option<String> },
     Import { input: PathBuf, output: PathBuf, game: Option<String> },
     Validate { package: PathBuf },
-    Preview { package: PathBuf },
+    Preview { package: PathBuf, out: Option<PathBuf> },
     Help,
     Version,
 }
@@ -71,8 +71,11 @@ where
         }
         "preview" => {
             let (positional, game, output) = split_flags(rest)?;
-            reject_extra(game, output)?;
-            Ok(Command::Preview { package: one_path(positional, "preview <package>")? })
+            if game.is_some() {
+                return Err(err("this command does not take --game"));
+            }
+            // `-o` names a directory to write the rendered frames into.
+            Ok(Command::Preview { package: one_path(positional, "preview <package>")?, out: output })
         }
         other if other.starts_with('-') => Err(err(format!("unknown option `{other}`; try `animated2d help`"))),
         other => Err(err(format!("unknown command `{other}`; try `animated2d help`"))),
@@ -149,14 +152,15 @@ COMMANDS:
     inspect  <input>                        identify assets and report what would load
     import   <input> -o <out.a2dpack>       reconstruct a normalized package
     validate <package.a2dpack>              check a package for missing or unsupported data
-    preview  <package.a2dpack>              open a package in the desktop viewer
+    preview  <package.a2dpack> [-o <dir>]   render the package and report the frames
     help                                    show this text
     version                                 show the version
 
 OPTIONS:
     --game <name>    importer to use: generic, aeons_echo, depose_girls, nikke
                      (default: guessed from the assets present)
-    -o, --output     destination package directory for `import`
+    -o, --output     destination package directory for `import`, or a directory
+                     to write rendered PNG frames into for `preview`
 
 NOTES:
     <input> may be a single asset or a directory. Detection reads file contents,
@@ -235,8 +239,17 @@ mod tests {
     #[test]
     fn validate_and_preview_take_one_path_and_no_flags() {
         assert_eq!(parse_ok(&["validate", "p.a2dpack"]), Command::Validate { package: "p.a2dpack".into() });
-        assert_eq!(parse_ok(&["preview", "p.a2dpack"]), Command::Preview { package: "p.a2dpack".into() });
+        assert_eq!(parse_ok(&["preview", "p.a2dpack"]), Command::Preview { package: "p.a2dpack".into(), out: None });
         assert!(parse(["validate", "p", "--game", "nikke"]).is_err());
+        assert!(parse(["preview", "p", "--game", "nikke"]).is_err());
+    }
+
+    #[test]
+    fn preview_takes_an_output_directory_for_frames() {
+        assert_eq!(
+            parse_ok(&["preview", "p.a2dpack", "-o", "frames"]),
+            Command::Preview { package: "p.a2dpack".into(), out: Some("frames".into()) }
+        );
     }
 
     #[test]

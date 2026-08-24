@@ -11,6 +11,9 @@ use a2d_core::{AnimatedModel, DecodeError, LoadReport, RuntimeError};
 use a2d_import::games::{self, Importer};
 use a2d_import::generic;
 use a2d_pack::Package;
+use a2d_render::{
+    Camera, FrameSettings, GpuContext, OffscreenTarget, RenderError, Renderer, Rgba8Image, SamplerConfig, Viewport,
+};
 use a2d_runtime::GenericSpineModel;
 
 /// Anything a command can fail with.
@@ -22,6 +25,7 @@ use a2d_runtime::GenericSpineModel;
 pub enum CliError {
     Decode(DecodeError),
     Runtime(RuntimeError),
+    Render(RenderError),
     Output(std::io::Error),
 }
 
@@ -30,6 +34,7 @@ impl std::fmt::Display for CliError {
         match self {
             CliError::Decode(e) => write!(f, "{e}"),
             CliError::Runtime(e) => write!(f, "{e}"),
+            CliError::Render(e) => write!(f, "{e}"),
             CliError::Output(e) => write!(f, "could not write output: {e}"),
         }
     }
@@ -46,6 +51,12 @@ impl From<DecodeError> for CliError {
 impl From<RuntimeError> for CliError {
     fn from(e: RuntimeError) -> Self {
         CliError::Runtime(e)
+    }
+}
+
+impl From<RenderError> for CliError {
+    fn from(e: RenderError) -> Self {
+        CliError::Render(e)
     }
 }
 
@@ -199,58 +210,137 @@ pub fn validate(out: &mut dyn std::io::Write, package_dir: &Path) -> Result<bool
     Ok(report.is_empty())
 }
 
-/// `animated2d preview <package>`
-pub fn preview(out: &mut dyn std::io::Write, package_dir: &Path) -> Result<(), CliError> {
-    // The package is still loaded and posed, so `preview` is a real check that
-    // the model plays even before a window exists to show it in.
+/// Timestamps rendered by `preview` and by the visual regression tests.
+///
+/// Fixed by spec §17.3 so that a regression is compared against the same
+/// instants every time.
+pub const REGRESSION_TIMESTAMPS: [f32; 4] = [0.0, 0.25, 0.5, 1.0];
+
+/// `animated2d preview <package> [-o <dir>]`
+///
+/// Renders the package at the regression timestamps. The desktop window is a
+/// later phase; until it exists this is the real thing rendering real pixels,
+/// which is more useful than a stub that opens nothing.
+pub fn preview(out: &mut dyn std::io::Write, package_dir: &Path, frames_dir: Option<&Path>) -> Result<(), CliError> {
     let package = Package::read_from(package_dir)?;
     let ir = package
         .model
         .as_spine()
         .cloned()
         .ok_or_else(|| DecodeError::UnsupportedFormat("only Spine packages can be previewed".into()))?;
+    let ir = Arc::new(ir);
 
-    let mut model = GenericSpineModel::load(Arc::new(ir), &package.manifest.display_name);
+    let mut model = GenericSpineModel::load(ir.clone(), &package.manifest.display_name);
     let animation =
         package.manifest.default_animation.clone().or_else(|| model.default_animation().map(str::to_string));
 
     writeln!(out, "Package:   {}", package_dir.display())?;
     writeln!(out, "Model:     {}", model.display_name())?;
-    match &animation {
-        Some(name) => {
-            // Pose the four timestamps the visual regression tests use, so the
-            // command reports something concrete rather than nothing.
-            writeln!(out, "Animation: {name}")?;
-            writeln!(out, "\nPosed frames:")?;
-            for time in [0.0f32, 0.25, 0.5, 1.0] {
-                model.pose_at(name, time)?;
-                let bounds = model.bounds();
-                let mut list = a2d_core::RenderList::new();
-                model.emit(&mut list);
-                writeln!(
-                    out,
-                    "  t={time:<5}  {:>3} meshes  bounds {:.1},{:.1} to {:.1},{:.1}",
-                    list.meshes().len(),
-                    bounds.min.x,
-                    bounds.min.y,
-                    bounds.max.x,
-                    bounds.max.y
-                )?;
-            }
+
+    let gpu = GpuContext::headless()?;
+    writeln!(out, "GPU:       {} ({})", gpu.adapter_name, gpu.backend)?;
+
+    let mut renderer = Renderer::new(gpu.clone());
+    let missing = upload_package_textures(&mut renderer, &gpu, &package, &ir)?;
+    for name in &missing {
+        writeln!(out, "  note: texture page {name:?} is missing; a placeholder was used")?;
+    }
+
+    let size = 512;
+    let target = OffscreenTarget::new(&gpu, size, size)?;
+    let viewport = Viewport::new(size, size);
+
+    let Some(animation) = animation else {
+        writeln!(out, "Animation: (none)")?;
+        return Ok(());
+    };
+    writeln!(out, "Animation: {animation}")?;
+
+    // One camera framing the setup pose, held across every frame — a camera
+    // that refit per frame would hide exactly the movement being checked.
+    model.pose_at(&animation, 0.0)?;
+    let camera = Camera::fit(model.bounds(), viewport, 0.1);
+
+    if let Some(dir) = frames_dir {
+        std::fs::create_dir_all(dir).map_err(|e| DecodeError::io(dir.display().to_string(), e))?;
+    }
+
+    writeln!(
+        out,
+        "
+Rendered frames:"
+    )?;
+    for time in REGRESSION_TIMESTAMPS {
+        model.pose_at(&animation, time)?;
+        let mut list = a2d_core::RenderList::new();
+        model.emit(&mut list);
+
+        let stats = renderer.render(target.view(), target.format(), FrameSettings::new(viewport, camera), &list)?;
+        let image = target.read_pixels(&gpu)?;
+
+        writeln!(
+            out,
+            "  t={time:<5}  {:>3} meshes  {:>3} draws  {:>5} tris  fingerprint {:016x}",
+            list.meshes().len(),
+            stats.draw_calls,
+            stats.triangles,
+            image.fingerprint()
+        )?;
+
+        if let Some(dir) = frames_dir {
+            let path = dir.join(format!("frame_{time:.2}.png"));
+            let png = a2d_render::encode_png(&image)?;
+            std::fs::write(&path, png).map_err(|e| DecodeError::io(path.display().to_string(), e))?;
+            writeln!(out, "           wrote {}", path.display())?;
         }
-        None => writeln!(out, "Animation: (none)")?,
     }
 
     let mut report = LoadReport::new();
     model.absorb_degradations(&mut report);
     print_report(out, &report)?;
-
-    writeln!(
-        out,
-        "\nNote: the desktop viewer window is not implemented yet, so `preview` reports\n\
-         the posed frames instead of opening one. See the roadmap in README.md."
-    )?;
     Ok(())
+}
+
+/// Uploads a package's texture pages so their ids line up with the atlas.
+///
+/// The runtime emits `TextureId(page index)`, so upload order must follow
+/// `atlas.pages` exactly. A page whose file is absent gets a placeholder rather
+/// than being skipped — skipping would shift every later id and silently draw
+/// the wrong art.
+fn upload_package_textures(
+    renderer: &mut Renderer,
+    gpu: &GpuContext,
+    package: &Package,
+    ir: &a2d_core::ir::spine::SpineIr,
+) -> Result<Vec<String>, CliError> {
+    let mut missing = Vec::new();
+    for page in &ir.atlas.pages {
+        let sampler = SamplerConfig {
+            min_filter: page.min_filter,
+            mag_filter: page.mag_filter,
+            u_wrap: page.u_wrap,
+            v_wrap: page.v_wrap,
+        };
+        let file = package.textures.iter().find(|t| t.file == page.name);
+        let decoded = file.map(|f| a2d_render::decode_png(&f.bytes, &page.name));
+
+        match decoded {
+            Some(Ok(image)) => {
+                renderer.textures_mut().upload(gpu, &page.name, &image, page.premultiplied_alpha, sampler)?;
+            }
+            other => {
+                if let Some(Err(e)) = other {
+                    missing.push(format!("{} ({e})", page.name));
+                } else {
+                    missing.push(page.name.clone());
+                }
+                // Magenta placeholder, at this page's slot, so ids stay aligned.
+                let placeholder = Rgba8Image::solid(2, 2, [255, 0, 255, 255]);
+                renderer.textures_mut().upload(gpu, &page.name, &placeholder, false, SamplerConfig::default())?;
+            }
+        }
+    }
+    Ok(missing)
 }
 
 /// Classifies every file at `path` for the `inspect` listing.

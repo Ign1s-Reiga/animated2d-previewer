@@ -38,7 +38,7 @@ fn main() -> ExitCode {
             Ok(false) => return ExitCode::from(1),
             Err(e) => Err(e),
         },
-        Command::Preview { package } => commands::preview(&mut out, &package),
+        Command::Preview { package, out: frames } => commands::preview(&mut out, &package, frames.as_deref()),
     };
 
     match result {

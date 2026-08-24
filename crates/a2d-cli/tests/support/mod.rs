@@ -1,5 +1,10 @@
 //! Synthetic test fixtures.
 //!
+//! Shared by every integration test binary via `#[path]`. Each of them uses a
+//! different subset, so unused items here are expected rather than dead.
+#![allow(dead_code)]
+
+//!
 //! Everything here is hand-authored. Spec §11 forbids committing extracted game
 //! assets, so the pipeline is exercised against a minimal model that is built
 //! from scratch — including a genuinely valid PNG, so that texture handling is
