@@ -15,7 +15,18 @@ Unity-packaged variants. Target games for importers: 放置少女 (Depose Girls)
 
 Primary objective: **correct character playback for desktop viewing.** Nothing else.
 
-**Current phase:** Phase 0 — no implementation yet. First concrete task is §12 below.
+**Current phase:** Phase 1 complete for the Spine path; Phase 2 partially complete.
+
+Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x),
+`a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints, mixing,
+idle), `a2d-pack`, `a2d-import` (generic + aeons_echo), `a2d-cli`.
+
+Not implemented: `a2d-render` (wgpu), `a2d-desktop`, `a2d-unity`, `a2d-cubism`.
+Known gaps, all reported rather than silently ignored: Spine 4.x and 2.x binary layouts,
+path constraints, transform constraints in local/relative mode.
+
+`a2d-cubism` is blocked on the Cubism Core decision in §13.1, which is why §12's first
+task has not been started.
 
 ---
 

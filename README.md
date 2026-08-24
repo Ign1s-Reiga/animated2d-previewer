@@ -11,8 +11,10 @@
 
 インポータの初期対象タイトル: 放置少女 / AEONS ECHO / NIKKE
 
-> **ステータス: Phase 0（設計のみ・未実装）**
-> 最初の実装タスクは 放置少女 `zjwujiang_prefab` の Unity AssetBundle インスペクタです。
+> **ステータス: Phase 1 実装済み（Spine 経路）**
+> Spine アセットの検出・デコード・正規化・パッケージ化・アニメーション評価と CLI が動作します。
+> GPU レンダラ、デスクトップウィンドウ、Cubism / Unity 経路は未実装です。
+> 詳細は下の「実装状況」を参照してください。
 
 ---
 
@@ -112,6 +114,25 @@ animated2d preview  <package>                # ビューアで直接開く
 不正なボーン親子 / 不正なスロット参照 / 壊れた atlas 参照 / 非対応コンストレイント。
 
 ---
+
+## 実装状況
+
+| クレート | 状態 |
+| --- | --- |
+| `a2d-core` | **実装済み** — IR、数学、`AnimatedModel`、`RenderMesh`、エラー分類、`LoadReport` |
+| `a2d-spine` | **実装済み（3.x / JSON 4.x）** — atlas パーサ、内容ベースのバージョン検出、JSON デコーダ（2.x/3.x/4.x 方言）、バイナリデコーダ（3.x）、正規化 |
+| `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント、トラック／キュー／クロスフェード、idle ロジック |
+| `a2d-pack` | **実装済み** — 決定論的な `model.bin`、`manifest.json`、`validate` |
+| `a2d-import` | **実装済み（generic / aeons_echo）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
+| `a2d-cli` | **実装済み** — `inspect` / `import` / `validate` / `preview` |
+| `a2d-render` | **未実装** — wgpu レンダラ |
+| `a2d-desktop` | **未実装** — 透過ウィンドウ、トレイ |
+| `a2d-unity` | **未実装** — Unity serialized file リーダ |
+| `a2d-cubism` | **未実装** — MOC3 の扱いが未決定のため着手していません（下記「未決定事項」） |
+
+未対応の機能は黙って無視されるのではなく、`LoadReport` として `inspect` / `import` /
+`validate` に必ず出力されます。既知の未対応: Spine 4.x バイナリ、Spine 2.x バイナリ、
+path コンストレイント、transform コンストレイントの local / relative モード。
 
 ## 開発環境
 
