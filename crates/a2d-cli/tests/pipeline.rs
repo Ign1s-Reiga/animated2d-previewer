@@ -158,17 +158,19 @@ fn a_reimported_package_reproduces_the_same_model_bytes() {
 }
 
 #[test]
-fn preview_poses_the_regression_timestamps() {
+fn preview_exports_the_regression_timestamps() {
     let dir = temp_dir("preview");
     Fixture::spine_json().write_to(dir.path());
     let package_dir = dir.path().join("hero.a2dpack");
     capture(|out| a2d_cli::import(out, dir.path(), &package_dir, None).map_err(|e| e.to_string()));
 
+    // With an output directory `preview` renders offscreen. Without one it
+    // opens a window, which an event loop on a test thread cannot do — that
+    // path is exercised by running the binary, not from here.
+    let frames = dir.path().join("frames");
     let mut out = Vec::new();
-    match a2d_cli::preview(&mut out, &package_dir, None) {
+    match a2d_cli::preview(&mut out, &package_dir, Some(&frames)) {
         Ok(()) => {}
-        // `preview` renders for real now, so a machine with no GPU cannot run
-        // it. That is a property of the machine, not a fault in the package.
         Err(e) if e.to_string().contains("no suitable GPU adapter") => {
             eprintln!("skipping: {e}");
             return;
@@ -182,9 +184,8 @@ fn preview_poses_the_regression_timestamps() {
     for time in ["t=0", "t=0.25", "t=0.5", "t=1"] {
         assert!(text.contains(time), "expected {time} in:\n{text}");
     }
-    // Both slots draw at every frame.
-    assert!(text.contains("2 meshes"), "{text}");
     assert!(text.contains("fingerprint"), "{text}");
+    assert_eq!(std::fs::read_dir(&frames).unwrap().count(), 4, "one PNG per timestamp");
 }
 
 #[test]
