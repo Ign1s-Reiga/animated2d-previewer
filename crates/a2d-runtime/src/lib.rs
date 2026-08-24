@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod idle;
 pub mod spine;
 
+pub use idle::{IdleDirector, Rng};
 pub use spine::{AnimationState, FiredEvent, GenericSpineModel, MixBlend, SkeletonPose};
