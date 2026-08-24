@@ -227,7 +227,8 @@ cargo fmt --all
 
 Rust エコシステムの慣例に従ったデュアルライセンスです。各クレートの `Cargo.toml` にも
 `license = "MIT OR Apache-2.0"` として記載しています（`publish = false` のため
-crates.io へは公開されません）。
+crates.io へは公開されません）。トップレベルの [LICENSE](LICENSE) は両者への案内であり、
+実際の条文は上記 2 ファイルです。
 
 このライセンスが適用されるのは本リポジトリのコードのみです。ゲームアセットおよび
 proprietary SDK バイナリはリポジトリに含まれておらず、それらの権利は各権利者に帰属します。
