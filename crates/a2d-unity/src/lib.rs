@@ -2,7 +2,8 @@
 //!
 //! # Status: not implemented
 //!
-//! Needed by the depose_girls and nikke importers, neither of which is built.
+//! Needed by the unity_cubism and unity_spine importers, neither of which is
+//! built.
 //! Whether this becomes a purpose-built minimal reader or wraps an existing
 //! crate is an open decision (CLAUDE.md §13.3): the choice should be made
 //! against a real bundle rather than in the abstract.

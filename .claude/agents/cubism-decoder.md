@@ -21,7 +21,7 @@ GenericCubismModel
 
 ## Scope
 
-**Cubism 3+ first** — 放置少女 uses a modern Cubism Unity integration. Cubism 2 comes later behind
+**Cubism 3+ first** — the `unity_cubism` target uses a modern Cubism Unity integration. Cubism 2 comes later behind
 its own decoder and runtime adapter; do not design for it now, just do not architecturally exclude it.
 
 ## Blocking decision — do not skip

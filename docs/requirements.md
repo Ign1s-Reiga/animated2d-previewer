@@ -8,13 +8,14 @@ The initial target ecosystems are:
 
 - Live2D Cubism assets
 - Spine assets across multiple historical versions
-- Game-specific Unity-packaged variants of the above
+- Unity-packaged variants of the above
 
-Initial game-oriented importers should be designed with these titles in mind:
+Importers are named for the asset shape they reconstruct, never for the title they were
+written against. The three initial shapes are:
 
-- 放置少女 / Houkai? (Depose Girls)
-- AEONS ECHO
-- NIKKE
+- `unity_cubism` — Cubism models packed inside Unity AssetBundles
+- `spine_bytes` — Spine skeletons shipped as `.skel.bytes` / `.atlas.txt` pairs
+- `unity_spine` — Spine rigs packed inside Unity AssetBundles
 
 The system must **not** attempt to convert Spine into Cubism directly. Instead, both formats must be normalized into internal runtime representations behind a shared high-level interface.
 
@@ -104,9 +105,9 @@ src/
 │
 ├─ importers/
 │  ├─ generic/
-│  ├─ depose_girls/
-│  ├─ aeons_echo/
-│  └─ nikke/
+│  ├─ unity_cubism/
+│  ├─ spine_bytes/
+│  └─ unity_spine/
 │
 ├─ runtime/
 │  ├─ spine/
@@ -284,8 +285,7 @@ Prioritize versions encountered in target games.
 At minimum:
 
 - Spine 3.8.x
-- whichever Spine version is detected in AEONS ECHO
-- whichever Spine version is detected in NIKKE lobby/character assets
+- whichever Spine versions are detected in the target assets
 
 Do not implement unused versions speculatively.
 
@@ -311,7 +311,7 @@ GenericCubismModel
 └─ hitAreas[]
 ```
 
-The first implementation should prioritize Cubism 3+ because 放置少女 uses a modern Cubism Unity integration.
+The first implementation should prioritize Cubism 3+ because the `unity_cubism` target uses a modern Cubism Unity integration.
 
 Cubism 2 support may be added later behind a separate decoder/runtime adapter.
 
@@ -323,7 +323,7 @@ Game importers must only perform **asset discovery and reconstruction**.
 
 They must output generic source-format packages and must not contain rendering logic.
 
-### 9.1 Depose Girls Importer
+### 9.1 `unity_cubism` Importer
 
 Input examples:
 
@@ -332,10 +332,10 @@ Input examples:
 
 Responsibilities:
 
-- detect Cubism-related assets under paths similar to:
+- detect Cubism-related assets under a `Live2D`-style resource path, for example:
 
 ```text
-Assets/GirlsGame/Editor/Resources/Live2D/
+Assets/<project>/Editor/Resources/Live2D/
 ```
 
 - extract MOC3 payload from Unity `CubismMoc`/TextAsset-like data
@@ -361,7 +361,7 @@ Important:
 
 Unity-imported Cubism animations may no longer exist as raw `motion3.json`. The importer must be able to recover animation parameter curves from Unity `AnimationClip` objects when possible.
 
-### 9.2 AEONS ECHO Importer
+### 9.2 `spine_bytes` Importer
 
 Expected Spine-style source assets may include:
 
@@ -378,9 +378,9 @@ Responsibilities:
 - detect Spine version
 - pass the reconstructed package to the correct Spine decoder
 
-### 9.3 NIKKE Importer
+### 9.3 `unity_spine` Importer
 
-Scope is limited to **desktop-viewable character / lobby models**.
+Scope is limited to **desktop-viewable standing / idle character models**.
 
 Do not prioritize:
 
@@ -389,7 +389,7 @@ Do not prioritize:
 - weapons
 - aiming systems
 - combat VFX
-- burst scene reconstruction
+- cutscene reconstruction
 
 Responsibilities:
 
@@ -427,7 +427,7 @@ Manifest example:
 {
   "formatVersion": 1,
   "modelType": "spine",
-  "sourceGame": "aeons_echo",
+  "sourceGame": "spine_bytes",
   "sourceFormat": "spine-3.8",
   "displayName": "CharacterName",
   "defaultAnimation": "idle",
@@ -710,7 +710,7 @@ Implement:
 
 Goal:
 
-Display one AEONS ECHO character correctly.
+Display one `spine_bytes` character correctly.
 
 ### Phase 2 — Spine Animation Completeness
 
@@ -728,7 +728,7 @@ Goal:
 
 Correctly play idle animations from multiple characters.
 
-### Phase 3 — Depose Girls Cubism Import
+### Phase 3 — Unity Cubism Import
 
 Implement:
 
@@ -740,19 +740,19 @@ Implement:
 
 Goal:
 
-Display the provided `zjwujiang_prefab` character and play at least its idle animation.
+Display a Unity-packaged Cubism character and play at least its idle animation.
 
 ### Phase 4 — Generic Cubism Runtime Integration
 
 Create `GenericCubismModel : IAnimatedModel` and integrate with the shared desktop viewer.
 
-### Phase 5 — NIKKE Importer
+### Phase 5 — `unity_spine` Importer
 
 Implement only lobby/standing character use cases.
 
 Goal:
 
-Display one NIKKE character idle model through Generic Spine Runtime.
+Display one Unity-packaged Spine idle model through the Generic Spine Runtime.
 
 ### Phase 6 — Desktop Mascot Features
 
@@ -790,7 +790,7 @@ Claude Code should follow these rules:
 
 The first implementation task should be:
 
-> Build an inspector for the provided decrypted `zjwujiang_prefab` Unity AssetBundle and output a structured inventory of all Cubism-related assets contained within it.
+> Build an inspector for a decrypted Unity AssetBundle containing a Cubism model and output a structured inventory of all Cubism-related assets contained within it.
 
 The inspector should identify at minimum:
 
@@ -815,8 +815,8 @@ The first milestone is successful model reconstruction and preview.
 
 The MVP is complete when all of the following are true:
 
-1. An AEONS ECHO Spine character can be imported and displayed.
-2. The provided 放置少女 `zjwujiang_prefab` can be imported and displayed.
+1. A `spine_bytes` Spine character can be imported and displayed.
+2. A `unity_cubism` model can be imported and displayed.
 3. Idle animation works for both models.
 4. Both are opened through the same desktop viewer UI.
 5. The renderer contains no game-specific branches.

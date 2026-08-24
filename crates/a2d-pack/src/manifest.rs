@@ -134,7 +134,7 @@ mod tests {
         Manifest {
             format_version: FORMAT_VERSION,
             model_type: ModelType::Spine,
-            source_game: "aeons_echo".into(),
+            source_game: "spine_bytes".into(),
             source_format: "spine-3.8".into(),
             display_name: "CharacterName".into(),
             default_animation: Some("idle".into()),
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn a_minimal_manifest_parses() {
-        let json = r#"{"formatVersion":1,"modelType":"cubism","sourceGame":"depose_girls",
+        let json = r#"{"formatVersion":1,"modelType":"cubism","sourceGame":"unity_cubism",
                        "sourceFormat":"cubism-3","displayName":"X","textures":[],"animations":[]}"#;
         let m = Manifest::from_json(json).unwrap();
         assert_eq!(m.model_type, ModelType::Cubism);

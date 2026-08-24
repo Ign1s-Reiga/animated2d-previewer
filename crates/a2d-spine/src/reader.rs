@@ -241,8 +241,8 @@ mod tests {
 
     #[test]
     fn non_ascii_strings_survive() {
-        let bytes = encode_string("放置少女");
-        assert_eq!(BinaryReader::new(&bytes).string().unwrap(), "放置少女");
+        let bytes = encode_string("骨・スロット");
+        assert_eq!(BinaryReader::new(&bytes).string().unwrap(), "骨・スロット");
     }
 
     #[test]

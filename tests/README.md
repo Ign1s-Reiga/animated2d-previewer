@@ -44,9 +44,9 @@ the suite still passes for someone who does not have it:
 
 ```rust
 #[test]
-#[ignore = "needs a real asset; set A2D_FIXTURE_AEONS to a directory"]
+#[ignore = "needs a real asset; set A2D_FIXTURE_SPINE to a directory"]
 fn a_real_character_imports_and_poses() {
-    let Ok(dir) = std::env::var("A2D_FIXTURE_AEONS") else { return };
+    let Ok(dir) = std::env::var("A2D_FIXTURE_SPINE") else { return };
     // ...
 }
 ```
@@ -54,7 +54,7 @@ fn a_real_character_imports_and_poses() {
 Run them with:
 
 ```bash
-A2D_FIXTURE_AEONS=tests/fixtures/local/aeons cargo test --workspace -- --ignored
+A2D_FIXTURE_SPINE=tests/fixtures/local/spine cargo test --workspace -- --ignored
 ```
 
 Document each new variable in the table below.

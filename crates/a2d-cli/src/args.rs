@@ -199,7 +199,8 @@ COMMANDS:
     version                                 show the version
 
 OPTIONS:
-    --game <name>    importer to use: generic, aeons_echo, depose_girls, nikke
+    --game <name>    importer to use: generic, spine_bytes, unity_cubism,
+                     unity_spine
                      (default: guessed from the assets present)
     -o, --output     destination package directory for `import`, or a directory
                      to write rendered PNG frames into for `preview`
@@ -246,12 +247,12 @@ mod tests {
     #[test]
     fn inspect_accepts_an_explicit_game() {
         assert_eq!(
-            parse_ok(&["inspect", "assets/", "--game", "aeons_echo"]),
-            Command::Inspect { input: PathBuf::from("assets/"), game: Some("aeons_echo".into()) }
+            parse_ok(&["inspect", "assets/", "--game", "spine_bytes"]),
+            Command::Inspect { input: PathBuf::from("assets/"), game: Some("spine_bytes".into()) }
         );
         assert_eq!(
-            parse_ok(&["inspect", "assets/", "--game=nikke"]),
-            Command::Inspect { input: PathBuf::from("assets/"), game: Some("nikke".into()) }
+            parse_ok(&["inspect", "assets/", "--game=unity_spine"]),
+            Command::Inspect { input: PathBuf::from("assets/"), game: Some("unity_spine".into()) }
         );
     }
 
@@ -288,8 +289,8 @@ mod tests {
             parse_ok(&["preview", "p.a2dpack"]),
             Command::Preview { package: "p.a2dpack".into(), out: None, exit_after: None }
         );
-        assert!(parse(["validate", "p", "--game", "nikke"]).is_err());
-        assert!(parse(["preview", "p", "--game", "nikke"]).is_err());
+        assert!(parse(["validate", "p", "--game", "unity_spine"]).is_err());
+        assert!(parse(["preview", "p", "--game", "unity_spine"]).is_err());
     }
 
     #[test]
@@ -360,7 +361,7 @@ mod tests {
         for command in ["inspect", "import", "validate", "preview"] {
             assert!(HELP.contains(command), "help should mention {command}");
         }
-        for game in ["generic", "aeons_echo", "depose_girls", "nikke"] {
+        for game in ["generic", "spine_bytes", "unity_cubism", "unity_spine"] {
             assert!(HELP.contains(game), "help should mention {game}");
         }
     }

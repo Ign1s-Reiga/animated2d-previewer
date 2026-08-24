@@ -254,16 +254,16 @@ fn an_unknown_importer_name_is_refused() {
 }
 
 #[test]
-fn aeons_echo_style_suffixes_are_handled() {
-    // `.skel.bytes` / `.atlas.txt`, which is what AEONS ECHO ships (spec §9.2).
-    let dir = temp_dir("aeons");
+fn doubled_suffixes_are_handled() {
+    // `.skel.bytes` / `.atlas.txt`, one of the shapes in the wild (spec §9.2).
+    let dir = temp_dir("suffixes");
     let mut fixture = Fixture::spine_json();
     fixture.skeleton_name = "hero.skel.bytes".into();
     fixture.atlas_name = "hero.atlas.txt".into();
     fixture.write_to(dir.path());
 
-    let text = capture(|out| a2d_cli::inspect(out, dir.path(), Some("aeons_echo")).map_err(|e| e.to_string()));
-    assert!(text.contains("Importer: aeons_echo"), "{text}");
+    let text = capture(|out| a2d_cli::inspect(out, dir.path(), Some("spine_bytes")).map_err(|e| e.to_string()));
+    assert!(text.contains("Importer: spine_bytes"), "{text}");
     assert!(text.contains("Character: hero"), "{text}");
     assert!(text.contains("Loaded cleanly."), "{text}");
 }
@@ -272,7 +272,7 @@ fn aeons_echo_style_suffixes_are_handled() {
 fn the_unimplemented_importers_explain_themselves() {
     let dir = temp_dir("stubs");
     Fixture::spine_json().write_to(dir.path());
-    for (game, expected) in [("nikke", "--game generic"), ("depose_girls", "Cubism Core")] {
+    for (game, expected) in [("unity_spine", "--game generic"), ("unity_cubism", "not implemented")] {
         let mut out = Vec::new();
         let err = a2d_cli::inspect(&mut out, dir.path(), Some(game)).unwrap_err();
         assert!(err.to_string().contains(expected), "for {game}: {err}");

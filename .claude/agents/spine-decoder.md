@@ -21,8 +21,8 @@ Spine 4.x ─┘
 
 ## Scope discipline
 
-Implement **only versions actually found in target assets**: Spine 3.8.x, whatever AEONS ECHO ships,
-whatever NIKKE lobby assets ship. Do not implement unused versions speculatively. If you cannot
+Implement **only versions actually found in target assets**. Do not implement unused versions
+speculatively — though a version a target is known to ship counts as used. If you cannot
 confirm a version is present in real assets, do not write its decoder — say so and stop.
 
 ## IR target

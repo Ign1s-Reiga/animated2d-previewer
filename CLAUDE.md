@@ -11,7 +11,13 @@ A reusable desktop 2D character viewer/runtime that plays animated character ass
 from multiple games **without** depending on each game's original runtime.
 
 Source ecosystems: **Live2D Cubism** and **Spine** (multiple historical versions), including
-Unity-packaged variants. Target games for importers: 放置少女 (Depose Girls), AEONS ECHO, NIKKE.
+Unity-packaged variants.
+
+**Importers are named for the asset shape they reconstruct, never for a title.** The three
+initial targets are: Cubism models inside Unity AssetBundles (`unity_cubism`), Spine skeletons
+shipped as `.skel.bytes` / `.atlas.txt` pairs (`spine_bytes`), and Spine rigs inside Unity
+AssetBundles (`unity_spine`). Keep it that way: do not reintroduce title names anywhere in this
+repository, including comments, tests, fixture names and commit messages.
 
 Primary objective: **correct character playback for desktop viewing.** Nothing else.
 
@@ -21,7 +27,7 @@ goal is unverified without real assets; Phase 6 implemented.
 Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x),
 `a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints in all four
 modes, path constraints, mixing,
-idle), `a2d-pack`, `a2d-import` (generic + aeons_echo), `a2d-render` (wgpu, batching, blend
+idle), `a2d-pack`, `a2d-import` (generic + spine_bytes), `a2d-render` (wgpu, batching, blend
 modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transparent frameless
 window, drag, scale, click-through, always-on-top, tray, config persistence), `a2d-cli`.
 
@@ -60,7 +66,7 @@ Desktop Host
 **Game-specific knowledge must never leak downstream of `importers/`.**
 **Source-version-specific knowledge must never leak downstream of `formats/`.**
 
-If a change requires the renderer to know the string `"nikke"`, or requires the runtime to know
+If a change requires the renderer to know the string `"unity_spine"`, or requires the runtime to know
 `"spine 3.8.99"`, the design is wrong. Stop and fix the layer above instead.
 
 ---
@@ -76,7 +82,7 @@ Rust, cargo workspace. Rendering via `wgpu`. Desktop shell via `winit` + `tray-i
 | `a2d-spine` | `formats/spine/` | version detect, v2/v3/v4 decoders, normalize → Generic Spine IR | core |
 | `a2d-cubism` | `formats/cubism/` | moc3/motion3/physics decode, normalize → Generic Cubism model | core |
 | `a2d-unity` | (support) | Unity serialized file / AssetBundle object graph reading | core |
-| `a2d-import` | `importers/` | generic + depose_girls + aeons_echo + nikke importers | core, unity, spine, cubism |
+| `a2d-import` | `importers/` | generic + unity_cubism + spine_bytes + unity_spine importers | core, unity, spine, cubism |
 | `a2d-pack` | (support) | `.a2dpack` read/write, manifest, deterministic serialization | core |
 | `a2d-runtime` | `runtime/` | skeleton/param evaluation, timelines, constraints, mixing | core |
 | `a2d-render` | `renderer/` | wgpu device, texture cache, batching, clipping/masks | core |
@@ -178,8 +184,8 @@ GenericSpineModel
 - **Constraints, in this order**: IK → Transform → Path.
 
 Version decoders own all historical quirks. Each decoder translates *up* to the **latest** IR shape.
-Prioritize only versions actually found in target assets: Spine 3.8.x, whatever AEONS ECHO uses,
-whatever NIKKE lobby assets use. **Do not implement unused versions speculatively.**
+Prioritize only versions actually found in target assets. **Do not implement unused versions
+speculatively** — but a version a target is known to ship counts as used.
 
 A model must still load when unsupported constraint data exists — report, degrade, never corrupt.
 
@@ -187,8 +193,8 @@ A model must still load when unsupported constraint data exists — report, degr
 
 ## 7. Generic Cubism model
 
-Separate normalized runtime model. **Cubism 3+ first** (放置少女 uses a modern Cubism Unity
-integration). Cubism 2 only later, behind its own decoder/runtime adapter.
+Separate normalized runtime model. **Cubism 3+ first** (the `unity_cubism` target uses a modern
+Cubism Unity integration). Cubism 2 only later, behind its own decoder/runtime adapter.
 
 ```
 GenericCubismModel
@@ -207,15 +213,15 @@ must recover parameter curves from Unity `AnimationClip` objects, plus fade moti
 Importers do **asset discovery and reconstruction only**. No rendering logic, no runtime logic.
 Output = a generic source-format package, or a normalized `.a2dpack`.
 
-- **depose_girls** — decrypted Unity AssetBundles / serialized assets. Detect Cubism assets under
-  paths like `Assets/GirlsGame/Editor/Resources/Live2D/`; extract MOC3 payload from
-  `CubismMoc`/TextAsset-like data; extract `Texture2D`; find `AnimationClip`s originating from
-  `*.motion3.json`; inspect fade motions; reconstruct model metadata.
-- **aeons_echo** — `*.skel.bytes`, `*.atlas.txt`, `*.png`. Pair skeleton/atlas/textures, normalize
+- **unity_cubism** — decrypted Unity AssetBundles / serialized assets. Detect Cubism assets under
+  a `Live2D`-style resource path; extract MOC3 payload from `CubismMoc`/TextAsset-like data;
+  extract `Texture2D`; find `AnimationClip`s originating from `*.motion3.json`; inspect fade
+  motions; reconstruct model metadata.
+- **spine_bytes** — `*.skel.bytes`, `*.atlas.txt`, `*.png`. Pair skeleton/atlas/textures, normalize
   suffixes internally (`.skel.bytes` → `.skel`, `.atlas.txt` → `.atlas`), detect Spine version,
   hand off to the right decoder.
-- **nikke** — **lobby / standing character models only.** Explicitly out of scope: shooting poses,
-  battle rigs, weapons, aiming, combat VFX, burst scenes.
+- **unity_spine** — **standing / idle character models only.** Explicitly out of scope: shooting
+  poses, battle rigs, weapons, aiming, combat VFX, cutscenes.
 
 Normalized Cubism output shape:
 
@@ -243,7 +249,7 @@ character.a2dpack/
 {
   "formatVersion": 1,
   "modelType": "spine",
-  "sourceGame": "aeons_echo",
+  "sourceGame": "spine_bytes",
   "sourceFormat": "spine-3.8",
   "displayName": "CharacterName",
   "defaultAnimation": "idle",
@@ -306,16 +312,16 @@ asset, gate it behind `#[ignore]` + an env var and document it in `tests/README.
 
 | Phase | Deliverable | Goal |
 |---|---|---|
-| 1 | atlas parser, skeleton decoder for one real target version, bones, slots, region + mesh + weighted mesh, basic timelines, GPU rendering | display one AEONS ECHO character correctly |
+| 1 | atlas parser, skeleton decoder for one real target version, bones, slots, region + mesh + weighted mesh, basic timelines, GPU rendering | display one `spine_bytes` character correctly |
 | 2 | deform, draw order, color, clipping, IK, transform constraints, mixing | idle animations play correctly across multiple characters |
-| 3 | Unity bundle inspection, MOC3 extraction, Texture2D extraction, AnimationClip reconstruction, normalized Cubism package | display `zjwujiang_prefab`, play its idle |
+| 3 | Unity bundle inspection, MOC3 extraction, Texture2D extraction, AnimationClip reconstruction, normalized Cubism package | display the sample Cubism bundle, play its idle |
 | 4 | `GenericCubismModel : AnimatedModel` integrated into the shared viewer | one viewer, two runtimes |
-| 5 | NIKKE importer (lobby/standing only) | one NIKKE idle model via Generic Spine runtime |
+| 5 | `unity_spine` importer (standing only) | one Unity-packaged Spine idle model via the Generic Spine runtime |
 | 6 | transparent window, drag, click-through, tray, idle logic, config persistence | desktop mascot |
 
 **First concrete task — do this before anything else:**
 
-> Build an inspector for the provided decrypted `zjwujiang_prefab` Unity AssetBundle and output a
+> Build an inspector for a decrypted Unity AssetBundle containing a Cubism model and output a
 > structured inventory of all Cubism-related assets inside it.
 
 Must identify: Unity version · Cubism MOC object / MOC3 payload · `Texture2D` assets ·
@@ -327,7 +333,7 @@ Then implement an exporter reconstructing the minimum data needed to render the 
 **Do not begin by implementing the desktop UI.** First milestone = successful model reconstruction
 and preview.
 
-**MVP is done when:** AEONS ECHO Spine character imports and displays · `zjwujiang_prefab` imports
+**MVP is done when:** a `spine_bytes` Spine character imports and displays · a `unity_cubism` model imports
 and displays · idle works for both · both open in the same viewer UI · renderer has zero
 game-specific branches · viewer loads `.a2dpack`, not raw assets · parser/runtime tests pass ·
 at least one visual regression test exists per runtime family.

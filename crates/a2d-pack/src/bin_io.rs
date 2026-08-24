@@ -352,12 +352,12 @@ mod tests {
         let mut w = Writer::new();
         w.str("hip");
         w.str("");
-        w.str("放置少女");
+        w.str("骨・スロット");
         let bytes = w.into_bytes();
         let mut r = Reader::new(&bytes);
         assert_eq!(r.str().unwrap(), "hip");
         assert_eq!(r.str().unwrap(), "");
-        assert_eq!(r.str().unwrap(), "放置少女");
+        assert_eq!(r.str().unwrap(), "骨・スロット");
     }
 
     #[test]

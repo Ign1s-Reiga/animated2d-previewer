@@ -25,7 +25,7 @@ importers/ → formats/ → IR → runtime/ → renderer/ → desktop/
 ## Checks to run every time
 
 ```bash
-grep -rniE "nikke|aeons|depose|girlsgame|houkai|放置少女" --include=*.rs crates/a2d-{core,runtime,render,desktop,pack}/
+grep -rniE "spine_bytes|spinebytes|unity_cubism|unitycubism|unity_spine|unityspine" --include=*.rs crates/a2d-{core,runtime,render,desktop,pack}/
 grep -rniE "spine[-_ ]?[234]|3\.8|cubism[23]|moc3" --include=*.rs crates/a2d-{runtime,render,desktop}/
 ```
 

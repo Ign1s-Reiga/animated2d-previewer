@@ -119,10 +119,12 @@ fn dependency_direction_is_one_way() {
 }
 
 #[test]
-fn no_game_name_appears_downstream_of_the_importers() {
-    // Invariant 1. `a2d-import` is where these names are allowed to live; the
-    // CLI may print them because it is the user-facing surface.
-    let games = ["nikke", "aeons_echo", "aeonsecho", "depose_girls", "deposegirls"];
+fn no_source_identity_appears_downstream_of_the_importers() {
+    // Invariant 1. `a2d-import` is where source identity may live; the CLI may
+    // print it because it is the user-facing surface. Importers are named for
+    // the asset shape they reconstruct, so these are the strings that stand in
+    // for "which source is this" and must not reach a decoder or the renderer.
+    let games = ["spine_bytes", "spinebytes", "unity_cubism", "unitycubism", "unity_spine", "unityspine"];
     let downstream = ["a2d-core", "a2d-spine", "a2d-cubism", "a2d-runtime", "a2d-render", "a2d-pack", "a2d-desktop"];
 
     for crate_name in downstream {
@@ -131,7 +133,7 @@ fn no_game_name_appears_downstream_of_the_importers() {
             for game in games {
                 assert!(
                     !lower.contains(game),
-                    "{} mentions {game:?}: game-specific knowledge must not leak downstream of importers/ \
+                    "{} mentions {game:?}: source-specific knowledge must not leak downstream of importers/ \
                      (CLAUDE.md §2). If a decoder needs it, the importer should have handled it.",
                     path.display()
                 );

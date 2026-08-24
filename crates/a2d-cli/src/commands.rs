@@ -386,14 +386,14 @@ mod tests {
         let err = resolve_importer(Path::new("."), Some("genshin")).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("genshin"), "{text}");
-        for name in ["generic", "aeons_echo", "depose_girls", "nikke"] {
+        for name in ["generic", "spine_bytes", "unity_cubism", "unity_spine"] {
             assert!(text.contains(name), "{text}");
         }
     }
 
     #[test]
     fn a_known_importer_name_resolves() {
-        assert_eq!(resolve_importer(Path::new("."), Some("aeons_echo")).unwrap(), Importer::AeonsEcho);
+        assert_eq!(resolve_importer(Path::new("."), Some("spine_bytes")).unwrap(), Importer::SpineBytes);
     }
 
     #[test]

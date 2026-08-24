@@ -1,9 +1,14 @@
-//! Game-specific importers.
+//! Source-specific importers.
 //!
-//! This module is the only place in the workspace where a game's name may
-//! influence behaviour (spec §2). Everything here reduces to a generic source
-//! package; nothing downstream learns which game an asset came from beyond the
-//! informational `sourceGame` string in the manifest.
+//! This module is the only place in the workspace where the identity of a
+//! source title may influence behaviour (spec §2). Everything here reduces to a
+//! generic source package; nothing downstream learns where an asset came from
+//! beyond the informational `sourceGame` string in the manifest.
+//!
+//! Importers are named for the asset shape they reconstruct rather than for the
+//! title they were written against. Two titles that ship the same shape share
+//! an importer, and the name stays meaningful to someone who has never seen
+//! either of them.
 
 use std::path::Path;
 
@@ -18,36 +23,36 @@ use crate::generic;
 pub enum Importer {
     /// No game-specific handling: plain Spine assets in a folder.
     Generic,
-    /// AEONS ECHO — Spine assets exported as `.skel.bytes` / `.atlas.txt`.
-    AeonsEcho,
-    /// 放置少女 — Cubism inside Unity AssetBundles.
-    DeposeGirls,
-    /// NIKKE — lobby and standing models only.
-    Nikke,
+    /// Spine skeletons shipped as `.skel.bytes` / `.atlas.txt` pairs.
+    SpineBytes,
+    /// Cubism models packed inside Unity AssetBundles.
+    UnityCubism,
+    /// Spine rigs packed inside Unity AssetBundles; standing models only.
+    UnitySpine,
 }
 
 impl Importer {
     pub fn as_str(self) -> &'static str {
         match self {
             Importer::Generic => "generic",
-            Importer::AeonsEcho => "aeons_echo",
-            Importer::DeposeGirls => "depose_girls",
-            Importer::Nikke => "nikke",
+            Importer::SpineBytes => "spine_bytes",
+            Importer::UnityCubism => "unity_cubism",
+            Importer::UnitySpine => "unity_spine",
         }
     }
 
     pub fn parse(s: &str) -> Option<Importer> {
         Some(match s {
             "generic" => Importer::Generic,
-            "aeons_echo" | "aeons-echo" => Importer::AeonsEcho,
-            "depose_girls" | "depose-girls" => Importer::DeposeGirls,
-            "nikke" => Importer::Nikke,
+            "spine_bytes" | "spine-bytes" => Importer::SpineBytes,
+            "unity_cubism" | "unity-cubism" => Importer::UnityCubism,
+            "unity_spine" | "unity-spine" => Importer::UnitySpine,
             _ => return None,
         })
     }
 
     pub fn all() -> [Importer; 4] {
-        [Importer::Generic, Importer::AeonsEcho, Importer::DeposeGirls, Importer::Nikke]
+        [Importer::Generic, Importer::SpineBytes, Importer::UnityCubism, Importer::UnitySpine]
     }
 }
 
@@ -55,19 +60,19 @@ impl Importer {
 ///
 /// Only used to pick a default; `inspect` and `import` both accept an explicit
 /// choice, and an unclear guess falls back to [`Importer::Generic`] rather than
-/// asserting a game.
+/// asserting a source.
 pub fn guess_importer(path: &Path) -> Importer {
     let dir = if path.is_dir() { path.to_path_buf() } else { path.parent().unwrap_or(Path::new(".")).to_path_buf() };
     let Ok(entries) = std::fs::read_dir(&dir) else { return Importer::Generic };
 
     let mut has_unity = false;
-    let mut has_aeons_naming = false;
+    let mut has_doubled_suffix = false;
     for entry in entries.flatten().take(256) {
         let file = entry.path();
         let Some(name) = file.file_name().and_then(|n| n.to_str()) else { continue };
-        // AEONS ECHO's tell is the doubled suffix, not the file's content.
+        // The tell here is the doubled suffix, not the file's content.
         if name.ends_with(".skel.bytes") || name.ends_with(".atlas.txt") {
-            has_aeons_naming = true;
+            has_doubled_suffix = true;
         }
         if let Ok(head) = read_head(&file, 64) {
             if matches!(classify(&head), AssetKind::UnityBundle { .. }) {
@@ -76,10 +81,10 @@ pub fn guess_importer(path: &Path) -> Importer {
         }
     }
 
-    match (has_aeons_naming, has_unity) {
-        (true, _) => Importer::AeonsEcho,
-        // A Unity bundle could be any of the Unity-packaged games, so the
-        // importer is not guessed from that alone.
+    match (has_doubled_suffix, has_unity) {
+        (true, _) => Importer::SpineBytes,
+        // A Unity bundle could hold either shape, so the importer is not
+        // guessed from that alone.
         (false, true) => Importer::Generic,
         (false, false) => Importer::Generic,
     }
@@ -97,20 +102,19 @@ fn read_head(path: &Path, n: usize) -> Result<Vec<u8>, std::io::Error> {
 /// Discovers every character an importer can find at `path`.
 pub fn discover(importer: Importer, path: &Path) -> Result<Vec<generic::SpineSourceSet>, DecodeError> {
     match importer {
-        // AEONS ECHO's `.skel.bytes` / `.atlas.txt` naming is already handled by
-        // the generic stem normalisation, so discovery is shared. The importer
-        // stays a distinct choice because it labels the package's `sourceGame`
-        // and is where any future layout quirk belongs.
-        Importer::Generic | Importer::AeonsEcho => generic::discover(path),
-        Importer::Nikke => Err(unimplemented_importer(
-            "nikke",
-            "lobby model discovery inside NIKKE bundles is not implemented; \
+        // The `.skel.bytes` / `.atlas.txt` naming is already handled by the
+        // generic stem normalisation, so discovery is shared. The importer stays
+        // a distinct choice because it labels the package's `sourceGame` and is
+        // where any future layout quirk belongs.
+        Importer::Generic | Importer::SpineBytes => generic::discover(path),
+        Importer::UnitySpine => Err(unimplemented_importer(
+            "unity_spine",
+            "discovering Spine rigs inside Unity bundles is not implemented; \
              extract the skeleton, atlas and textures first and import them with `--game generic`",
         )),
-        Importer::DeposeGirls => Err(unimplemented_importer(
-            "depose_girls",
-            "Cubism reconstruction from Unity AssetBundles is not implemented \
-             (it depends on the unresolved Cubism Core decision)",
+        Importer::UnityCubism => Err(unimplemented_importer(
+            "unity_cubism",
+            "Cubism reconstruction from Unity AssetBundles is not implemented yet",
         )),
     }
 }
@@ -120,8 +124,8 @@ pub fn import(importer: Importer, set: &generic::SpineSourceSet) -> Result<(Pack
     generic::import(set, importer.as_str())
 }
 
-fn unimplemented_importer(game: &str, detail: &str) -> DecodeError {
-    DecodeError::Reconstruction { game: game.to_string(), message: detail.to_string() }
+fn unimplemented_importer(importer: &str, detail: &str) -> DecodeError {
+    DecodeError::Reconstruction { game: importer.to_string(), message: detail.to_string() }
 }
 
 #[cfg(test)]
@@ -137,25 +141,25 @@ mod tests {
 
     #[test]
     fn hyphenated_spellings_are_accepted() {
-        assert_eq!(Importer::parse("aeons-echo"), Some(Importer::AeonsEcho));
-        assert_eq!(Importer::parse("depose-girls"), Some(Importer::DeposeGirls));
+        assert_eq!(Importer::parse("spine-bytes"), Some(Importer::SpineBytes));
+        assert_eq!(Importer::parse("unity-cubism"), Some(Importer::UnityCubism));
     }
 
     #[test]
     fn an_unknown_importer_name_is_rejected() {
-        assert_eq!(Importer::parse("genshin"), None);
+        assert_eq!(Importer::parse("not_a_known_shape"), None);
         assert_eq!(Importer::parse(""), None);
     }
 
     #[test]
     fn the_unimplemented_importers_say_so_precisely() {
-        let err = discover(Importer::Nikke, Path::new(".")).unwrap_err();
+        let err = discover(Importer::UnitySpine, Path::new(".")).unwrap_err();
         assert!(matches!(err, DecodeError::Reconstruction { .. }), "{err}");
-        assert!(err.to_string().contains("nikke"), "{err}");
+        assert!(err.to_string().contains("unity_spine"), "{err}");
         assert!(err.to_string().contains("--game generic"), "{err}");
 
-        let err = discover(Importer::DeposeGirls, Path::new(".")).unwrap_err();
-        assert!(err.to_string().contains("Cubism Core"), "{err}");
+        let err = discover(Importer::UnityCubism, Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("not implemented"), "{err}");
     }
 
     #[test]

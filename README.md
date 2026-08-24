@@ -9,7 +9,9 @@
 - **Spine**（複数の歴史的バージョン）
 - 上記を Unity パッケージ化したゲーム固有の変種
 
-インポータの初期対象タイトル: 放置少女 / AEONS ECHO / NIKKE
+インポータの初期対象は、Unity バンドルに同梱された Cubism モデル、`.skel.bytes` /
+`.atlas.txt` 形式で配布される Spine スケルトン、Unity バンドルに同梱された Spine リグ
+の 3 系統です。インポータは対象タイトル名ではなく、復元するアセットの形で命名します。
 
 > **ステータス: Phase 1 完了（Spine 経路）／Phase 2 一部完了／Phase 6 実装済み**
 > Spine アセットの検出・デコード・正規化・パッケージ化・アニメーション評価・GPU 描画・
@@ -44,7 +46,7 @@ Desktop Host
 1. **ゲーム固有の知識を `importers/` より下流に漏らさない**
 2. **ソースバージョン固有の知識を `formats/` より下流に漏らさない**
 
-レンダラに `"nikke"` という文字列が必要になったら、設計が間違っています。
+レンダラがどのインポータ由来かを知る必要が出てきたら、設計が間違っています。
 
 ---
 
@@ -58,7 +60,7 @@ Rust の cargo workspace。レンダリングは `wgpu`、デスクトップシ�
 | `a2d-spine` | Spine バージョン検出、v2/v3/v4 デコーダ、Generic Spine IR への正規化 |
 | `a2d-cubism` | moc3 / motion3 / physics / pose のデコードと正規化 |
 | `a2d-unity` | Unity serialized file / AssetBundle のオブジェクトグラフ読み取り |
-| `a2d-import` | generic / depose_girls / aeons_echo / nikke の各インポータ |
+| `a2d-import` | generic / spine_bytes / unity_cubism / unity_spine の各インポータ |
 | `a2d-pack` | `.a2dpack` の読み書き、マニフェスト、決定論的シリアライズ |
 | `a2d-runtime` | スケルトン／パラメータ評価、タイムライン、コンストレイント、ミキシング |
 | `a2d-render` | wgpu デバイス、テクスチャキャッシュ、バッチング、クリッピング |
@@ -87,7 +89,7 @@ character.a2dpack/
 {
   "formatVersion": 1,
   "modelType": "spine",
-  "sourceGame": "aeons_echo",
+  "sourceGame": "spine_bytes",
   "sourceFormat": "spine-3.8",
   "displayName": "CharacterName",
   "defaultAnimation": "idle",
@@ -123,7 +125,7 @@ animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開�
 | `a2d-spine` | **実装済み（3.x / JSON 4.x）** — atlas パーサ、内容ベースのバージョン検出、JSON デコーダ（2.x/3.x/4.x 方言）、バイナリデコーダ（3.x）、正規化 |
 | `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント（world / local × absolute / relative の 4 モード）、path コンストレイント（Tangent / Chain / ChainScale、4 種の spacing モード）、トラック／キュー／クロスフェード、idle ロジック |
 | `a2d-pack` | **実装済み** — 決定論的な `model.bin`、`manifest.json`、`validate` |
-| `a2d-import` | **実装済み（generic / aeons_echo）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
+| `a2d-import` | **実装済み（generic / spine_bytes）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
 | `a2d-cli` | **実装済み** — `inspect` / `import` / `validate` / `preview`（実描画・PNG 出力対応） |
 | `a2d-render` | **実装済み** — wgpu 描画、テクスチャキャッシュ、バッチング、4 ブレンドモード、ステンシルクリッピング、high-DPI、透過背景、オフスクリーン描画と読み戻し |
 | `a2d-desktop` | **実装済み** — 透過フレームレスウィンドウ、ドラッグ、スクロール拡縮、クリックスルー、最前面、トレイメニュー、モデル／アニメーション選択、設定永続化 |
@@ -214,17 +216,17 @@ cargo fmt --all
 
 | Phase | 内容 | ゴール |
 | --- | --- | --- |
-| 1 | atlas パーサ、実ターゲット 1 バージョンの skeleton デコーダ、ボーン／スロット／region・mesh・weighted mesh、基本タイムライン、GPU 描画 | AEONS ECHO のキャラを 1 体正しく表示 |
+| 1 | atlas パーサ、実ターゲット 1 バージョンの skeleton デコーダ、ボーン／スロット／region・mesh・weighted mesh、基本タイムライン、GPU 描画 | Spine キャラを 1 体正しく表示 |
 | 2 | deform / draw order / color / clipping / IK / transform constraint / ミキシング | 複数キャラの idle が正しく再生される |
-| 3 | Unity バンドル調査、MOC3 抽出、Texture2D 抽出、AnimationClip 復元、Cubism パッケージ生成 | `zjwujiang_prefab` を表示し idle を再生 |
+| 3 | Unity バンドル調査、MOC3 抽出、Texture2D 抽出、AnimationClip 復元、Cubism パッケージ生成 | サンプルの Cubism バンドルを表示し idle を再生 |
 | 4 | `GenericCubismModel : AnimatedModel` をビューアに統合 | 1 つのビューアで 2 系統のランタイム |
-| 5 | NIKKE インポータ（ロビー／立ち絵のみ） | NIKKE キャラの idle を Generic Spine Runtime で表示 |
+| 5 | unity_spine インポータ（立ち絵のみ） | Unity 同梱の Spine キャラの idle を Generic Spine Runtime で表示 |
 | 6 | 透過ウィンドウ、ドラッグ、クリックスルー、トレイ、idle ロジック、設定永続化 | デスクトップマスコット化 |
 
 ### MVP の完了条件
 
-1. AEONS ECHO の Spine キャラをインポートして表示できる
-2. 放置少女 `zjwujiang_prefab` をインポートして表示できる
+1. `.skel.bytes` 形式の Spine キャラをインポートして表示できる
+2. Unity 同梱の Cubism モデルをインポートして表示できる
 3. 両方で idle アニメーションが動く
 4. 同一のデスクトップビューア UI から両方を開ける
 5. レンダラにゲーム固有の分岐が 1 つも無い
