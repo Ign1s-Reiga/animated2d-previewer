@@ -246,7 +246,7 @@ fn motion3_path(file: &SerializedFile, info: &ObjectInfo) -> Option<String> {
 /// Whether a source path names a given clip, ignoring case.
 ///
 /// Unity lower-cases container paths but keeps the authored casing inside the
-/// asset, so `ZJmoushi_idle` has to match `.../zjmoushi_idle.motion3.json`.
+/// asset, so `Hero_idle` has to match `.../hero_idle.motion3.json`.
 fn mentions(path: &str, clip: &str) -> bool {
     let stem = clip.to_ascii_lowercase();
     path.to_ascii_lowercase().contains(&stem)
@@ -266,10 +266,10 @@ mod tests {
 
     #[test]
     fn a_clip_is_matched_to_its_source_regardless_of_case() {
-        let path = "Assets/.../motions/ZJmoushi_idle.motion3.json";
-        assert!(mentions(path, "ZJmoushi_idle"));
-        assert!(mentions(path, "zjmoushi_idle"), "container paths are lower-cased");
-        assert!(!mentions(path, "ZJmoushi_smile"));
+        let path = "Assets/.../motions/Hero_idle.motion3.json";
+        assert!(mentions(path, "Hero_idle"));
+        assert!(mentions(path, "hero_idle"), "container paths are lower-cased");
+        assert!(!mentions(path, "Hero_smile"));
     }
 
     #[test]

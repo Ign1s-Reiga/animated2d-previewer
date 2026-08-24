@@ -342,6 +342,41 @@ Rendered frames:"
 }
 
 /// Classifies every file at `path` for the `inspect` listing.
+/// Prints what the MOC3 itself declares, beside what Unity recorded.
+fn print_moc3(
+    out: &mut dyn std::io::Write,
+    model: &a2d_cubism::Moc3,
+    inventory: &a2d_import::CubismInventory,
+) -> Result<(), CliError> {
+    let c = model.canvas;
+    writeln!(out, "  canvas:      {} x {} px at {} px/unit", c.size.0, c.size.1, c.pixels_per_unit)?;
+
+    // A count that disagrees with the Unity components means one of the two
+    // readings is wrong, and saying which is which beats picking one.
+    let rows: [(&str, u32, usize); 3] = [
+        ("parameters", model.counts.parameters, inventory.parameters),
+        ("parts", model.counts.parts, inventory.parts),
+        ("drawables", model.counts.drawables, inventory.drawables),
+    ];
+    for (label, from_moc, from_unity) in rows {
+        let note =
+            if from_moc as usize == from_unity { String::new() } else { format!("  (Unity reports {from_unity})") };
+        writeln!(out, "  {label:<12} {from_moc}{note}")?;
+    }
+    writeln!(
+        out,
+        "  deformers:   {} ({} warp, {} rotation)",
+        model.counts.deformers, model.counts.warp_deformers, model.counts.rotation_deformers
+    )?;
+    if model.counts.glues > 0 {
+        writeln!(out, "  glues:       {}", model.counts.glues)?;
+    }
+    if !model.is_verified_version() {
+        writeln!(out, "  note:        MOC3 version {} is newer than any checked against a real model", model.version)?;
+    }
+    Ok(())
+}
+
 /// Reads `input` when it is a Unity bundle, by content rather than by name.
 fn unity_bundle_bytes(input: &Path) -> Option<Vec<u8>> {
     if !input.is_file() {
@@ -368,9 +403,18 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<()
             if let Some(path) = &moc.asset_path {
                 writeln!(out, "  authored at: {path}")?;
             }
-            writeln!(out, "  parameters:  {}", inventory.parameters)?;
-            writeln!(out, "  parts:       {}", inventory.parts)?;
-            writeln!(out, "  drawables:   {}", inventory.drawables)?;
+            // The Unity side counts components; the MOC3 counts what the
+            // model itself declares. Reporting both is what makes a
+            // disagreement visible rather than quietly averaged over.
+            match a2d_cubism::Moc3::parse(&moc.bytes) {
+                Ok(model) => print_moc3(out, &model, &inventory)?,
+                Err(e) => {
+                    writeln!(out, "  contents:    unreadable — {e}")?;
+                    writeln!(out, "  parameters:  {} (counted from the Unity components)", inventory.parameters)?;
+                    writeln!(out, "  parts:       {}", inventory.parts)?;
+                    writeln!(out, "  drawables:   {}", inventory.drawables)?;
+                }
+            }
             writeln!(out, "  hierarchy:   {} GameObjects", inventory.game_objects)?;
         }
         None => writeln!(out, "\nNo CubismMoc found: this bundle holds no Live2D model.")?,

@@ -1,23 +1,30 @@
 //! Live2D Cubism decoding and normalization into the Generic Cubism model.
 //!
-//! # Status: blocked on an open decision, deliberately not started
+//! # Status: the MOC3 container reads; the model does not yet
 //!
-//! CLAUDE.md §13.1 says to ask before writing any MOC3 code, because the answer
-//! changes this crate's whole design:
+//! CLAUDE.md §13.1 is settled: MOC3 is decoded by an independent parser here,
+//! and Live2D's proprietary Cubism Core is not linked. That keeps the project
+//! redistributable and free of proprietary binaries (§11, §16), at the cost of
+//! working out an undocumented format.
 //!
-//! * **Use the official Cubism Core.** A proprietary native library with
-//!   licence terms. Correct by construction, but adds a binary dependency that
-//!   cannot be redistributed and constrains how the viewer may be shipped.
-//! * **Write an independent MOC3 parser.** No proprietary dependency, but a
-//!   large undertaking against an undocumented format, and the deformer
-//!   evaluation semantics would have to be reverse-engineered to match.
+//! What that cost means in practice, and how it is being paid: nothing is
+//! assumed. Every field this crate reads was derived from a real model and then
+//! checked against an independent source — the same model's Unity components,
+//! or a relation that could only hold if the reading were right. Anything not
+//! checked that way is left unparsed rather than guessed at. See [`moc3`] for
+//! what has been established and how.
 //!
-//! Nothing is stubbed here until that is settled. Guessing would produce a
-//! design that has to be thrown away.
+//! Read today: identifiers, counts, the canvas, and parameter ranges. Not yet:
+//! geometry, deformers, masks, and the evaluation that turns parameter values
+//! into a posed model — which is the larger half, and the half with no
+//! reference runtime to compare against.
 //!
-//! Detection is already in place and does not depend on the decision:
-//! [`a2d_import::classify`] recognises the `MOC3` magic and its version byte,
-//! and the `model3` / `motion3` / `physics3` / `pose3` / `exp3` JSON sidecars,
-//! so `animated2d inspect` can already inventory a Cubism character.
+//! Detection is separate and already complete: [`a2d_import::classify`]
+//! recognises the `MOC3` magic and its version byte, and the `model3` /
+//! `motion3` / `physics3` / `pose3` / `exp3` JSON sidecars.
 
 #![forbid(unsafe_code)]
+
+pub mod moc3;
+
+pub use moc3::{Canvas, Counts, Moc3, Parameter};
