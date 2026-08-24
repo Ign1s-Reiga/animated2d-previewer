@@ -1,0 +1,13 @@
+[package]
+name = "a2d-spine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Spine version detection, decoders and normalization into the Generic Spine IR."
+
+[dependencies]
+a2d-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
