@@ -107,7 +107,7 @@ character.a2dpack/
 animated2d inspect  <input>                  # ゲーム/形式/バージョン/テクスチャ/アニメ名/非対応機能
 animated2d import   <input> -o <out.a2dpack>
 animated2d validate <package>
-animated2d preview  <package>                # ビューアで直接開く
+animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開く
 ```
 
 `validate` のチェック項目: テクスチャ欠損 / 未解決アタッチメント / 非対応タイムライン /
@@ -144,6 +144,16 @@ animated2d preview character.a2dpack -o frames/ # オフスクリーン描画し
 表示しつつ各フレームを PNG として書き出します。GPU が無い環境ではエラーになります
 （テストはスキップされます）。
 
+```bash
+animated2d preview character.a2dpack --exit-after 5   # 5 秒後に自動終了
+```
+
+`--exit-after <秒>` は終了操作（`Esc` / トレイ / 閉じるボタン）とまったく同じ経路で
+ビューアを閉じます。スクリーンショットの自動撮影や、終了時に設定が本当に保存されるかを
+確かめるスモークテストのための機能です。計測はウィンドウが開いてから始まります
+（デバイス生成に数秒かかることがあるため）。終了時には提示したフレーム数を表示するので、
+ウィンドウが実際に描画したかどうかを外から確認できます。
+
 ### ビューアの操作
 
 | 操作 | 動作 |
@@ -163,7 +173,10 @@ animated2d preview character.a2dpack -o frames/ # オフスクリーン描画し
 受け取らないため、トレイが唯一の操作手段になります。
 
 ウィンドウ位置・サイズ・選択中のモデルとアニメーション・拡大率は終了時に保存され、
-次回起動時に復元されます（`%APPDATA%nimated2d\config.json` など）。
+次回起動時に復元されます（Windows なら `%APPDATA%\animated2d\config.json`、macOS なら
+`~/Library/Application Support/animated2d/config.json`、それ以外は
+`$XDG_CONFIG_HOME/animated2d/config.json`）。環境変数 `A2D_CONFIG_DIR` を
+設定するとその場所を上書きできます。
 
 ## 開発環境
 
