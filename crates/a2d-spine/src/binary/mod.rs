@@ -1,6 +1,7 @@
 //! Binary skeleton decoders, dispatched by detected version family.
 
 pub mod v3;
+pub mod v4;
 
 use a2d_core::ir::atlas::Atlas;
 use a2d_core::ir::spine::SpineIr;
@@ -25,15 +26,12 @@ pub fn decode(
             detection.raw_version.clone(),
             "the 2.x binary layout has no decoder yet; export as JSON or open an issue with the asset",
         )),
-        // Spine 4.x moved the string table, changed the timeline enum, and
-        // stores pre-sampled Bezier tables rather than control points. Guessing
-        // at those would produce a model that loads and animates wrongly, which
-        // is worse than refusing (rule §4.9).
-        Some(SpineFamily::V4) => Err(DecodeError::unsupported_version(
-            ModelKind::Spine,
-            detection.raw_version.clone(),
-            "the 4.x binary layout has no decoder yet; the 4.x JSON dialect is supported",
-        )),
+        // 4.0 and 4.1 only: see `v4::check_minor` for why 4.2 is refused, and
+        // the module docs for what "not yet validated" means here.
+        Some(SpineFamily::V4) => {
+            v4::check_minor(detection)?;
+            v4::decode(bytes, detection, atlas, report)
+        }
         None => Err(DecodeError::unsupported_version(
             ModelKind::Spine,
             detection.raw_version.clone(),
@@ -44,12 +42,17 @@ pub fn decode(
 
 #[cfg(test)]
 pub(crate) mod writer {
-    //! A minimal Spine 3.x binary writer, used to build test fixtures.
+    //! A minimal Spine binary writer, used to build test fixtures.
     //!
-    //! Round-tripping through a writer is how the decoder is tested without
-    //! committing a real game asset (spec §11 asset policy). The writer mirrors
-    //! the layout documented in [`super::v3`]; if the two disagree, the tests
-    //! catch it as a decode failure.
+    //! Round-tripping through a writer is how the decoders are tested without
+    //! committing a real game asset (spec §11 asset policy). The primitives are
+    //! shared by the 3.x and 4.x fixtures; each version's own test module lays
+    //! them out to match the layout documented in [`super::v3`] or
+    //! [`super::v4`], and a disagreement shows up as a decode failure.
+    //!
+    //! What a round-trip does **not** prove is that either side matches a file
+    //! the Spine editor wrote. For 3.x that has been checked; for 4.x it has
+    //! not. See the note at the top of [`super::v4`].
 
     #[derive(Default)]
     pub struct SkelWriter {
@@ -71,6 +74,11 @@ pub(crate) mod writer {
         }
 
         pub fn u32(&mut self, v: u32) -> &mut Self {
+            self.out.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+
+        pub fn u64(&mut self, v: u64) -> &mut Self {
             self.out.extend_from_slice(&v.to_be_bytes());
             self
         }
@@ -693,19 +701,22 @@ mod tests {
     }
 
     #[test]
-    fn the_4x_binary_layout_is_refused_rather_than_guessed_at() {
+    fn the_42_binary_layout_is_refused_rather_than_guessed_at() {
+        // 4.2 packed the IK flags and added physics constraints, so reading it
+        // with the 4.0/4.1 layout would silently misplace everything after.
         let detection = SpineDetection {
             encoding: crate::detect::SpineEncoding::Binary,
-            version: crate::detect::SpineVersion::new(4, 1, 23),
-            raw_version: "4.1.23".into(),
+            version: crate::detect::SpineVersion::new(4, 2, 7),
+            raw_version: "4.2.07".into(),
             hash: None,
         };
         let mut report = LoadReport::new();
         let err = decode(&[0u8; 32], &detection, Atlas::default(), &mut report).unwrap_err();
         match err {
             DecodeError::UnsupportedVersion { version, detail, .. } => {
-                assert_eq!(version, "4.1.23");
-                assert!(detail.contains("4.x JSON"), "{detail}");
+                assert_eq!(version, "4.2.07");
+                assert!(detail.contains("physics constraints"), "{detail}");
+                assert!(detail.contains("4.0 and 4.1"), "{detail}");
             }
             other => panic!("expected an unsupported-version error, got {other}"),
         }
