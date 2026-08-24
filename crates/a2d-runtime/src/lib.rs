@@ -8,4 +8,4 @@
 
 pub mod spine;
 
-pub use spine::SkeletonPose;
+pub use spine::{AnimationState, FiredEvent, MixBlend, SkeletonPose};
