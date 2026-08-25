@@ -128,32 +128,32 @@ points, then drawables under the same rule — reproduces every one of the 9554
 stored offsets and ends precisely on the declared total. A wrong padding rule or
 a wrong ordering misses on the very first deformer.
 
-**The axis order — checked against the one witness outside the chain.** MOC3
-writes the **vertical component of a point first**. This is the single most
-consequential fact in the format, because getting it wrong transposes the entire
-model, and it fixes four things at once:
+**Warp grid orientation.** Two division counts arrive with nothing to say which
+is rows and which is columns, and for a square grid it cannot matter. Reading
+every non-square grid across six models both ways settled it: with
+`divisions.1 + 1` points to a stored row, 713 of 729 grids are perfectly
+monotone lattices and most of the rest are coherently mirrored; the other
+reading interleaves rows and leaves not one grid monotone.
 
-- every stored point pair is swapped as it is read;
-- the two rotation-origin sections go into the opposite fields;
-- rotation angles turn the other way, so their sense is flipped once, at parse;
-- a warp's stored runs walk **down a column**, not along a row.
+**A correction, and a caution about determinants.** These coordinates were once
+read the other way round — pairs swapped, angles negated, the lattice
+transposed — on the strength of a determinant argument that turned out to be
+backwards. The argument was: a drawable's mesh is the same shape in uv space as
+in canvas space, so only a mirror flips the sign of the map between them, and
+one mirror must be expected because texture rows run down while `y` runs up. The
+second half is wrong for this pipeline: `a2d-unity` **flips Unity's bottom-up
+rows** when it decodes a `Texture2D`, and that flip is what makes the two axes
+agree. A correct model therefore fits *positive*, not negative.
 
-It hides well. Reading the point pairs and the lattice in the same wrong order
-transposes both, so the model stays internally consistent and a census of
-monotone lattices scores the two readings identically — an earlier version of
-this document claimed the orientation had been settled that way, and it had not
-been. The parameters cannot witness against it either, since they are carried
-through the very chain under test.
+Two lessons are worth keeping. A determinant detects a mirror and **nothing
+else** — it is blind to rotation, so it can never confirm that a model is the
+right way up. And a convention argued from first principles is worth less than
+the same argument checked against the code that actually runs: the row flip was
+forty lines away and had been read, and was still forgotten.
 
-What settled it was each drawable's **own texture coordinates**. A mesh is the
-same shape in uv space as in canvas space, so the map between them is a
-similarity; atlas packing may rotate a region, but a rotation cannot flip the
-sign of a determinant and a mirror can. Exactly one mirror is expected, `v`
-running down the atlas against `y` running up the canvas, so every drawable
-should fit negative. Read the old way 1% did; read this way 99% do, on all three
-models measured. The face then comes out upright and right-handed as well,
-though that is a consequence rather than the evidence — a character may
-legitimately be drawn tilted.
+What no measurement here settled was whether the character is upright. It is
+not: this one is drawn reclining, head to the right, which is why every attempt
+to assert that a face should be level produced a wrong answer.
 
 Anything not on this list is left unparsed rather than guessed at. The raw
 section table is exposed so later work can extend the parser without
@@ -191,16 +191,14 @@ is the one that renders correctly.
 Deformers form a forest; a drawable names one parent deformer and inherits the
 chain above it. There are two kinds.
 
-A **warp deformer** is a grid of control points, stored column-major:
-`divisions.1 + 1` consecutive points walk down one column, and there are
-`divisions.0 + 1` columns. Its children live in the grid's unit square, and
+A **warp deformer** is a grid of control points, stored row-major with
+`divisions.1 + 1` points to a row. Its children live in the grid's unit square, and
 posing a point is a bilinear lookup. Outside the square the edge cells are
 *extended* rather than clamped, so geometry that overhangs a deformer keeps its
 shape instead of collapsing onto the border.
 
 A **rotation deformer** is a rigid frame: origin, angle in degrees, uniform
-scale, opacity. Posing a point is `origin + R(angle) · (point · scale)`, with
-the angle's sense already flipped at parse to match a vertical-first file.
+scale, opacity. Posing a point is `origin + R(angle) · (point · scale)`.
 
 Constraints are applied in the order the chain is walked, from the drawable
 outward to the root.
@@ -295,17 +293,22 @@ unpainted.
 
 ### Why the eyes were invisible
 
-Three separate problems, all now fixed, and each hid the next:
+Two problems, both now fixed:
 
-1. the whole model was assembled transposed (§3), so nothing was where it looked;
-2. the irises were unclipped, drawing their full quads rather than being cut to
+1. the irises were unclipped, drawing their full quads rather than being cut to
    their own eye whites (sections 47, 48 and 80);
-3. section 87 was read as a key rather than a sequence, painting the face skin
+2. section 87 was read as a key rather than a sequence, painting the face skin
    over the eyes.
 
-Only the third was visible as "no eyes". The first was mistaken for a head
-rotation and the second for the cause of the third, which is why they were
-untangled in the wrong order.
+The second was the one that mattered — the eyes were there the whole time,
+behind the face's own skin.
+
+A third suspect was investigated at length and was not a fault: the model looks
+turned because **the character is drawn reclining**, head to the right. That was
+twice diagnosed as a decoding error, and the second diagnosis was acted on
+before being reverted. §3 records the argument and why it was wrong. Nothing in
+the format says which way up a character stands; only someone who knows the
+character can say.
 
 ## 7. How correctness is judged without a reference runtime
 
@@ -325,14 +328,19 @@ same scene. A wrong chain would have to distort both identically.
 coordinates near one whether their parent's grid is in `[0, 1]` or in units
 running to 64.
 
-**Every drawable agrees with the texture it samples.** This is the strongest of
-the four, because it is the only one that compares the geometry against
-something *outside* the deformer chain. A mesh is the same shape in uv space as
-in canvas space, so the map between them is a similarity; only a mirror flips
-the sign of its determinant, and exactly one mirror is expected because `v` runs
-down the atlas while `y` runs up the canvas. 99%, 96% and 97% of drawables fit
-negative on the three models measured. A model assembled transposed scores near
-zero, which is how one was caught.
+**No drawable is mirrored against the texture it samples.** This is the only
+criterion that compares the geometry against something *outside* the deformer
+chain. A mesh is the same shape in uv space as in canvas space, so the map
+between them is a similarity, and only a mirror flips the sign of its
+determinant. On the three models measured, 99%, 96% and 97% fit positive.
+
+Positive, not negative: `a2d-unity` flips Unity's bottom-up rows when it decodes
+a `Texture2D`, which cancels the usual v-runs-down convention. Getting that
+backwards is what produced the reverted change in §3.
+
+Note what this does **not** show. A determinant is invariant under rotation, so
+this can never say a model is the right way up — only that it is not mirrored.
+Treating it as an orientation check is precisely the mistake that was made.
 
 An earlier version of this document listed a fifth criterion — that sweeping
 `ParamEyeBallX` and `ParamEyeBallY` gives two perpendicular, right-handed axes —
