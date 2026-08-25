@@ -129,3 +129,56 @@ fn a_truncated_real_model_fails_rather_than_returning_a_partial_one() {
         let _ = Moc3::parse(&bytes[..cut.min(bytes.len())]);
     }
 }
+
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
+fn a_real_model_yields_meshes_whose_triangles_are_all_in_range() {
+    // The drawable tables are cumulative offsets into two shared arrays, so
+    // reading them wrongly puts indices outside their own mesh almost
+    // immediately. Checking every one is the strongest structural evidence
+    // available that they were read right.
+    let Some(bytes) = payload() else { return };
+    let moc = Moc3::parse(&bytes).expect("a real MOC3 should parse");
+
+    assert_eq!(moc.drawables.len(), moc.counts.drawables as usize);
+    let mut vertices = 0usize;
+    let mut triangles = 0usize;
+    for d in &moc.drawables {
+        assert!(d.vertex_count() > 0, "{} has no vertices", d.id);
+        assert_eq!(d.indices.len() % 3, 0, "{} has a partial triangle", d.id);
+        for &i in &d.indices {
+            assert!((i as usize) < d.vertex_count(), "{} index {i} is outside its own mesh", d.id);
+        }
+        // Texture coordinates live in the unit square, give or take the sliver
+        // of overshoot an atlas edge produces.
+        for &(u, v) in &d.uvs {
+            assert!((-0.01..=1.01).contains(&u) && (-0.01..=1.01).contains(&v), "{} has a uv at ({u}, {v})", d.id);
+        }
+        assert!(d.parent_deformer < moc.counts.deformers, "{} names a deformer out of range", d.id);
+        vertices += d.vertex_count();
+        triangles += d.triangle_count();
+    }
+    println!("{} drawables, {vertices} vertices, {triangles} triangles", moc.drawables.len());
+    assert!(triangles > 100, "a character mesh should be more than a handful of triangles");
+}
+
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
+fn a_real_keyform_pool_is_consistent_with_its_offsets() {
+    let Some(bytes) = payload() else { return };
+    let moc = Moc3::parse(&bytes).expect("a real MOC3 should parse");
+
+    assert!(!moc.keyforms.is_empty(), "a rigged model has keyforms");
+    assert!(!moc.keyforms.positions.is_empty());
+    for value in &moc.keyforms.positions {
+        assert!(value.is_finite(), "the keyform pool holds a non-finite coordinate");
+    }
+    // Offsets are non-decreasing and stay inside the pool.
+    let mut previous = 0u32;
+    for (i, &offset) in moc.keyforms.offsets.iter().enumerate() {
+        assert!(offset >= previous, "keyform {i} starts before its predecessor");
+        assert!((offset as usize) <= moc.keyforms.positions.len(), "keyform {i} starts past the pool");
+        previous = offset;
+    }
+    println!("{} keyforms over {} coordinates", moc.keyforms.len(), moc.keyforms.positions.len());
+}

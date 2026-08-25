@@ -363,6 +363,10 @@ fn print_moc3(
             if from_moc as usize == from_unity { String::new() } else { format!("  (Unity reports {from_unity})") };
         writeln!(out, "  {label:<12} {from_moc}{note}")?;
     }
+    let vertices: usize = model.drawables.iter().map(|d| d.vertex_count()).sum();
+    let triangles: usize = model.drawables.iter().map(|d| d.triangle_count()).sum();
+    writeln!(out, "  mesh:        {vertices} vertices, {triangles} triangles")?;
+    writeln!(out, "  keyforms:    {} (not yet bound to elements, so no pose)", model.keyforms.len())?;
     writeln!(
         out,
         "  deformers:   {} ({} warp, {} rotation)",

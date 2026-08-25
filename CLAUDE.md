@@ -32,9 +32,11 @@ modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transpare
 window, drag, scale, click-through, always-on-top, tray, config persistence), `a2d-cli`.
 
 Partly implemented: `a2d-unity` (UnityFS container, serialized files, object inventory),
-`a2d-import`'s `unity_cubism` discovery, and `a2d-cubism`'s MOC3 container reader
-(identifiers, counts, canvas, parameter ranges). Not implemented: MOC3 geometry and
-deformers, Cubism evaluation, and reconstruction of a loadable package from a bundle.
+`a2d-import`'s `unity_cubism` discovery, and `a2d-cubism`'s MOC3 reader (identifiers,
+counts, canvas, parameter ranges, and drawable meshes — uvs and triangles). Not
+implemented: the keyform-to-element binding, deformer evaluation, and reconstruction of
+a loadable package. **A MOC3 holds no resting pose** — coordinates come from blending
+keyforms by parameter value — so nothing can be posed until that binding is worked out.
 Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 binary layouts.
 
 **The 4.0/4.1 binary decoder has not been checked against a real export.** Its tests
