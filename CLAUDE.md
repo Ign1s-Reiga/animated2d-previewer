@@ -21,15 +21,22 @@ repository, including comments, tests, fixture names and commit messages.
 
 Primary objective: **correct character playback for desktop viewing.** Nothing else.
 
-**Current phase:** Phase 1 complete for the Spine path; Phase 2 feature-complete but its
-goal is unverified without real assets; Phase 6 implemented.
+**Current phase:** Phase 1 complete for the Spine path and now confirmed against a real
+export; Phase 5 discovery done; Phase 6 implemented. Phase 2's goal — idle playing correctly
+across several characters — is still unverified by eye.
 
 Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x and 4.0/4.1),
 `a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints in all four
 modes, path constraints, mixing,
-idle), `a2d-pack`, `a2d-import` (generic + spine_bytes), `a2d-render` (wgpu, batching, blend
+idle), `a2d-pack`, `a2d-import` (generic + spine_bytes + unity_spine), `a2d-render` (wgpu, batching, blend
 modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transparent frameless
 window, drag, scale, click-through, always-on-top, tray, config persistence), `a2d-cli`.
+
+**The Spine binary 3.8 decoder is now validated against real exports.** 24 Unity-packaged
+rigs from one source decode without a single failure, and the rigs come out coherent — one
+has 189 bones, 86 slots and animations of sensible duration. That is the first time any
+Spine path has been checked against a file the Spine editor wrote rather than against our
+own fixture writer. It says nothing about 4.0/4.1, which remains unvalidated.
 
 Partly implemented: `a2d-unity` (UnityFS container, serialized files, object inventory),
 `a2d-import`'s `unity_cubism` discovery, and `a2d-cubism`'s MOC3 reader (identifiers,

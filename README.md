@@ -13,10 +13,13 @@
 `.atlas.txt` 形式で配布される Spine スケルトン、Unity バンドルに同梱された Spine リグ
 の 3 系統です。インポータは対象タイトル名ではなく、復元するアセットの形で命名します。
 
-> **ステータス: Phase 1 完了（Spine 経路）／Phase 2 一部完了／Phase 6 実装済み**
+> **ステータス: Phase 1 完了（Spine 経路・実アセットで検証済み）／Phase 2 一部完了／
+> Phase 5 調査完了／Phase 6 実装済み**
 > Spine アセットの検出・デコード・正規化・パッケージ化・アニメーション評価・GPU 描画・
 > 透過デスクトップウィンドウが動作します。`animated2d preview` でビューアが開きます。
-> Cubism / Unity 経路は未実装です。詳細は下の「実装状況」を参照してください。
+> Unity バンドル内の Spine リグ（`unity_spine`）を取り出してデコードできます。
+> Cubism モデルは MOC3 を独自実装で読み、ポーズしてビューアに表示できますが、
+> 描画順とマスク周りに未解決の問題があります。詳細は下の「実装状況」を参照してください。
 
 ---
 
@@ -125,12 +128,12 @@ animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開�
 | `a2d-spine` | **実装済み** — atlas パーサ、内容ベースのバージョン検出、JSON デコーダ（2.x/3.x/4.x 方言）、バイナリデコーダ（3.x / 4.0・4.1）、正規化 |
 | `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント（world / local × absolute / relative の 4 モード）、path コンストレイント（Tangent / Chain / ChainScale、4 種の spacing モード）、トラック／キュー／クロスフェード、idle ロジック |
 | `a2d-pack` | **実装済み** — 決定論的な `model.bin`、`manifest.json`、`validate` |
-| `a2d-import` | **実装済み（generic / spine_bytes / unity_cubism の調査まで）** — 内容ベースの分類、アセット探索、サフィックス正規化 |
+| `a2d-import` | **実装済み（generic / spine_bytes / unity_spine）＋ unity_cubism は調査まで** — 内容ベースの分類、アセット探索、サフィックス正規化 |
 | `a2d-cli` | **実装済み** — `inspect` / `import` / `validate` / `preview`（実描画・PNG 出力対応） |
 | `a2d-render` | **実装済み** — wgpu 描画、テクスチャキャッシュ、バッチング、4 ブレンドモード、ステンシルクリッピング、high-DPI、透過背景、オフスクリーン描画と読み戻し |
 | `a2d-desktop` | **実装済み** — 透過フレームレスウィンドウ、ドラッグ、スクロール拡縮、クリックスルー、最前面、トレイメニュー、モデル／アニメーション選択、設定永続化 |
 | `a2d-unity` | **実装済み（読み取り）** — UnityFS コンテナ、serialized file、オブジェクト目録。実バンドルで検証済み |
-| `a2d-cubism` | **一部実装** — MOC3 読み取り（ID / カウント / キャンバス / パラメータ範囲 / ドローアブルの UV・三角形）。独自パーサ方針（Cubism Core は使いません）。キーフォームと要素の対応付け、デフォーマ評価は未実装のため、まだポーズを作れません |
+| `a2d-cubism` | **一部実装** — MOC3 読み取り（ID / カウント / キャンバス / パラメータ範囲 / ドローアブルの UV・三角形 / キーフォーム / デフォーマ / 不透明度 / クリッピングマスク / ブレンドモード）。独自パーサ方針（Cubism Core は使いません）。ポーズと描画は動作し、`AnimatedModel` としてビューアに表示できます。未解決：描画順（顔が目の手前に来る）、頭部ジオメトリの向き、Unity AnimationClip からのモーション復元。詳細は [`docs/cubism-moc3.md`](docs/cubism-moc3.md) |
 
 未対応の機能は黙って無視されるのではなく、`LoadReport` として `inspect` / `import` /
 `validate` に必ず出力されます。既知の未対応: Spine 2.x バイナリ、Spine 4.2 バイナリ。
