@@ -71,9 +71,26 @@ used by the parser:
 | 44 | drawable vertex offsets (floats) | | 90 | glue ids |
 | 45 | drawable index offsets | | | |
 | 46 | drawable index counts | | | |
+| 68 | drawable keyform opacity | | 69 | drawable keyform draw order |
 
 A wrong index here fails loudly rather than returning a plausible model: each
 section is required to hold exactly the declared number of well-formed entries.
+
+Identified but **not yet decoded**, listed so the next pass does not have to
+re-find them:
+
+| # | Width | Contents | How it was identified |
+|---|---|---|---|
+| 39 | u32 | part index per drawable | 79 distinct values over 568 drawables, `u32::MAX` for none; the eye and face meshes share one value and the front-hair meshes another |
+| 41 | u32 | texture index per drawable | all zero, which is what a single-page model looks like and confirms the one-page assumption the emitter makes |
+| 42 | **byte** | drawable constant flags | one byte per drawable; only two values occur, 4 on 529 meshes and 6 on 39. Bit 2 is double-sided and bit 1 multiply-blend, which is why the meshes carrying 6 include one named as a shadow |
+| 47 | u32 | first clipping mask per drawable | a running offset |
+| 48 | u32 | clipping mask count per drawable | offset plus count equals the next drawable's offset, exactly, all the way along -- the same closure argument that fixed the drawable tables |
+| 70 | u32 | drawable keyform position offsets | the offsets the padding rule of §3 already predicts, stored explicitly; useful as a cross-check |
+
+Section 42 is a **byte** array, not a word array. A scan that assumes four-byte
+entries walks straight past it, which is why it was missed on the first pass.
+
 
 ## 3. What was confirmed, and against what
 
@@ -210,7 +227,47 @@ Until that exists, a viewer should frame the **canvas** rather than the posed
 geometry. The canvas does not move, so one mis-scaled drawable cannot shrink
 everything else to nothing.
 
-## 6. How correctness is judged without a reference runtime
+## 6. Opacity, draw order, and why a face can come out with no eyes
+
+Two per-keyform tracks sit beside the coordinates and blend by exactly the same
+weights.
+
+**Opacity** (section 68) is one float per drawable keyform, every value inside
+`[0, 1]`. Cubism hides a part by taking it to zero opacity rather than by
+removing it, so a decoder that paints every drawable opaque covers whatever
+should have shown through. A fully transparent drawable is not emitted at all.
+
+**Draw order** (section 69) runs 499 to 1000 about a resting 510. This is the
+artist's per-drawable value, and it is **not** the same thing as the resolved
+back-to-front sequence in section 87: the two disagree on 567 of 568 drawables
+in one real model. Turning draw orders into a render order needs the part tree,
+so section 87 is what the emitter sorts by, and section 69 is decoded and
+carried but not yet used.
+
+That distinction has a visible consequence. On one model the eyes do not appear,
+and the reason is not that the meshes are absent: all 28 of them are present,
+correctly placed, at full opacity, named `eye_r01`, `eyelash_down_r03`,
+`eyelids_r02` and so on. Two separate gaps hide them.
+
+**The face skin is drawn in front of them.** `face_02` sits at section-87 order
+534 against eye meshes at 519 to 526, and covers 100% of their bounding box.
+Suppressing that one mesh reveals the eyes immediately. So section 87 is not by
+itself the correct render order for every mesh — the part tree is needed to
+resolve it.
+
+**The eyes are unclipped.** `eye_r01`, `eye_r02`, `eye_l01` and `eye_l02` each
+declare one clipping mask in sections 47 and 48, and masks are not decoded, so
+an iris that should be clipped to the eye white paints its whole quad. With the
+face skin removed they show as raw rectangles carrying visible atlas edges
+rather than as eyes.
+
+Both are decoding gaps rather than renderer ones: `a2d-render` already does
+stencil clipping for the Spine path, and `RenderMesh` already carries a
+`clipping_mask` and a `blend_mode`. What is missing is reading sections 39, 42,
+47 and 48 and the mask index array, and computing a render order from the part
+tree.
+
+## 7. How correctness is judged without a reference runtime
 
 No reference render has been compared against, so the chain is judged by
 properties that must hold for any correct evaluation.
@@ -245,7 +302,7 @@ model.
 These are `crates/a2d-cli/tests/cubism_orientation.rs`, gated on
 `A2D_FIXTURE_CUBISM` because extracted assets are never committed (§11).
 
-## 7. What is still unverified
+## 8. What is still unverified
 
 - **No reference render.** Landing in the right frame shows the chain composes;
   it cannot show that a particular warp bends the way Live2D bends it, or that
@@ -255,6 +312,12 @@ These are `crates/a2d-cli/tests/cubism_orientation.rs`, gated on
   model poses and draws but does not play its own animation.
 - **Physics, pose files, expressions, hit areas.** All live outside the MOC3 and
   are not read.
-- **Multiple texture pages.** Every drawable is assumed to sample page zero; the
-  per-drawable texture index is not decoded.
+- **Clipping masks and blend modes.** Sections 42, 47 and 48 are identified but
+  not read, so masked meshes draw unclipped and multiply-blended ones draw
+  normally. See §6.
+- **Render order.** Section 87's resolved order places at least one face mesh in
+  front of the eyes; resolving it properly needs the part tree in section 39.
+- **Multiple texture pages.** Every drawable is assumed to sample page zero.
+  Section 41 holds the per-drawable texture index and is all zero on the models
+  seen, so the assumption holds for them, but it is not read.
 - **Glue.** Identifiers are read; the constraint is not applied.
