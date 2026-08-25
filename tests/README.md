@@ -162,6 +162,24 @@ in-process test could have noticed.
 These skip, like the other GPU tests, on a machine with no adapter or no desktop
 session.
 
+## Capturing the window to look at it
+
+`PrintWindow` is not reliable against this window: it reads the redirection
+surface, and a wgpu surface presented through the flip model often leaves that
+blank, so a correct frame captures as a blank one. Three separate renders were
+misread as failures that way.
+
+Capture the window's screen rectangle instead — the window is always-on-top, so
+nothing overlaps it:
+
+```powershell
+$r = ...            # GetWindowRect on the process's MainWindowHandle
+$g.CopyFromScreen($r.Left, $r.Top, 0, 0, $bmp.Size)
+```
+
+Better still, prefer `preview -o <dir>`, which renders through the same viewer
+and writes deterministic PNGs with no window involved.
+
 ## GPU tests
 
 `crates/a2d-render/tests/render.rs` and the visual regression tests need a
