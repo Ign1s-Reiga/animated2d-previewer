@@ -155,7 +155,11 @@ mod section {
     pub const ROTATION_KEYFORM_BEGIN: usize = 26;
     pub const ROTATION_KEYFORM_COUNT: usize = 27;
 
-    /// Order the drawables are painted in, back to front.
+    /// The drawables in the order they are painted, back to front.
+    ///
+    /// Slot `k` names the drawable drawn `k`-th. It is **not** a per-drawable
+    /// key saying where each one sits -- reading it that way is the inverse
+    /// permutation, and it draws the face skin over the eyes.
     pub const DRAWABLE_DRAW_ORDER: usize = 87;
     pub const DRAWABLE_KEYFORM_BINDING: usize = 34;
     pub const DRAWABLE_KEYFORM_BEGIN: usize = 35;
@@ -283,12 +287,6 @@ pub struct Drawable {
     pub uvs: Vec<(f32, f32)>,
     /// Triangle indices, local to this drawable's own vertices.
     pub indices: Vec<u16>,
-    /// Where this drawable sits back to front. Lower is drawn first.
-    ///
-    /// A permutation of the drawables in five of the six models checked; in the
-    /// sixth it repeats, so it is treated as a sort key rather than an index
-    /// and ties fall back to model order.
-    pub draw_order: u32,
     /// This drawable's own keyforms, as a range in the drawable keyform list.
     pub keyform_begin: u32,
     pub keyform_count: u32,
@@ -501,6 +499,13 @@ pub struct Moc3 {
     pub drawable_keyform_opacities: Vec<f32>,
     /// Draw order of each drawable keyform, in the same order.
     pub drawable_keyform_draw_orders: Vec<f32>,
+    /// The drawables in the order they are painted, back to front: entry `k`
+    /// is the index of the drawable drawn `k`-th.
+    ///
+    /// A permutation in five of the six models checked; in the sixth it
+    /// repeats, so a repeated entry is drawn once and anything the table never
+    /// names is appended in model order rather than dropped.
+    pub draw_order: Vec<u32>,
     /// Every section offset, so later work can reach data this does not decode.
     pub sections: Vec<u32>,
 }
@@ -581,6 +586,10 @@ impl Moc3 {
         }
         check_keyform_grids(&keyform_bindings, &parameter_bindings, &warp_deformers, &rotation_deformers, &drawables)?;
         let keyforms = read_keyforms(bytes, &sections, &warp_deformers, &drawables)?;
+        let draw_order = {
+            let at = section_offset(&sections, section::DRAWABLE_DRAW_ORDER, "drawable draw order")?;
+            (0..drawables.len()).map(|i| u32_at(bytes, at + i * 4)).collect::<Result<Vec<u32>, _>>()?
+        };
 
         // A model that predates these sections, or one whose layout moved them,
         // is read without them rather than refused: a drawn model missing its
@@ -610,6 +619,7 @@ impl Moc3 {
             parameter_bindings,
             keyform_bindings,
             keyforms,
+            draw_order,
             drawable_keyform_opacities,
             drawable_keyform_draw_orders,
             sections,
@@ -791,7 +801,6 @@ fn read_drawables(
     };
 
     let parents = u32s(section::DRAWABLE_PARENT_DEFORMERS, "drawable parent")?;
-    let draw_order = u32s(section::DRAWABLE_DRAW_ORDER, "drawable draw order")?;
     let keyform_binding = u32s(section::DRAWABLE_KEYFORM_BINDING, "drawable keyform binding")?;
     let keyform_begin = u32s(section::DRAWABLE_KEYFORM_BEGIN, "drawable keyform begin")?;
     let keyform_count = u32s(section::DRAWABLE_KEYFORM_COUNT, "drawable keyform count")?;
@@ -919,7 +928,6 @@ fn read_drawables(
         out.push(Drawable {
             id: ids.get(i).cloned().unwrap_or_default(),
             parent_deformer: parents[i],
-            draw_order: draw_order[i],
             uvs,
             indices,
             keyform_begin: keyform_begin[i],
@@ -1487,7 +1495,6 @@ pub(crate) mod tests {
             parent_deformer: 0,
             uvs: Vec::new(),
             indices: Vec::new(),
-            draw_order: 0,
             keyform_begin: 0,
             keyform_count: 0,
             keyform_binding: 0,
@@ -1557,6 +1564,12 @@ pub(crate) mod tests {
         pub(crate) fn masked(mut self) -> Self {
             self.masked = true;
             self.drawables = vec!["ArtMesh1", "ArtMesh2"];
+            self
+        }
+
+        /// Several drawables, for tests about the order they are painted in.
+        pub(crate) fn drawables(mut self, count: usize) -> Self {
+            self.drawables = ["ArtMesh1", "ArtMesh2", "ArtMesh3", "ArtMesh4"][..count.min(4)].to_vec();
             self
         }
 
@@ -1639,8 +1652,16 @@ pub(crate) mod tests {
             offsets[section::DRAWABLE_INDEX_OFFSETS] = place(&mut body, &u32_array(&ioff));
             offsets[section::DRAWABLE_INDEX_COUNTS] = place(&mut body, &u32_array(&vec![idx_each as u32; d]));
 
-            let uvs: Vec<u8> =
-                (0..d).flat_map(|_| [0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0]).flat_map(|v| v.to_le_bytes()).collect();
+            // Each drawable is given its own `u`, so a mesh that comes out of
+            // the emitter says which drawable it came from -- which is what
+            // lets a test pin the paint *order* rather than only the count.
+            let uvs: Vec<u8> = (0..d)
+                .flat_map(|i| {
+                    let tag = i as f32 * 0.125;
+                    [tag, 0.0, tag + 1.0, 0.0, tag, 1.0]
+                })
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             offsets[section::VERTEX_UVS] = place(&mut body, &uvs);
             let indices: Vec<u8> = (0..d).flat_map(|_| [0u16, 1, 2]).flat_map(|v| v.to_le_bytes()).collect();
             offsets[section::VERTEX_INDICES] = place(&mut body, &indices);
@@ -1673,8 +1694,11 @@ pub(crate) mod tests {
 
             // --- drawables ------------------------------------------------
             let d_begin: Vec<u32> = (0..d).map(|i| (i * per_element) as u32).collect();
-            offsets[section::DRAWABLE_DRAW_ORDER] =
-                place(&mut body, &u32_array(&(0..d as u32).rev().collect::<Vec<_>>()));
+            // A rotation rather than a reversal: a reversal is its own
+            // inverse, so reading this table the wrong way round would be
+            // invisible against one.
+            let sequence: Vec<u32> = (0..d as u32).map(|k| (k + 1) % d as u32).collect();
+            offsets[section::DRAWABLE_DRAW_ORDER] = place(&mut body, &u32_array(&sequence));
             offsets[section::DRAWABLE_KEYFORM_BINDING] = place(&mut body, &u32_array(&vec![0u32; d]));
             offsets[section::DRAWABLE_KEYFORM_BEGIN] = place(&mut body, &u32_array(&d_begin));
             offsets[section::DRAWABLE_KEYFORM_COUNT] = place(&mut body, &u32_array(&vec![per_element as u32; d]));

@@ -225,7 +225,9 @@ impl Moc3 {
             let weights = self.weights_for(d.keyform_binding, &resolved);
             let mut points = vec![(0.0f32, 0.0f32); d.vertex_count()];
             let mut opacity = if self.drawable_keyform_opacities.is_empty() { 1.0 } else { 0.0 };
-            let mut order = if self.drawable_keyform_draw_orders.is_empty() { d.draw_order as f32 } else { 0.0 };
+            // The artist's animated value, which rests at 500 where a model
+            // carries no track for it.
+            let mut order = if self.drawable_keyform_draw_orders.is_empty() { 500.0 } else { 0.0 };
             for (keyform, weight) in &weights {
                 let at = d.keyform_begin as usize + keyform;
                 if let Some(o) = self.drawable_keyform_opacities.get(at) {

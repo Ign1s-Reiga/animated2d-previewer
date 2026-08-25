@@ -20,19 +20,29 @@ impl Moc3 {
     /// Coordinates come out in canvas units — the space the canvas size is
     /// expressed in once divided by its pixels per unit — with `y` upwards.
     pub fn emit(&self, pose: &Pose, texture: TextureId, out: &mut RenderList) {
-        // Drawables are listed in model order but drawn in draw order, so a
-        // stable sort of one against the other gives the sequence to emit.
+        // The model carries the resolved back-to-front sequence outright, so
+        // there is nothing to sort: slot k names the drawable drawn k-th.
         //
-        // This is the *render* order -- the resolved back-to-front sequence,
-        // which arrives as a permutation of the drawables. It is not the same
-        // thing as [`Pose::draw_orders`], the artist's per-drawable value that
-        // Cubism animates: turning those into a render order needs the part
-        // tree, which is not decoded, and the two disagree on 567 of 568
-        // drawables in one real model. Sorting by the wrong one would reshuffle
-        // the whole character, so the resolved order is what is used until the
-        // part tree can be read.
-        let mut order: Vec<usize> = (0..self.drawables.len()).collect();
-        order.sort_by_key(|i| self.drawables[*i].draw_order);
+        // Reading that array the other way round -- as a per-drawable key
+        // saying where each one sits -- gives the inverse permutation, which
+        // looks plausible and draws the face skin over the eyes.
+        //
+        // It is not the same thing as [`Pose::draw_orders`], the artist's
+        // per-drawable value that Cubism animates. Turning those into a render
+        // order needs the part tree, and the per-part orders are all equal on
+        // the models measured, so the resolved sequence is what is used.
+        let n = self.drawables.len();
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut placed = vec![false; n];
+        for slot in &self.draw_order {
+            let at = *slot as usize;
+            if at < n && !placed[at] {
+                placed[at] = true;
+                order.push(at);
+            }
+        }
+        // A model whose table repeats leaves gaps; those keep model order.
+        order.extend((0..n).filter(|i| !placed[*i]));
 
         // Masks are shared: a face's worth of drawables usually clip to the
         // same one or two meshes, so identical lists are registered once.
@@ -127,6 +137,41 @@ impl Moc3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meshes_are_painted_in_the_sequence_the_model_names() {
+        // Section 87 is the sequence itself: slot k names the drawable painted
+        // k-th. Read the other way round it is the inverse permutation, which
+        // is plausible enough to have shipped -- it paints a face's skin over
+        // its eyes. The fixture uses a rotation rather than a reversal because
+        // a reversal is its own inverse and could not tell the two apart.
+        let moc = Moc3::parse(&crate::moc3::tests::Builder::new().drawables(3).build()).expect("should parse");
+        assert_eq!(moc.draw_order, [1, 2, 0], "the table is read as a sequence, not as a per-drawable key");
+
+        let pose = moc.pose(&[]);
+        let mut list = RenderList::new();
+        moc.emit(&pose, TextureId(0), &mut list);
+        assert_eq!(list.meshes().len(), 3);
+
+        // Each drawable carries its own `u`, so the first uv names its source.
+        let painted: Vec<usize> = list.meshes().iter().map(|m| (m.uvs[0].x / 0.125).round() as usize).collect();
+        assert_eq!(painted, [1, 2, 0], "emitted in the model's own order; the inverse would be [2, 0, 1]");
+    }
+
+    #[test]
+    fn a_drawable_the_sequence_never_names_is_still_painted() {
+        // One real model repeats an entry rather than permuting cleanly. The
+        // drawables left unnamed by such a table must still be drawn, or part
+        // of the character silently disappears.
+        let mut moc = Moc3::parse(&crate::moc3::tests::Builder::new().drawables(3).build()).expect("should parse");
+        moc.draw_order = vec![1, 1, 1];
+        let pose = moc.pose(&[]);
+        let mut list = RenderList::new();
+        moc.emit(&pose, TextureId(0), &mut list);
+        assert_eq!(list.meshes().len(), 3, "every drawable is painted exactly once");
+        let painted: Vec<usize> = list.meshes().iter().map(|m| (m.uvs[0].x / 0.125).round() as usize).collect();
+        assert_eq!(painted, [1, 0, 2], "the named one first, the rest in model order");
+    }
 
     #[test]
     fn a_masked_drawable_carries_a_clip_and_its_blend_mode() {
