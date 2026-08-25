@@ -28,9 +28,11 @@
 pub mod emit;
 pub mod eval;
 pub mod moc3;
+pub mod model;
 
 pub use eval::Pose;
 pub use moc3::{
     Canvas, Counts, Deformer, DeformerKind, Drawable, KeyformBinding, Keyforms, Moc3, Parameter, ParameterBinding,
     RotationDeformer, RotationKeyform, WarpDeformer,
 };
+pub use model::GenericCubismModel;
