@@ -68,6 +68,20 @@
 //! against a canvas of 3792 pixels per unit — that deformer is the
 //! pixels-to-units bridge, exactly as the transform predicts.
 //!
+//! # What rendering showed
+//!
+//! Rendered at default parameters, the models come out as coherent scenes: a
+//! reclining figure under a pine branch in one, a character on a swing in
+//! another. Each drawable is well formed and correctly textured, and the parts
+//! sit where a scene needs them.
+//!
+//! Two things about that are worth more than the picture itself. A model and
+//! its own low-detail variant -- separately authored rigs, 101 drawables
+//! against 601, 151 parameters against 849 -- render as the *same* scene. A
+//! wrong chain would have to distort both identically to do that. And the
+//! elements that read as scattered at first turned out to be scenery: a pine
+//! branch hanging apart from the figure is the rig, not a fault.
+//!
 //! # What is still unverified
 //!
 //! **No reference render has been compared against.** Landing in the right
