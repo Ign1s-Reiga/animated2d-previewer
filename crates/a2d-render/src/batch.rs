@@ -118,7 +118,7 @@ pub fn build(list: &RenderList, out: &mut FrameGeometry) {
     // references one, and so mask ids index `out.masks` directly.
     for (i, mask) in list.masks().iter().enumerate() {
         let start = out.indices.len() as u32;
-        append_mask(&mask.polygon, out);
+        append_mask(mask, out);
         let end = out.indices.len() as u32;
         if end > start {
             out.masks.push(MaskShape { id: MaskId(i as u32), indices: start..end });
@@ -174,22 +174,20 @@ fn append_mesh(mesh: &RenderMesh, out: &mut FrameGeometry) {
     out.indices.extend(mesh.indices.iter().map(|i| base + *i as u32));
 }
 
-/// Appends a polygon as a fan from its first vertex.
+/// Appends a mask's triangles.
 ///
 /// The mask pipeline inverts stencil rather than writing it, so overlapping
-/// fan triangles cancel and the result is an even-odd fill. That is what lets a
+/// triangles cancel and the result is an even-odd fill. That is what lets a
 /// concave outline work without being triangulated properly.
-fn append_mask(polygon: &[Vec2], out: &mut FrameGeometry) {
-    if polygon.len() < 3 {
+fn append_mask(mask: &a2d_core::RenderMask, out: &mut FrameGeometry) {
+    if mask.indices.len() < 3 {
         return;
     }
     let base = out.vertices.len() as u32;
-    for point in polygon {
+    for point in &mask.vertices {
         out.vertices.push(Vertex::position_only(*point));
     }
-    for i in 1..polygon.len() as u32 - 1 {
-        out.indices.extend_from_slice(&[base, base + i, base + i + 1]);
-    }
+    out.indices.extend(mask.indices.iter().map(|i| base + *i));
 }
 
 #[cfg(test)]

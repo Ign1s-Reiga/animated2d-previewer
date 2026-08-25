@@ -105,10 +105,51 @@ impl RenderMesh {
     }
 }
 
-/// A clipping polygon in world space.
+/// A clipping shape in world space, as triangles.
+///
+/// Triangles rather than an outline because the two source families disagree:
+/// a Spine clipping attachment is a polygon, while a Cubism mask is an ordinary
+/// drawable's mesh. Triangles hold both -- a polygon fans into them -- and the
+/// renderer stays neutral between the two, which is the whole point of this
+/// layer.
 #[derive(Debug, Clone, Default)]
 pub struct RenderMask {
-    pub polygon: Vec<Vec2>,
+    pub vertices: Vec<Vec2>,
+    pub indices: Vec<u32>,
+}
+
+impl RenderMask {
+    fn reset(&mut self) {
+        self.vertices.clear();
+        self.indices.clear();
+    }
+
+    /// Adds a polygon as a fan from its first vertex.
+    ///
+    /// The mask pipeline inverts stencil rather than writing it, so overlapping
+    /// fan triangles cancel and a concave outline still fills correctly without
+    /// being triangulated properly.
+    pub fn push_polygon(&mut self, polygon: &[Vec2]) {
+        if polygon.len() < 3 {
+            return;
+        }
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(polygon);
+        for i in 1..polygon.len() as u32 - 1 {
+            self.indices.extend_from_slice(&[base, base + i, base + i + 1]);
+        }
+    }
+
+    /// Adds a triangle mesh, with `indices` local to `vertices`.
+    ///
+    /// Beware that the stencil is even-odd, so two shapes added to the *same*
+    /// mask cancel where they overlap instead of uniting. Disjoint shapes --
+    /// which is what a model's masks normally are -- combine correctly.
+    pub fn push_mesh(&mut self, vertices: &[Vec2], indices: &[u16]) {
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(vertices);
+        self.indices.extend(indices.iter().map(|i| base + *i as u32));
+    }
 }
 
 /// One frame's worth of draw primitives.
@@ -137,7 +178,7 @@ impl RenderList {
             self.mesh_pool.push(m);
         }
         for mut m in self.masks.drain(..) {
-            m.polygon.clear();
+            m.reset();
             self.mask_pool.push(m);
         }
     }
@@ -154,9 +195,22 @@ impl RenderList {
 
     /// Registers a clipping polygon and returns the handle to reference it with.
     pub fn push_mask(&mut self, polygon: Vec<Vec2>) -> MaskId {
-        let id = MaskId(self.masks.len() as u32);
+        let mut mask = self.take_mask();
+        mask.push_polygon(&polygon);
+        self.push_mask_shape(mask)
+    }
+
+    /// Takes a recycled mask to fill in. Commit it with
+    /// [`RenderList::push_mask_shape`].
+    pub fn take_mask(&mut self) -> RenderMask {
         let mut mask = self.mask_pool.pop().unwrap_or_default();
-        mask.polygon = polygon;
+        mask.reset();
+        mask
+    }
+
+    /// Registers a mask built by hand and returns its handle.
+    pub fn push_mask_shape(&mut self, mask: RenderMask) -> MaskId {
+        let id = MaskId(self.masks.len() as u32);
         self.masks.push(mask);
         id
     }
@@ -279,7 +333,8 @@ mod tests {
     fn mask_handles_resolve_to_their_polygon() {
         let mut list = RenderList::new();
         let id = list.push_mask(vec![Vec2::ZERO, Vec2::ONE, Vec2::new(0.0, 1.0)]);
-        assert_eq!(list.mask(id).unwrap().polygon.len(), 3);
+        assert_eq!(list.mask(id).unwrap().vertices.len(), 3);
+        assert_eq!(list.mask(id).unwrap().indices, [0, 1, 2]);
         assert!(list.mask(MaskId(99)).is_none());
     }
 
