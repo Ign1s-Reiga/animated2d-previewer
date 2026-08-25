@@ -164,6 +164,51 @@ fn a_real_model_yields_meshes_whose_triangles_are_all_in_range() {
 
 #[test]
 #[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
+fn every_element_reaches_its_own_keyforms() {
+    // The pool is divided by walking it: warp deformers first, each keyform
+    // padded to eight points, then drawables by the same rule. If any part of
+    // that were wrong the parse would already have refused, so this checks the
+    // consequence -- that every element's keyforms are actually addressable.
+    let Some(bytes) = payload() else { return };
+    let moc = Moc3::parse(&bytes).expect("a real MOC3 should parse");
+
+    let mut warp_keyforms = 0usize;
+    for w in &moc.warp_deformers {
+        assert_eq!(w.point_count, (w.divisions.0 + 1) * (w.divisions.1 + 1), "{} grid", w.id);
+        for k in 0..w.keyform_count as usize {
+            let grid = moc
+                .keyforms
+                .warp(w.keyform_begin as usize + k, w.point_count as usize)
+                .unwrap_or_else(|| panic!("{} keyform {k} is unreachable", w.id));
+            assert_eq!(grid.len(), w.point_count as usize * 2);
+            assert!(grid.iter().all(|v| v.is_finite()), "{} keyform {k} holds a non-finite value", w.id);
+            warp_keyforms += 1;
+        }
+    }
+
+    let mut drawable_keyforms = 0usize;
+    for d in &moc.drawables {
+        for k in 0..d.keyform_count as usize {
+            let verts = moc
+                .keyforms
+                .drawable(d.keyform_begin as usize + k, d.vertex_count())
+                .unwrap_or_else(|| panic!("{} keyform {k} is unreachable", d.id));
+            assert_eq!(verts.len(), d.vertex_count() * 2);
+            assert!(verts.iter().all(|v| v.is_finite()), "{} keyform {k} holds a non-finite value", d.id);
+            drawable_keyforms += 1;
+        }
+    }
+
+    assert_eq!(warp_keyforms + drawable_keyforms, moc.keyforms.len());
+    println!(
+        "{} warp deformers own {warp_keyforms} keyforms; {} drawables own {drawable_keyforms}",
+        moc.warp_deformers.len(),
+        moc.drawables.len()
+    );
+}
+
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
 fn a_real_keyform_pool_is_consistent_with_its_offsets() {
     let Some(bytes) = payload() else { return };
     let moc = Moc3::parse(&bytes).expect("a real MOC3 should parse");
@@ -175,7 +220,7 @@ fn a_real_keyform_pool_is_consistent_with_its_offsets() {
     }
     // Offsets are non-decreasing and stay inside the pool.
     let mut previous = 0u32;
-    for (i, &offset) in moc.keyforms.offsets.iter().enumerate() {
+    for (i, &offset) in moc.keyforms.warp_offsets.iter().chain(&moc.keyforms.drawable_offsets).enumerate() {
         assert!(offset >= previous, "keyform {i} starts before its predecessor");
         assert!((offset as usize) <= moc.keyforms.positions.len(), "keyform {i} starts past the pool");
         previous = offset;
