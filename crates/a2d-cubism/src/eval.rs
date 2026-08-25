@@ -31,26 +31,42 @@
 //! amount of staring at aggregate statistics produced that; one readable tree
 //! did.
 //!
-//! # The axis order, and how it was found
+//! # The grid orientation, and how it was found
 //!
-//! MOC3 writes the **vertical component of a point first**. That one fact fixes
-//! four things at once: point pairs are swapped as they are read, the two
-//! rotation-origin sections go into the opposite fields, rotation angles turn
-//! the other way, and a warp's stored runs walk down a column rather than along
-//! a row (see [`crate::WarpDeformer::divisions`]).
+//! A warp's two division counts arrive with nothing in the layout to say which
+//! is rows and which is columns, and for a square grid it cannot matter — the
+//! lookup is identical either way. Reading every non-square grid in the same
+//! six models both ways settled it: with `divisions.1 + 1` points to a stored
+//! row, 713 of 729 such grids are perfectly monotone lattices and most of the
+//! rest are coherently mirrored; with `divisions.0 + 1`, the rows interleave
+//! and not one grid is monotone.
 //!
-//! Getting it wrong transposes the whole model — a mirror, not a turn — and the
-//! error hides well, because reading the point pairs and the lattice in the
-//! same wrong order transposes both. A census of monotone lattices scores the
-//! two readings identically, and the parameters cannot witness against it
-//! either, since they are carried through the very chain under test.
+//! # A correction, and what a determinant can and cannot show
 //!
-//! What settled it was each drawable's own texture coordinates: the mesh is the
-//! same shape in uv space as in canvas space, so the map between them is a
-//! similarity, and only a mirror flips the sign of its determinant. Exactly one
-//! mirror is expected, `v` running down the atlas against `y` running up the
-//! canvas. Read the old way 1% of drawables matched their own texture; read
-//! this way 99% do, on all three models measured.
+//! These coordinates were once read the other way round — point pairs swapped,
+//! rotation angles negated, the lattice transposed — because a drawable's posed
+//! geometry appeared *mirrored* against its own texture coordinates. The
+//! measurement was sound as far as it went: a mesh is the same shape in uv
+//! space as in canvas space, so only a mirror flips the sign of the map between
+//! them, and the sign was consistent across three models.
+//!
+//! The expectation was what was wrong. It assumed one mirror must be present,
+//! texture rows running down against `y` running up. But [`a2d_unity`] **flips
+//! Unity's bottom-up rows** when it decodes a `Texture2D`, and that flip is
+//! what makes the two agree: a correct model fits *positive*, and the reading
+//! that looked broken was right all along.
+//!
+//! Two things are worth keeping from it. A determinant detects a mirror and
+//! **nothing else** — it is blind to rotation, so it can never show that a
+//! model is the right way up, and treating it as though it could is what turned
+//! a correct decoder into a wrong one. And a convention reasoned out from first
+//! principles is worth less than the same reasoning checked against the code
+//! that runs: the row flip was in a neighbouring crate, had been read earlier
+//! the same day, and was still forgotten.
+//!
+//! What none of this settles is whether a character stands up. The model these
+//! were measured on is drawn reclining, head to the right, which is why every
+//! attempt to assert that its face should be level produced a wrong answer.
 //!
 //! # How well it works, measured
 //!
@@ -349,7 +365,7 @@ impl Moc3 {
                         // The second division count is the one that runs along
                         // a stored row (see `WarpDeformer::divisions`), so it
                         // is the x axis here.
-                        let (columns, rows) = shape.divisions;
+                        let (rows, columns) = shape.divisions;
                         for point in points.iter_mut() {
                             *point = warp_point(grid, columns as usize, rows as usize, *point);
                         }
@@ -509,9 +525,7 @@ fn warp_point(grid: &[(f32, f32)], divisions_x: usize, divisions_y: usize, point
     let tx = fx - ix as f32;
     let ty = fy - iy as f32;
 
-    // Column-major: a stored run walks *down* a column, because the file's
-    // first axis is the vertical one (see `WarpDeformer::divisions`).
-    let corner = |cx: usize, cy: usize| grid[cx * rows + cy];
+    let corner = |cx: usize, cy: usize| grid[cy * cols + cx];
     let (a, b, c, d) = (corner(ix, iy), corner(ix + 1, iy), corner(ix, iy + 1), corner(ix + 1, iy + 1));
     let top = (a.0 + (b.0 - a.0) * tx, a.1 + (b.1 - a.1) * tx);
     let bottom = (c.0 + (d.0 - c.0) * tx, c.1 + (d.1 - c.1) * tx);
@@ -648,9 +662,7 @@ mod tests {
     #[test]
     fn a_warp_grid_reproduces_its_own_corners() {
         // A 1x1 grid is a quad; looking it up at the corners must return them.
-        // Stored column-major, so the second point is the one *below* the
-        // first, not the one beside it.
-        let grid = vec![(0.0, 0.0), (0.0, 20.0), (10.0, 0.0), (10.0, 20.0)];
+        let grid = vec![(0.0, 0.0), (10.0, 0.0), (0.0, 20.0), (10.0, 20.0)];
         assert_eq!(warp_point(&grid, 1, 1, (0.0, 0.0)), (0.0, 0.0));
         assert_eq!(warp_point(&grid, 1, 1, (1.0, 0.0)), (10.0, 0.0));
         assert_eq!(warp_point(&grid, 1, 1, (0.0, 1.0)), (0.0, 20.0));
@@ -662,7 +674,7 @@ mod tests {
     #[test]
     fn a_warp_extends_its_edge_cells_rather_than_clamping() {
         // Geometry that overhangs a deformer should keep its shape.
-        let grid = vec![(0.0, 0.0), (0.0, 20.0), (10.0, 0.0), (10.0, 20.0)];
+        let grid = vec![(0.0, 0.0), (10.0, 0.0), (0.0, 20.0), (10.0, 20.0)];
         let out = warp_point(&grid, 1, 1, (2.0, 0.0));
         assert_eq!(out, (20.0, 0.0), "the cell should be extended, not clamped to the border");
     }
