@@ -571,8 +571,111 @@ fn unity_bundle_bytes(input: &Path) -> Option<Vec<u8>> {
 }
 
 /// Prints the structured inventory of a Unity bundle (spec §12).
+/// Prints what a Unity bundle holding a Spine rig contains.
+///
+/// Spine survives Unity intact -- the skeleton and atlas are the editor's own
+/// bytes -- so this reports the same things `inspect` reports for loose files,
+/// and says so.
+fn inspect_spine_bundle(
+    out: &mut dyn std::io::Write,
+    inventory: a2d_import::SpineInventory,
+    mut report: LoadReport,
+) -> Result<(), CliError> {
+    writeln!(out, "Importer: unity_spine")?;
+    writeln!(
+        out,
+        "
+Unity bundle"
+    )?;
+    writeln!(out, "  built with:  {}", inventory.unity_revision)?;
+    writeln!(out, "  objects:     {}", inventory.object_count)?;
+    if !inventory.components.is_empty() {
+        writeln!(out, "  components:  {}", inventory.components.join(", "))?;
+    }
+
+    if let Some(skeleton) = &inventory.skeleton {
+        writeln!(
+            out,
+            "
+Spine rig: {}",
+            skeleton.name
+        )?;
+        writeln!(out, "  skeleton:    {} bytes", skeleton.bytes.len())?;
+        if let Some(kind) = &inventory.skeleton_kind {
+            writeln!(out, "  version:     {}", kind.label())?;
+        }
+        if let Some(path) = &skeleton.asset_path {
+            writeln!(out, "  authored at: {path}")?;
+        }
+    }
+    if let Some(atlas) = &inventory.atlas {
+        writeln!(out, "  atlas:       {} ({} bytes)", atlas.name, atlas.bytes.len())?;
+    }
+
+    // The rig itself, decoded exactly as a loose export would be. Doing it here
+    // rather than only reporting sizes is what shows the extraction is faithful.
+    if let (Some(skeleton), Some(atlas)) = (&inventory.skeleton, &inventory.atlas) {
+        let text = String::from_utf8_lossy(&atlas.bytes);
+        let decoded = a2d_spine::parse_atlas(&text).map_err(CliError::from).and_then(|(pages, atlas_report)| {
+            report.absorb(atlas_report);
+            Ok(a2d_spine::decode_skeleton(&skeleton.bytes, pages, &mut report)?)
+        });
+        match decoded {
+            Ok((ir, _)) => {
+                writeln!(out, "  bones:       {}", ir.bones.len())?;
+                writeln!(out, "  slots:       {}", ir.slots.len())?;
+                writeln!(out, "  attachments: {}", ir.attachments.len())?;
+                writeln!(
+                    out,
+                    "
+  animations:"
+                )?;
+                for animation in &ir.animations {
+                    writeln!(out, "    {:<30} {:.3}s", animation.name, animation.duration)?;
+                }
+            }
+            Err(e) => writeln!(out, "  contents:    unreadable — {e}")?,
+        }
+    }
+
+    writeln!(
+        out,
+        "
+  textures:"
+    )?;
+    if inventory.textures.is_empty() {
+        writeln!(out, "    (none)")?;
+    }
+    for texture in &inventory.textures {
+        match &texture.asset_path {
+            Some(path) => writeln!(out, "    {}  ({path})", texture.name)?,
+            None => writeln!(out, "    {}", texture.name)?,
+        }
+    }
+    if !inventory.other_text_assets.is_empty() {
+        writeln!(
+            out,
+            "
+  other text assets: {}",
+            inventory.other_text_assets.join(", ")
+        )?;
+    }
+
+    print_report(out, &report)?;
+    Ok(())
+}
+
 fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<(), CliError> {
     let mut report = LoadReport::new();
+
+    // A bundle holds one family or the other. The Spine check runs first
+    // because it is decisive -- a skeleton and an atlas, both recognised by
+    // content -- whereas the Cubism path reports a structure either way.
+    let spine = a2d_import::inspect_spine_bundle(bytes, &mut report)?;
+    if spine.is_spine() {
+        return inspect_spine_bundle(out, spine, report);
+    }
+
     let inventory = a2d_import::inspect_bundle(bytes, &mut report)?;
 
     writeln!(out, "Importer: {}", if inventory.is_cubism() { "unity_cubism" } else { "(undetermined)" })?;
