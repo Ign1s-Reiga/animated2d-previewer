@@ -25,6 +25,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod eval;
 pub mod moc3;
 
-pub use moc3::{Canvas, Counts, Moc3, Parameter};
+pub use eval::Pose;
+pub use moc3::{
+    Canvas, Counts, Deformer, DeformerKind, Drawable, KeyformBinding, Keyforms, Moc3, Parameter, ParameterBinding,
+    RotationDeformer, RotationKeyform, WarpDeformer,
+};

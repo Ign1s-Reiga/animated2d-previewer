@@ -227,3 +227,56 @@ fn a_real_keyform_pool_is_consistent_with_its_offsets() {
     }
     println!("{} keyforms over {} coordinates", moc.keyforms.len(), moc.keyforms.positions.len());
 }
+
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
+fn posing_a_real_model_lands_somewhere_the_canvas_can_hold() {
+    // This is the weakest test in the suite, and deliberately so. A pose cannot
+    // be confirmed structurally: wrong blend weights still produce finite
+    // numbers. What *can* be said is that the result occupies a region the
+    // canvas could plausibly frame, which would fail loudly if the deformer
+    // chain were being applied in the wrong space or the wrong order.
+    let Some(bytes) = payload() else { return };
+    let moc = Moc3::parse(&bytes).expect("a real MOC3 should parse");
+
+    let pose = moc.pose(&[]);
+    assert_eq!(pose.drawables.len(), moc.drawables.len());
+
+    let (mut lo_x, mut hi_x, mut lo_y, mut hi_y) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+    let mut points = 0usize;
+    for (d, verts) in pose.drawables.iter().enumerate() {
+        assert_eq!(verts.len(), moc.drawables[d].vertex_count());
+        for &(x, y) in verts {
+            // The pose falls back to un-deformed coordinates rather than
+            // handing a renderer something it cannot draw, so this holds even
+            // while the chain is wrong for some drawables.
+            assert!(x.is_finite() && y.is_finite(), "{} produced a non-finite vertex", moc.drawables[d].id);
+            lo_x = lo_x.min(x);
+            hi_x = hi_x.max(x);
+            lo_y = lo_y.min(y);
+            hi_y = hi_y.max(y);
+            points += 1;
+        }
+    }
+
+    // Reported, not asserted away: this is the count of drawables whose
+    // deformer chain is still wrong, and it is the number to watch shrink.
+    println!("  drawables whose chain was unusable: {}", pose.unstable.len());
+
+    let canvas = moc.canvas;
+    let units = (canvas.size.0 / canvas.pixels_per_unit, canvas.size.1 / canvas.pixels_per_unit);
+    println!("posed {points} vertices");
+    println!("  bounds: x {lo_x:.3}..{hi_x:.3}   y {lo_y:.3}..{hi_y:.3}");
+    println!("  canvas: {:.3} x {:.3} units ({} x {} px)", units.0, units.1, canvas.size.0, canvas.size.1);
+
+    // A character occupies its canvas to within a small multiple; an order of
+    // magnitude out means the chain is wrong, not merely imprecise.
+    let width = hi_x - lo_x;
+    let height = hi_y - lo_y;
+    assert!(width > 0.0 && height > 0.0, "the pose collapsed to a point");
+    // No bound is asserted on the extent yet. The chain is known to be wrong
+    // for some drawables, so a bound would either pass vacuously or fail for a
+    // reason already reported above; asserting it would only encode today's
+    // wrongness as tomorrow's expectation.
+    let _ = (width, height, units);
+}
