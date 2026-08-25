@@ -95,6 +95,28 @@ mod section {
     pub const GLUE_IDS: usize = 90;
 
     pub const DRAWABLE_PARENT_DEFORMERS: usize = 40;
+    /// Which part each drawable belongs to. `u32::MAX` for none.
+    pub const DRAWABLE_PART: usize = 39;
+    /// Texture page each drawable samples.
+    pub const DRAWABLE_TEXTURE: usize = 41;
+    /// One **byte** per drawable of constant flags -- not a word array, which
+    /// is why a scan assuming four-byte entries walks straight past it.
+    ///
+    /// Bit 0 additive blend, bit 1 multiply blend, bit 2 double sided, bit 3
+    /// inverted mask.
+    pub const DRAWABLE_FLAGS: usize = 42;
+    /// Where this drawable's clipping masks begin, in [`DRAWABLE_MASKS`].
+    ///
+    /// Begin plus count equals the next drawable's begin, exactly, for every
+    /// adjacent pair in a real model -- which is what identified the pair.
+    pub const DRAWABLE_MASK_BEGIN: usize = 47;
+    pub const DRAWABLE_MASK_COUNT: usize = 48;
+    /// Every drawable's mask list, end to end, as drawable indices.
+    ///
+    /// Located by elimination: it is the only section in all three models
+    /// checked whose length matches the count table's mask total and whose
+    /// every entry is a valid drawable index.
+    pub const DRAWABLE_MASKS: usize = 80;
     pub const DRAWABLE_VERTEX_COUNTS: usize = 43;
     /// Offsets into the shared coordinate arrays, counted in *floats*.
     pub const DRAWABLE_VERTEX_OFFSETS: usize = 44;
@@ -188,6 +210,8 @@ mod count {
     pub const WARP_KEYFORMS: usize = 7;
     pub const DRAWABLE_KEYFORMS: usize = 9;
     pub const KEYFORM_POSITION_FLOATS: usize = 10;
+    /// Total entries in the flat clipping-mask list.
+    pub const DRAWABLE_MASKS: usize = 17;
     pub const UV_FLOATS: usize = 15;
     pub const INDICES: usize = 16;
 }
@@ -257,9 +281,34 @@ pub struct Drawable {
     pub keyform_begin: u32,
     pub keyform_count: u32,
     pub keyform_binding: u32,
+    /// Drawables this one is clipped to. Empty when it is not masked.
+    ///
+    /// The stencil is even-odd, so masks overlapping each other cancel where
+    /// they do; a model's masks are normally disjoint.
+    pub masks: Vec<u32>,
+    /// Constant flags: bit 0 additive, bit 1 multiply, bit 2 double sided,
+    /// bit 3 inverted mask.
+    pub flags: u8,
+    /// The part this drawable belongs to, where it names one.
+    pub part: Option<u32>,
+    /// Texture page this drawable samples.
+    pub texture: u32,
 }
 
 impl Drawable {
+    /// How this drawable is composited.
+    pub fn blend_mode(&self) -> a2d_core::BlendMode {
+        // Additive is checked first: no model seen sets both, and if one did,
+        // treating it as additive is the less destructive reading.
+        if self.flags & 0b0000_0001 != 0 {
+            a2d_core::BlendMode::Additive
+        } else if self.flags & 0b0000_0010 != 0 {
+            a2d_core::BlendMode::Multiply
+        } else {
+            a2d_core::BlendMode::Normal
+        }
+    }
+
     pub fn vertex_count(&self) -> usize {
         self.uvs.len()
     }
@@ -735,6 +784,48 @@ fn read_drawables(
     let index_offsets = u32s(section::DRAWABLE_INDEX_OFFSETS, "drawable index offset")?;
     let index_counts = u32s(section::DRAWABLE_INDEX_COUNTS, "drawable index count")?;
 
+    // Sections a model may predate: read where present, absent otherwise. A
+    // missing one leaves every drawable unmasked, normally blended and on page
+    // zero -- which is exactly how they were treated before these were read.
+    let optional = |index: usize, what: &str| -> Vec<u32> { u32s(index, what).unwrap_or_default() };
+    let part = optional(section::DRAWABLE_PART, "drawable part");
+    let texture = optional(section::DRAWABLE_TEXTURE, "drawable texture");
+    let mask_begin = optional(section::DRAWABLE_MASK_BEGIN, "drawable mask begin");
+    let mask_count = optional(section::DRAWABLE_MASK_COUNT, "drawable mask count");
+    let flags: Vec<u8> = match section_offset(sections, section::DRAWABLE_FLAGS, "drawable flags") {
+        Ok(at) => bytes.get(at..at + n).map(<[u8]>::to_vec).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    // The mask list is only believed when it closes: begin plus count must
+    // reach the next drawable's begin all the way along, and the last must land
+    // exactly on the total the count table declares. That is what identified
+    // the three sections in the first place, so checking it here means a model
+    // laid out differently degrades to unmasked rather than clipping to the
+    // wrong shapes.
+    let declared_masks = counts_at(bytes, sections, count::DRAWABLE_MASKS).unwrap_or(0);
+    let mask_list = {
+        let closes = mask_begin.len() == n
+            && mask_count.len() == n
+            && (0..n - 1).all(|i| mask_begin[i] + mask_count[i] == mask_begin[i + 1])
+            && mask_begin[n - 1] + mask_count[n - 1] == declared_masks;
+        if !closes {
+            Vec::new()
+        } else {
+            let total = declared_masks as usize;
+            match section_offset(sections, section::DRAWABLE_MASKS, "drawable masks") {
+                Ok(at) => {
+                    let list: Result<Vec<u32>, _> = (0..total).map(|i| u32_at(bytes, at + i * 4)).collect();
+                    match list {
+                        Ok(v) if v.iter().all(|m| (*m as usize) < n) => v,
+                        _ => Vec::new(),
+                    }
+                }
+                Err(_) => Vec::new(),
+            }
+        }
+    };
+
     // Coordinates are `x, y` pairs, so a vertex costs two floats.
     let mut expect_vertex = 0u64;
     let mut expect_index = 0u64;
@@ -818,6 +909,15 @@ fn read_drawables(
             keyform_begin: keyform_begin[i],
             keyform_count: keyform_count[i],
             keyform_binding: keyform_binding[i],
+            masks: if mask_list.is_empty() {
+                Vec::new()
+            } else {
+                let begin = mask_begin[i] as usize;
+                mask_list.get(begin..begin + mask_count[i] as usize).map(<[u32]>::to_vec).unwrap_or_default()
+            },
+            flags: flags.get(i).copied().unwrap_or(0),
+            part: part.get(i).copied().filter(|p| (*p as usize) < usize::MAX && *p != u32::MAX),
+            texture: texture.get(i).copied().unwrap_or(0),
         });
     }
 
@@ -1354,6 +1454,46 @@ fn read_floats(bytes: &[u8], sections: &[u32], index: usize, count: u32, what: &
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn flags_choose_the_blend_mode() {
+        let mut d = Drawable {
+            id: String::new(),
+            parent_deformer: 0,
+            uvs: Vec::new(),
+            indices: Vec::new(),
+            draw_order: 0,
+            keyform_begin: 0,
+            keyform_count: 0,
+            keyform_binding: 0,
+            masks: Vec::new(),
+            flags: 0,
+            part: None,
+            texture: 0,
+        };
+        assert_eq!(d.blend_mode(), a2d_core::BlendMode::Normal);
+        d.flags = 0b100; // double sided only
+        assert_eq!(d.blend_mode(), a2d_core::BlendMode::Normal);
+        d.flags = 0b110; // double sided and multiply, as real models write it
+        assert_eq!(d.blend_mode(), a2d_core::BlendMode::Multiply);
+        d.flags = 0b101;
+        assert_eq!(d.blend_mode(), a2d_core::BlendMode::Additive);
+    }
+
+    #[test]
+    fn a_model_without_the_mask_tables_reads_as_unmasked() {
+        let moc = Moc3::parse(&Builder::new().build()).expect("should parse");
+        assert!(moc.drawables.iter().all(|d| d.masks.is_empty() && d.flags == 0));
+    }
+
+    #[test]
+    fn the_mask_tables_resolve_to_drawable_indices() {
+        let moc = Moc3::parse(&Builder::new().masked().build()).expect("should parse");
+        assert_eq!(moc.drawables.len(), 2);
+        assert!(moc.drawables[0].masks.is_empty(), "the mask itself is not masked");
+        assert_eq!(moc.drawables[1].masks, [0], "the second drawable clips to the first");
+        assert_eq!(moc.drawables[1].blend_mode(), a2d_core::BlendMode::Multiply);
+    }
+
     /// Builds a MOC3 with the section layout this parser expects.
     ///
     /// Laid out by hand from the module docs, so a disagreement between the two
@@ -1369,6 +1509,7 @@ pub(crate) mod tests {
         /// Opacity of each drawable keyform, or none to omit the section the
         /// way an older model does.
         opacities: Option<Vec<f32>>,
+        masked: bool,
     }
 
     impl Builder {
@@ -1381,7 +1522,16 @@ pub(crate) mod tests {
                 warp_divisions: (1, 1),
                 version: 2,
                 opacities: None,
+                masked: false,
             }
+        }
+
+        /// Clips every drawable after the first to the first, and gives them
+        /// multiply blending, so the mask and flag tables are exercised.
+        pub(crate) fn masked(mut self) -> Self {
+            self.masked = true;
+            self.drawables = vec!["ArtMesh1", "ArtMesh2"];
+            self
         }
 
         /// Gives every drawable keyform an opacity, in keyform order.
@@ -1502,6 +1652,21 @@ pub(crate) mod tests {
             offsets[section::DRAWABLE_KEYFORM_BINDING] = place(&mut body, &u32_array(&vec![0u32; d]));
             offsets[section::DRAWABLE_KEYFORM_BEGIN] = place(&mut body, &u32_array(&d_begin));
             offsets[section::DRAWABLE_KEYFORM_COUNT] = place(&mut body, &u32_array(&vec![per_element as u32; d]));
+
+            if self.masked {
+                // Drawable 0 masks every later one, so begin/count close: the
+                // first contributes nothing, each of the rest one entry.
+                let begin: Vec<u32> = (0..d).map(|i| i.saturating_sub(1) as u32).collect();
+                let count: Vec<u32> = (0..d).map(|i| u32::from(i > 0)).collect();
+                offsets[section::DRAWABLE_MASK_BEGIN] = place(&mut body, &u32_array(&begin));
+                offsets[section::DRAWABLE_MASK_COUNT] = place(&mut body, &u32_array(&count));
+                offsets[section::DRAWABLE_MASKS] = place(&mut body, &u32_array(&vec![0u32; d - 1]));
+                counts[count::DRAWABLE_MASKS] = d as u32 - 1;
+                // Multiply blending plus double sided, as a real model writes it.
+                let mut flags = vec![6u8; d];
+                flags.resize(d.max(1), 6);
+                offsets[section::DRAWABLE_FLAGS] = place(&mut body, &flags);
+            }
 
             // --- deformers ------------------------------------------------
             // A rotation deformer at the root with a warp hanging off it, and

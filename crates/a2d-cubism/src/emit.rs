@@ -4,7 +4,7 @@
 //! coordinates and a draw order; `a2d-render` draws them, exactly as it draws
 //! the Spine side, and never learns which of the two it is looking at.
 
-use a2d_core::{RenderList, Rgba, TextureId, Vec2};
+use a2d_core::{MaskId, RenderList, Rgba, TextureId, Vec2};
 
 use crate::eval::Pose;
 use crate::moc3::Moc3;
@@ -34,6 +34,10 @@ impl Moc3 {
         let mut order: Vec<usize> = (0..self.drawables.len()).collect();
         order.sort_by_key(|i| self.drawables[*i].draw_order);
 
+        // Masks are shared: a face's worth of drawables usually clip to the
+        // same one or two meshes, so identical lists are registered once.
+        let mut masks: Vec<(Vec<u32>, MaskId)> = Vec::new();
+
         for (z, index) in order.into_iter().enumerate() {
             let drawable = &self.drawables[index];
             let Some(points) = pose.drawables.get(index) else { continue };
@@ -50,12 +54,45 @@ impl Moc3 {
                 continue;
             }
 
+            let clip = if drawable.masks.is_empty() {
+                None
+            } else {
+                match masks.iter().find(|(list, _)| *list == drawable.masks) {
+                    Some((_, id)) => Some(*id),
+                    None => {
+                        let mut shape = out.take_mask();
+                        for source in &drawable.masks {
+                            let at = *source as usize;
+                            let (Some(points), Some(mask)) = (pose.drawables.get(at), self.drawables.get(at)) else {
+                                continue;
+                            };
+                            if points.len() != mask.uvs.len() {
+                                continue;
+                            }
+                            let corners: Vec<Vec2> = points.iter().map(|(x, y)| Vec2::new(*x, *y)).collect();
+                            shape.push_mesh(&corners, &mask.indices);
+                        }
+                        // An empty shape would clip everything away, so a mask
+                        // that produced no triangles is treated as no mask.
+                        if shape.indices.len() < 3 {
+                            None
+                        } else {
+                            let id = out.push_mask_shape(shape);
+                            masks.push((drawable.masks.clone(), id));
+                            Some(id)
+                        }
+                    }
+                }
+            };
+
             let mut mesh = out.take_mesh();
             mesh.vertices.extend(points.iter().map(|(x, y)| Vec2::new(*x, *y)));
             mesh.uvs.extend(drawable.uvs.iter().map(|(u, v)| Vec2::new(*u, *v)));
             mesh.indices.extend_from_slice(&drawable.indices);
             mesh.texture = texture;
             mesh.color = Rgba::new(1.0, 1.0, 1.0, opacity);
+            mesh.blend_mode = drawable.blend_mode();
+            mesh.clipping_mask = clip;
             mesh.z_order = z as u32;
             if mesh.is_well_formed() {
                 out.push_mesh(mesh);
@@ -90,6 +127,32 @@ impl Moc3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_masked_drawable_carries_a_clip_and_its_blend_mode() {
+        let moc = Moc3::parse(&crate::moc3::tests::Builder::new().masked().build()).expect("should parse");
+        let pose = moc.pose(&[]);
+        let mut list = RenderList::new();
+        moc.emit(&pose, TextureId(0), &mut list);
+
+        assert_eq!(list.masks().len(), 1, "one mask, shared rather than one per drawable");
+        let clipped: Vec<_> = list.meshes().iter().filter(|m| m.clipping_mask.is_some()).collect();
+        assert_eq!(clipped.len(), 1);
+        assert_eq!(clipped[0].blend_mode, a2d_core::BlendMode::Multiply);
+        // The mask carries the masking drawable's own triangles, not a bounding box.
+        let mask = list.mask(clipped[0].clipping_mask.expect("present")).expect("registered");
+        assert_eq!(mask.indices.len(), moc.drawables[0].indices.len());
+    }
+
+    #[test]
+    fn an_unmasked_model_registers_no_masks() {
+        let moc = Moc3::parse(&crate::moc3::tests::Builder::new().build()).expect("should parse");
+        let pose = moc.pose(&[]);
+        let mut list = RenderList::new();
+        moc.emit(&pose, TextureId(0), &mut list);
+        assert!(list.masks().is_empty());
+        assert!(list.meshes().iter().all(|m| m.clipping_mask.is_none()));
+    }
 
     #[test]
     fn opacity_reaches_the_mesh_and_a_transparent_drawable_is_not_drawn() {
