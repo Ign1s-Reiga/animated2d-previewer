@@ -868,9 +868,13 @@ fn read_parameter_bindings(
         }
         out.push(ParameterBinding { parameter: *owner, keys });
     }
-    if expect_key != key_count as u64 {
+    // The key pool can be larger than the bindings consume: on two of the six
+    // models checked they use only about half of it, so something not decoded
+    // here owns the rest. What must hold is that no binding reaches past the
+    // end, which is the part that would corrupt a read.
+    if expect_key > key_count as u64 {
         return Err(DecodeError::corrupt(format!(
-            "the bindings account for {expect_key} keys, but the count table declares {key_count}"
+            "the bindings reach key {expect_key}, past the {key_count} the count table declares"
         )));
     }
     Ok(out)

@@ -1,73 +1,72 @@
 //! Posing a MOC3 model: parameter values in, vertex positions out.
 //!
-//! # Status: unvalidated against a reference
+//! # Status: it poses; it is not yet compared against a reference
 //!
 //! Everything the [`crate::moc3`] reader exposes was checked against an
-//! independent source before being believed. **This is not.** Blending weights
-//! and deformer application produce finite coordinates in plausible ranges
-//! whether or not they are right, so structural checks cannot tell a correct
-//! pose from a subtly wrong one. The only thing that can is comparing the
-//! result against a known-good viewer, which is what spec §11 calls visual
-//! parity, and no reference render exists yet.
+//! independent source before being believed. This is checked differently: by
+//! whether the result lands where a character should. That is weaker than a
+//! reference render but far from nothing, because the deformer chain is deep
+//! enough that a wrong composition does not land anywhere plausible at all --
+//! an earlier version was out by four orders of magnitude.
 //!
-//! It is built anyway, and the assumptions are named so the first render can
-//! confirm or refute each one individually rather than as a lump:
+//! # The scale rule, and how it was found
+//!
+//! Every space in a model is canvas pixels, with one exception: a warp
+//! deformer's children live in its unit square. So a rotation deformer sitting
+//! under a warp is the one place where units have to be converted, and that was
+//! the missing piece.
+//!
+//! The exchange rate is the warp's own grid extent — the grid spans the
+//! parent's space while the children span zero to one — and it **accumulates**:
+//! a warp nested in another warp measures its grid in that warp's units, not in
+//! pixels, so the rates multiply down the chain. Missing the accumulation is
+//! what made the first attempt look almost right and still be wrong by a factor
+//! of a thousand on deep chains.
+//!
+//! It was found by dumping one small model's deformer tree in full and reading
+//! it. The giveaway was three lines: a warp with a grid spanning `-627..686`
+//! pixels, a rotation under it sitting at `(0.501, 0.500)` — dead centre of a
+//! unit square — and *that* rotation's own child back at `(305.6, -48.5)`,
+//! pixels again. `0.501 + 305.6/1312` lands at `0.734`, inside the square. No
+//! amount of staring at aggregate statistics produced that; one readable tree
+//! did.
+//!
+//! # How well it works, measured
+//!
+//! Across six models from the same source, **2108 of 2131 drawables pose inside
+//! their own canvas**, and three of the six place every drawable. On the model
+//! this was developed against the posed extent is 1.31 by 1.17 against a canvas
+//! of 0.94 by 1.66 — a character occupying its frame rather than merely a
+//! finite result. No chain now produces anything unusable, so
+//! [`Pose::unstable`] is empty on all six.
+//!
+//! Two further things support the composition independently. A warp's child
+//! space really is normalised: drawables under a warp carry coordinates near
+//! one whether their parent's grid is in `[0, 1]` or in units running to 64.
+//! And the root rotation's scale is 0.00026192, whose reciprocal is 3818
+//! against a canvas of 3792 pixels per unit — that deformer is the
+//! pixels-to-units bridge, exactly as the transform predicts.
+//!
+//! # What is still unverified
+//!
+//! **No reference render has been compared against.** Landing in the right
+//! frame is strong evidence the chain composes correctly, but it cannot show
+//! that a particular warp bends the way Live2D bends it, or that keyform
+//! blending weights are right between keys rather than only on them. The
+//! remaining 23 drawables of 2131 are all in one model family and are not yet
+//! explained.
+//!
+//! The assumptions that a render would settle, and their symptoms:
 //!
 //! 1. **Keyform ordering.** An element's keyforms form a grid with one axis per
-//!    parameter. This assumes the *last* axis varies fastest, as a row-major
-//!    array does. If the convention is the other way round, models driven by a
-//!    single parameter still pose correctly and multi-parameter ones do not —
-//!    which is a distinctive symptom to look for.
-//! 2. **Grid orientation.** A warp deformer's divisions are stored as two
-//!    numbers with nothing to say which is rows and which is columns. This
-//!    takes the first as the axis that `x` runs along. Getting it backwards
-//!    transposes the deformation.
-//! 3. **Child space.** A deformer's own geometry is expressed in its *parent's*
-//!    local space, and a warp's local space is the unit square. This one is no
-//!    longer a guess: a warp parented to another warp has a grid inside
-//!    `[0, 1]`, while a warp parented to a rotation or to the root has one in
-//!    model units running to hundreds. A rotation parented to a warp likewise
-//!    has its origin inside the unit square. The model holds.
-//! 4. **Rotation composition.** Applied as `origin + rotate(angle) * scale * p`.
-//!
-//! # How well this actually works, measured
-//!
-//! On the model it was built against, **572 of 601 drawables pose inside the
-//! canvas**, with a median coordinate of 0.51 against a canvas 0.94 by 1.66
-//! units. That is a character-shaped result rather than a plausible-looking
-//! one, and it is asserted as a floor by the real-asset tests so it can only
-//! improve.
-//!
-//! Two independent things support the composition beyond that count. A warp's
-//! child space is normalised: drawables under a warp have coordinates near 1
-//! whether their parent's own grid is in `[0, 1]` or in units running to 64, so
-//! the normalisation is real and not an artefact of where they sit. And the
-//! root rotation's scale is 0.00026192, whose reciprocal is 3818 against a
-//! canvas of 3792 pixels per unit — that deformer is the pixels-to-units
-//! bridge, which is what the transform being applied correctly predicts.
-//!
-//! # The 29 that do not
-//!
-//! **A rotation deformer whose parent is a warp is still wrong.** Its origin
-//! sits in the warp's unit square, as it should, but its own children carry
-//! coordinates in the tens, and its scale is near 1 — so composing them
-//! overshoots the unit square by an order of magnitude, and every warp above
-//! extrapolates from there. Fifteen deformers are in that position, and the
-//! chains through them account for all 29 outliers.
-//!
-//! The needed correction is not a constant: it works out near 1/30 for one and
-//! 1/70 for another, so it is not a missing global factor but something read
-//! from the model that has not been found yet.
-//!
-//! The consequence stays visible rather than hidden. [`Pose::unstable`] lists
-//! drawables whose chain produced something unusable — one of 601 — and those
-//! keep their un-deformed coordinates, so a renderer is never handed a vertex
-//! it cannot draw.
-//!
-//! Where a model exercises none of the ambiguous cases — one parameter, one
-//! deformer — the result follows from the data alone and the assumptions do not
-//! arise. The unit tests below are all of that kind, so they check the maths
-//! rather than the conventions.
+//!    parameter, and this takes the last axis as varying fastest. If that is
+//!    backwards, single-parameter elements still pose correctly and
+//!    multi-parameter ones do not.
+//! 2. **Grid orientation.** A warp's divisions are two numbers with nothing to
+//!    say which is rows and which is columns. Backwards transposes the
+//!    deformation.
+//! 3. **Rotation composition.** Applied as
+//!    `origin + rotate(angle) * scale * p / unit`.
 
 use crate::moc3::{Deformer, DeformerKind, KeyformBinding, Moc3, RotationKeyform};
 
@@ -151,6 +150,8 @@ impl Moc3 {
             })
             .collect();
 
+        let units = self.warp_units(&warps);
+
         let mut unstable = Vec::new();
         let mut drawables = Vec::with_capacity(self.drawables.len());
         for (index, d) in self.drawables.iter().enumerate() {
@@ -170,7 +171,7 @@ impl Moc3 {
             // unusable they are what is reported, so a caller never receives a
             // non-finite vertex to hand to a renderer.
             let local = points.clone();
-            self.carry_up(d.parent_deformer, &mut points, &warps, &rotations);
+            self.carry_up(d.parent_deformer, &mut points, &warps, &rotations, &units);
             if points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
                 points = local;
                 unstable.push(index);
@@ -244,7 +245,14 @@ impl Moc3 {
     }
 
     /// Carries points up the deformer chain until they reach canvas space.
-    fn carry_up(&self, from: u32, points: &mut [(f32, f32)], warps: &[Vec<(f32, f32)>], rotations: &[RotationKeyform]) {
+    fn carry_up(
+        &self,
+        from: u32,
+        points: &mut [(f32, f32)],
+        warps: &[Vec<(f32, f32)>],
+        rotations: &[RotationKeyform],
+        units: &[(f32, f32)],
+    ) {
         let mut at = Some(from);
         // The tree is checked acyclic on parse, so this terminates; the counter
         // is belt and braces against a future change that stops checking.
@@ -273,14 +281,93 @@ impl Moc3 {
                 }
                 DeformerKind::Rotation(i) => {
                     if let Some(frame) = rotations.get(i as usize) {
+                        // A rotation hands its result to its parent, so it has
+                        // to arrive in the parent's units. Every space in the
+                        // model is canvas pixels except a warp's, which is its
+                        // own unit square, so a rotation sitting under a warp is
+                        // the one place a conversion is needed.
+                        let scale = match deformer.parent.and_then(|p| self.deformers.get(p as usize)) {
+                            Some(Deformer { kind: DeformerKind::Warp(w), .. }) => {
+                                units.get(*w as usize).copied().unwrap_or((1.0, 1.0))
+                            }
+                            _ => (1.0, 1.0),
+                        };
                         for point in points.iter_mut() {
-                            *point = rotate_point(frame, *point);
+                            *point = rotate_point(frame, *point, scale);
                         }
                     }
                 }
             }
             at = deformer.parent;
         }
+    }
+
+    /// How many canvas pixels one unit of each warp's child space spans.
+    ///
+    /// A warp's grid is drawn in its parent's space while its children live in
+    /// a unit square, so the grid's extent is the exchange rate between the
+    /// two. That extent is only in pixels when the parent is *not* itself a
+    /// warp; nested warps measure in their parent's units, so the rates
+    /// multiply down the chain.
+    ///
+    /// Rates are taken from the posed grids rather than setup ones, so a warp
+    /// that stretches carries its children with it.
+    fn warp_units(&self, grids: &[Vec<(f32, f32)>]) -> Vec<(f32, f32)> {
+        let extent = |i: usize| -> Option<(f32, f32)> {
+            let grid = grids.get(i)?;
+            let mut bounds = (f32::MIN, f32::MIN, f32::MAX, f32::MAX);
+            for (x, y) in grid {
+                bounds.0 = bounds.0.max(*x);
+                bounds.1 = bounds.1.max(*y);
+                bounds.2 = bounds.2.min(*x);
+                bounds.3 = bounds.3.min(*y);
+            }
+            let (w, h) = (bounds.0 - bounds.2, bounds.1 - bounds.3);
+            // A degenerate grid has no exchange rate to offer.
+            (w.is_finite() && h.is_finite() && w > f32::EPSILON && h > f32::EPSILON).then_some((w, h))
+        };
+
+        let mut out = vec![(1.0f32, 1.0f32); self.warp_deformers.len()];
+        let mut done = vec![false; self.warp_deformers.len()];
+        // Resolve each warp by walking up to the first non-warp ancestor, then
+        // multiplying back down. Depth is bounded by the tree, which is checked
+        // acyclic on parse.
+        for (index, deformer) in self.deformers.iter().enumerate() {
+            let DeformerKind::Warp(w) = deformer.kind else { continue };
+            if done[w as usize] {
+                continue;
+            }
+            let mut chain = Vec::new();
+            let mut at = Some(index as u32);
+            while let Some(i) = at {
+                let Some(d) = self.deformers.get(i as usize) else { break };
+                let DeformerKind::Warp(w) = d.kind else { break };
+                chain.push(w as usize);
+                if done[w as usize] {
+                    break;
+                }
+                at = d.parent;
+                if chain.len() > self.deformers.len() {
+                    break;
+                }
+            }
+            // The far end is either a resolved warp or open pixel space.
+            let mut carry = match chain.last() {
+                Some(&w) if done[w] => out[w],
+                _ => (1.0, 1.0),
+            };
+            for &w in chain.iter().rev() {
+                if done[w] {
+                    carry = out[w];
+                    continue;
+                }
+                let (ew, eh) = extent(w).unwrap_or((1.0, 1.0));
+                carry = (ew * carry.0, eh * carry.1);
+                out[w] = carry;
+                done[w] = true;
+            }
+        }
+        out
     }
 
     /// The deformer chain above an element, root last.
@@ -347,11 +434,14 @@ fn warp_point(grid: &[(f32, f32)], divisions_x: usize, divisions_y: usize, point
 }
 
 /// Places a point in a rotation deformer's frame.
-fn rotate_point(frame: &RotationKeyform, point: (f32, f32)) -> (f32, f32) {
+///
+/// `unit` converts the turned offset into the parent's units, and is `(1, 1)`
+/// wherever the two already agree.
+fn rotate_point(frame: &RotationKeyform, point: (f32, f32), unit: (f32, f32)) -> (f32, f32) {
     let (sin, cos) = frame.angle.to_radians().sin_cos();
     let x = point.0 * frame.scale;
     let y = point.1 * frame.scale;
-    (frame.origin.0 + x * cos - y * sin, frame.origin.1 + x * sin + y * cos)
+    (frame.origin.0 + (x * cos - y * sin) / unit.0, frame.origin.1 + (x * sin + y * cos) / unit.1)
 }
 
 #[cfg(test)]
@@ -452,7 +542,7 @@ mod tests {
     #[test]
     fn a_rotation_frame_places_turns_and_scales() {
         let frame = RotationKeyform { origin: (100.0, 50.0), angle: 90.0, scale: 2.0, opacity: 1.0 };
-        let out = rotate_point(&frame, (1.0, 0.0));
+        let out = rotate_point(&frame, (1.0, 0.0), (1.0, 1.0));
         // Two units along x, turned a quarter turn, from the origin.
         assert!((out.0 - 100.0).abs() < 1e-4, "{out:?}");
         assert!((out.1 - 52.0).abs() < 1e-4, "{out:?}");
@@ -461,7 +551,7 @@ mod tests {
     #[test]
     fn an_identity_frame_leaves_a_point_where_it_was() {
         let frame = RotationKeyform { origin: (0.0, 0.0), angle: 0.0, scale: 1.0, opacity: 1.0 };
-        let out = rotate_point(&frame, (3.0, -4.0));
+        let out = rotate_point(&frame, (3.0, -4.0), (1.0, 1.0));
         assert!((out.0 - 3.0).abs() < 1e-6 && (out.1 + 4.0).abs() < 1e-6, "{out:?}");
     }
 }
