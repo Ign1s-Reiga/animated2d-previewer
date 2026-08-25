@@ -227,6 +227,18 @@ impl AnimatedModel for GenericSpineModel {
         self.disposed = true;
     }
 
+    fn set_scale(&mut self, scale: a2d_core::Vec2) {
+        GenericSpineModel::set_scale(self, scale);
+    }
+
+    fn pose_at(&mut self, animation: &str, time: f32) -> Result<(), RuntimeError> {
+        GenericSpineModel::pose_at(self, animation, time)
+    }
+
+    fn absorb_degradations(&self, report: &mut a2d_core::LoadReport) {
+        GenericSpineModel::absorb_degradations(self, report);
+    }
+
     fn display_name(&self) -> &str {
         &self.display_name
     }

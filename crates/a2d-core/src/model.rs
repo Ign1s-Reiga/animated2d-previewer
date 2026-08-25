@@ -128,6 +128,39 @@ pub trait AnimatedModel {
     /// Name the viewer should show. Defaults to the package display name.
     fn display_name(&self) -> &str;
 
+    /// A sensible animation to start with: `idle` if present, else the first.
+    ///
+    /// The rule is the same for every runtime family, so it lives here rather
+    /// than being restated per model.
+    fn default_animation(&self) -> Option<&str> {
+        let all = self.animations();
+        all.iter()
+            .find(|a| a.name.eq_ignore_ascii_case("idle"))
+            .or_else(|| all.iter().find(|a| a.name.to_ascii_lowercase().contains("idle")))
+            .or_else(|| all.first())
+            .map(|a| a.name.as_str())
+    }
+
+    /// Scales the whole model. A negative component mirrors it.
+    ///
+    /// Default is to ignore it, for a model that cannot be mirrored meaningfully.
+    fn set_scale(&mut self, _scale: crate::Vec2) {}
+
+    /// Poses at an absolute time within one animation, without advancing state.
+    ///
+    /// This is what visual regression tests and frame export need: a frame that
+    /// depends on the timestamp alone, not on how it was reached. A model whose
+    /// timelines cannot be seeked says so rather than posing something else,
+    /// which is why this has a default rather than being required.
+    fn pose_at(&mut self, animation: &str, _time: f32) -> Result<(), RuntimeError> {
+        Err(RuntimeError::UnknownAnimation(format!("{animation:?}: this model cannot be posed at a timestamp")))
+    }
+
+    /// Folds any degradations the model noticed while posing into a report.
+    ///
+    /// Default is silence, for models that have nothing to add.
+    fn absorb_degradations(&self, _report: &mut crate::LoadReport) {}
+
     /// Whether the model has an animation with this name.
     fn has_animation(&self, name: &str) -> bool {
         self.animations().iter().any(|a| a.name == name)
