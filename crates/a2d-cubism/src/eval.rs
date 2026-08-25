@@ -31,23 +31,26 @@
 //! amount of staring at aggregate statistics produced that; one readable tree
 //! did.
 //!
-//! # The grid orientation, and how it was found
+//! # The axis order, and how it was found
 //!
-//! A warp's two division counts arrive with nothing in the layout to say which
-//! is rows and which is columns, and for a square grid it cannot matter — the
-//! lookup is identical either way. Reading every non-square grid in the same
-//! six models both ways settled it: with `divisions.1 + 1` points to a stored
-//! row, 713 of 729 such grids are perfectly monotone lattices and most of the
-//! rest are coherently mirrored; with `divisions.0 + 1`, the rows interleave
-//! and not one grid is monotone.
+//! MOC3 writes the **vertical component of a point first**. That one fact fixes
+//! four things at once: point pairs are swapped as they are read, the two
+//! rotation-origin sections go into the opposite fields, rotation angles turn
+//! the other way, and a warp's stored runs walk down a column rather than along
+//! a row (see [`crate::WarpDeformer::divisions`]).
 //!
-//! The wrong reading had survived because a scrambled lattice still lands
-//! points *inside* the grid within the grid's own bounds. What exposed it was
-//! the 22 drawables (all in one model family) whose geometry overhangs a
-//! non-square grid: there the mapping extrapolates the edge cells, a scrambled
-//! edge cell has the wrong slope, and chains amplified that into excursions of
-//! up to eight orders of magnitude. With the orientation fixed, every one of
-//! them poses inside its canvas.
+//! Getting it wrong transposes the whole model — a mirror, not a turn — and the
+//! error hides well, because reading the point pairs and the lattice in the
+//! same wrong order transposes both. A census of monotone lattices scores the
+//! two readings identically, and the parameters cannot witness against it
+//! either, since they are carried through the very chain under test.
+//!
+//! What settled it was each drawable's own texture coordinates: the mesh is the
+//! same shape in uv space as in canvas space, so the map between them is a
+//! similarity, and only a mirror flips the sign of its determinant. Exactly one
+//! mirror is expected, `v` running down the atlas against `y` running up the
+//! canvas. Read the old way 1% of drawables matched their own texture; read
+//! this way 99% do, on all three models measured.
 //!
 //! # How well it works, measured
 //!
@@ -344,7 +347,7 @@ impl Moc3 {
                         // The second division count is the one that runs along
                         // a stored row (see `WarpDeformer::divisions`), so it
                         // is the x axis here.
-                        let (rows, columns) = shape.divisions;
+                        let (columns, rows) = shape.divisions;
                         for point in points.iter_mut() {
                             *point = warp_point(grid, columns as usize, rows as usize, *point);
                         }
@@ -504,7 +507,9 @@ fn warp_point(grid: &[(f32, f32)], divisions_x: usize, divisions_y: usize, point
     let tx = fx - ix as f32;
     let ty = fy - iy as f32;
 
-    let corner = |cx: usize, cy: usize| grid[cy * cols + cx];
+    // Column-major: a stored run walks *down* a column, because the file's
+    // first axis is the vertical one (see `WarpDeformer::divisions`).
+    let corner = |cx: usize, cy: usize| grid[cx * rows + cy];
     let (a, b, c, d) = (corner(ix, iy), corner(ix + 1, iy), corner(ix, iy + 1), corner(ix + 1, iy + 1));
     let top = (a.0 + (b.0 - a.0) * tx, a.1 + (b.1 - a.1) * tx);
     let bottom = (c.0 + (d.0 - c.0) * tx, c.1 + (d.1 - c.1) * tx);
@@ -641,7 +646,9 @@ mod tests {
     #[test]
     fn a_warp_grid_reproduces_its_own_corners() {
         // A 1x1 grid is a quad; looking it up at the corners must return them.
-        let grid = vec![(0.0, 0.0), (10.0, 0.0), (0.0, 20.0), (10.0, 20.0)];
+        // Stored column-major, so the second point is the one *below* the
+        // first, not the one beside it.
+        let grid = vec![(0.0, 0.0), (0.0, 20.0), (10.0, 0.0), (10.0, 20.0)];
         assert_eq!(warp_point(&grid, 1, 1, (0.0, 0.0)), (0.0, 0.0));
         assert_eq!(warp_point(&grid, 1, 1, (1.0, 0.0)), (10.0, 0.0));
         assert_eq!(warp_point(&grid, 1, 1, (0.0, 1.0)), (0.0, 20.0));
@@ -653,7 +660,7 @@ mod tests {
     #[test]
     fn a_warp_extends_its_edge_cells_rather_than_clamping() {
         // Geometry that overhangs a deformer should keep its shape.
-        let grid = vec![(0.0, 0.0), (10.0, 0.0), (0.0, 20.0), (10.0, 20.0)];
+        let grid = vec![(0.0, 0.0), (0.0, 20.0), (10.0, 0.0), (10.0, 20.0)];
         let out = warp_point(&grid, 1, 1, (2.0, 0.0));
         assert_eq!(out, (20.0, 0.0), "the cell should be extended, not clamped to the border");
     }

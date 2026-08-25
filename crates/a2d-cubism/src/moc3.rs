@@ -34,11 +34,21 @@
 //!   every one of the 9554 stored offsets exactly and ends precisely on the
 //!   declared total. A wrong padding rule or a wrong ordering would miss on the
 //!   very first deformer.
-//! * The warp grid orientation — which division count is columns — was settled
-//!   by reading every non-square grid in six models both ways: with
-//!   `divisions.1 + 1` points to a row, 713 of 729 grids are perfectly
-//!   monotone lattices; the other reading interleaves rows and makes not one
-//!   of them monotone. See [`WarpDeformer::divisions`].
+//! * The file's **axis order puts the vertical component first**. Every stored
+//!   point pair is therefore swapped as it is read, the two rotation-origin
+//!   sections go into the opposite fields, rotation angles have their sense
+//!   flipped, and a warp's stored runs walk down a column rather than along a
+//!   row. All four follow from that one fact.
+//!
+//!   It was settled by comparing each drawable's posed geometry against its own
+//!   texture coordinates, the one witness independent of the whole deformer
+//!   chain: a mesh is the same shape in both spaces, and only a mirror can flip
+//!   the sign of the map between them. Read the old way 1% of drawables matched
+//!   their own texture; read this way 99% do, on three models. An earlier
+//!   reading had the axes the other way about and was self-consistent, because
+//!   reading the pairs and the lattice in the same wrong order transposes both
+//!   — which is why a census of monotone lattices could not tell them apart.
+//!   See [`WarpDeformer::divisions`].
 //!
 //! # What is missing
 //!
@@ -159,6 +169,8 @@ mod section {
     /// Opacity carried by each rotation keyform.
     pub const ROTATION_KEYFORM_OPACITY: usize = 61;
     pub const ROTATION_KEYFORM_ANGLE: usize = 62;
+    /// Named for the file's axis order, which puts the vertical first: section
+    /// 63 holds what the rest of this crate calls `y`.
     pub const ROTATION_KEYFORM_ORIGIN_X: usize = 63;
     pub const ROTATION_KEYFORM_ORIGIN_Y: usize = 64;
     pub const ROTATION_KEYFORM_SCALE: usize = 65;
@@ -381,16 +393,20 @@ pub struct RotationKeyform {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WarpDeformer {
     pub id: String,
-    /// Grid divisions: `.0` down the grid's y axis, `.1` across its x axis.
+    /// Grid divisions: `.0` across the grid's x axis, `.1` down its y axis.
     ///
-    /// The stored lattice is row-major with `divisions.1 + 1` points to a row,
-    /// and x runs along a row. The layout alone could not tell the two counts
-    /// apart; reading every non-square grid in six real models both ways did.
-    /// Read this way, 713 of 729 such grids are perfectly monotone — x
-    /// increasing along every row, y along every column — and most of the rest
-    /// are coherently mirrored rather than scrambled. Read with
-    /// `divisions.0 + 1` points to a row instead, the rows interleave and not
-    /// one grid is monotone.
+    /// The stored lattice runs **column-major** in our terms: `divisions.1 + 1`
+    /// consecutive points walk down one column, and there are `divisions.0 + 1`
+    /// columns. That falls out of the file's axis order rather than being a
+    /// separate discovery — a stored run walks along the file's first axis,
+    /// which is the vertical one.
+    ///
+    /// An earlier reading had these the other way about and called the runs
+    /// rows. It was self-consistent, because reading the point pairs in the
+    /// same wrong order transposes the lattice too, and a transposed lattice of
+    /// transposed points is monotone exactly as often. What broke the tie was
+    /// comparing posed geometry against the drawable's own uvs, which no
+    /// reading of the grid can affect.
     pub divisions: (u32, u32),
     /// Control point count, always `(a + 1) * (b + 1)`.
     pub point_count: u32,
@@ -1136,15 +1152,19 @@ fn read_rotation_deformers(
     };
     let opacity = floats(section::ROTATION_KEYFORM_OPACITY, "rotation opacity")?;
     let angle = floats(section::ROTATION_KEYFORM_ANGLE, "rotation angle")?;
-    let origin_x = floats(section::ROTATION_KEYFORM_ORIGIN_X, "rotation origin")?;
-    let origin_y = floats(section::ROTATION_KEYFORM_ORIGIN_Y, "rotation origin")?;
+    // The vertical component comes first here too, so the two sections are
+    // read into the opposite fields.
+    let origin_y = floats(section::ROTATION_KEYFORM_ORIGIN_X, "rotation origin")?;
+    let origin_x = floats(section::ROTATION_KEYFORM_ORIGIN_Y, "rotation origin")?;
     let scale = floats(section::ROTATION_KEYFORM_SCALE, "rotation scale")?;
 
     let mut keyforms = Vec::with_capacity(keyform_count);
     for i in 0..keyform_count {
         let k = RotationKeyform {
             origin: (origin_x[i], origin_y[i]),
-            angle: angle[i],
+            // Angles turn the other way round in a frame whose vertical axis
+            // comes first, so the sense is flipped once, here.
+            angle: -angle[i],
             scale: scale[i],
             opacity: opacity[i],
         };
@@ -1407,10 +1427,16 @@ fn read_keyforms(
         )));
     }
 
+    // The file writes the *vertical* component of a point first (see
+    // `Moc3::pose`), so the pairs are swapped as they are read and everything
+    // downstream is in the ordinary x-then-y order.
     let positions_at = section_offset(sections, section::KEYFORM_POSITIONS, "keyform position")?;
     let mut positions = Vec::with_capacity(float_count);
     for i in 0..float_count {
         positions.push(f32_at(bytes, positions_at + i * 4)?);
+    }
+    for pair in positions.chunks_exact_mut(2) {
+        pair.swap(0, 1);
     }
     Ok(Keyforms { positions, warp_offsets, drawable_offsets })
 }
@@ -1540,9 +1566,9 @@ pub(crate) mod tests {
             self
         }
 
-        /// A non-square grid, for tests where rows and columns must differ.
-        pub(crate) fn warp_divisions(mut self, rows: u32, columns: u32) -> Self {
-            self.warp_divisions = (rows, columns);
+        /// A non-square grid, for tests where the two axes must differ.
+        pub(crate) fn warp_divisions(mut self, across_x: u32, down_y: u32) -> Self {
+            self.warp_divisions = (across_x, down_y);
             self
         }
 
@@ -1712,24 +1738,33 @@ pub(crate) mod tests {
             offsets[section::KEYFORM_POSITION_OFFSETS] = place(&mut body, &u32_array(&warp_kf_offsets));
 
             let mut pool = vec![0.0f32; warp_floats + draw_floats];
-            // The grid is a regular lattice spanning 10 by 20 that doubles
-            // across the three keys, so a blend between them is visible in the
-            // result. It is stored row-major with `div_b + 1` points to a row,
-            // the orientation established in the module docs; with the default
-            // 1x1 divisions it is the quad (0,0)-(10,0)-(0,20)-(10,20).
+            // The grid is a regular lattice spanning 10 across by 20 down that
+            // doubles across the three keys, so a blend between them is visible
+            // in the result. With the default 1x1 divisions it is the quad
+            // (0,0)-(10,0)-(0,20)-(10,20).
+            //
+            // It is written the way a real file writes one: **column-major**,
+            // with `div_b + 1` points walking down one column, and each pair
+            // stored vertical component first. Both follow from the file's axis
+            // order (see `Moc3::pose`), and writing the fixture in the file's
+            // convention rather than in ours is what makes these tests exercise
+            // the conversion instead of bypassing it.
             for k in 0..warp_keyforms {
                 let scale = [0.5f32, 1.0, 2.0][k % 3];
                 for pt in 0..grid_points as usize {
-                    let column = (pt % (div_b as usize + 1)) as f32;
-                    let row = (pt / (div_b as usize + 1)) as f32;
-                    pool[k * warp_stride + pt * 2] = column * 10.0 / div_b as f32 * scale;
-                    pool[k * warp_stride + pt * 2 + 1] = row * 20.0 / div_a as f32 * scale;
+                    let down = (pt % (div_b as usize + 1)) as f32;
+                    let across = (pt / (div_b as usize + 1)) as f32;
+                    let x = across * 10.0 / div_a as f32 * scale;
+                    let y = down * 20.0 / div_b as f32 * scale;
+                    pool[k * warp_stride + pt * 2] = y;
+                    pool[k * warp_stride + pt * 2 + 1] = x;
                 }
             }
-            // Drawable vertices sit in the warp's unit square.
+            // Drawable vertices sit in the warp's unit square: (0,0), (1,0) and
+            // (0,1), each written vertical component first.
             for k in 0..draw_keyforms {
                 let base = warp_floats + k * draw_stride;
-                pool[base..base + 6].copy_from_slice(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+                pool[base..base + 6].copy_from_slice(&[0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
             }
             let pool_bytes: Vec<u8> = pool.iter().flat_map(|v| v.to_le_bytes()).collect();
             offsets[section::KEYFORM_POSITIONS] = place(&mut body, &pool_bytes);
@@ -1861,11 +1896,13 @@ pub(crate) mod tests {
         assert_eq!(warp.divisions, (1, 1));
         assert_eq!(warp.point_count, 4);
         assert_eq!(warp.keyform_count, 3);
-        // The quad doubles across the three keys.
-        assert_eq!(moc.keyforms.warp(0, 4).expect("first"), [0.0, 0.0, 5.0, 0.0, 0.0, 10.0, 5.0, 10.0]);
+        // The quad doubles across the three keys. The points come out
+        // column-major and in x-then-y order, which is the file's own layout
+        // converted: (0,0) (0,10) (5,0) (5,10).
+        assert_eq!(moc.keyforms.warp(0, 4).expect("first"), [0.0, 0.0, 0.0, 10.0, 5.0, 0.0, 5.0, 10.0]);
         // The second keyform starts after the first one's padding, not after
         // its four points -- reading it proves the padding is stepped over.
-        assert_eq!(moc.keyforms.warp(1, 4).expect("second"), [0.0, 0.0, 10.0, 0.0, 0.0, 20.0, 10.0, 20.0]);
+        assert_eq!(moc.keyforms.warp(1, 4).expect("second"), [0.0, 0.0, 0.0, 20.0, 10.0, 0.0, 10.0, 20.0]);
 
         let d = &moc.drawables[0];
         assert_eq!(d.keyform_count, 3);
