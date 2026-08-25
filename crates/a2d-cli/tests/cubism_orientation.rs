@@ -9,12 +9,19 @@
 //! of it**: the drawable's own texture coordinates. A mesh is the same shape in
 //! both spaces, so the map between them is a similarity. Atlas packing may
 //! rotate a region, but a rotation cannot flip a determinant and a mirror can.
-//! Exactly one mirror is expected, since `v` runs down the atlas while `y` runs
-//! up the canvas — so every drawable should fit with a *negative* determinant.
-//! A model assembled transposed scores near zero here, which is how one was
-//! caught being exactly that.
 //!
-//! Two tempting alternatives do **not** work, and were both tried first:
+//! So this detects a **mirrored** model and only that. It is blind to rotation,
+//! which is worth saying plainly: it was once mistaken for a full orientation
+//! check, and a correct model was "fixed" on the strength of it.
+//!
+//! The expected sign is **positive** — no net mirror. It is tempting to argue
+//! the opposite, since texture rows usually run down while `y` runs up the
+//! canvas, but `a2d-unity`'s decoder flips Unity's bottom-up rows when it reads
+//! a `Texture2D`, and that flip is what makes the two agree. Reasoning about
+//! the convention without accounting for it is exactly the mistake that was
+//! made.
+//!
+//! Nothing here checks rotation. Two tempting alternatives do **not** work:
 //!
 //! * *"the face should be upright"* — a character may legitimately be drawn
 //!   reclining or tilted, so there is no angle to assert.
@@ -95,7 +102,7 @@ fn posed_geometry_agrees_with_the_texture_it_samples() {
         }
         let Some(det) = uv_to_position_determinant(&drawable.uvs, points) else { continue };
         total += 1;
-        if det < 0.0 {
+        if det > 0.0 {
             agree += 1;
         }
     }
@@ -105,7 +112,8 @@ fn posed_geometry_agrees_with_the_texture_it_samples() {
     assert!(
         agree * 10 >= total * 9,
         "only {agree} of {total} drawables are oriented to match their own texture; \
-         a model assembled transposed scores near zero here"
+         a mirrored model scores near zero here, though a rotated one scores \
+         just as well as an upright one: a determinant cannot see a turn"
     );
 }
 
