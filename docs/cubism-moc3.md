@@ -72,25 +72,31 @@ used by the parser:
 | 45 | drawable index offsets | | | |
 | 46 | drawable index counts | | | |
 | 68 | drawable keyform opacity | | 69 | drawable keyform draw order |
+| 39 | drawable part index | | 41 | drawable texture index |
+| 42 | drawable flags (**bytes**) | | 47 | drawable mask begin |
+| 48 | drawable mask count | | 80 | drawable mask list |
 
 A wrong index here fails loudly rather than returning a plausible model: each
 section is required to hold exactly the declared number of well-formed entries.
 
-Identified but **not yet decoded**, listed so the next pass does not have to
-re-find them:
+### How the drawable side tables were identified
 
-| # | Width | Contents | How it was identified |
+| # | Width | Contents | How it was established |
 |---|---|---|---|
-| 39 | u32 | part index per drawable | 79 distinct values over 568 drawables, `u32::MAX` for none; the eye and face meshes share one value and the front-hair meshes another |
-| 41 | u32 | texture index per drawable | all zero, which is what a single-page model looks like and confirms the one-page assumption the emitter makes |
-| 42 | **byte** | drawable constant flags | one byte per drawable; only two values occur, 4 on 529 meshes and 6 on 39. Bit 2 is double-sided and bit 1 multiply-blend, which is why the meshes carrying 6 include one named as a shadow |
+| 39 | u32 | part index per drawable | `u32::MAX` for none; the values group exactly as the part names do — every eye mesh shares the part named `eye`, every front-hair mesh the one named `hair_front` |
+| 41 | u32 | texture index per drawable | all zero on every model seen, which is what a single-page model looks like and confirms the one-page assumption the emitter makes |
+| 42 | **byte** | drawable constant flags | one byte per drawable; only two values occur, 4 on 529 meshes and 6 on 39. Bit 2 is double-sided and bit 1 multiply-blend — the meshes carrying 6 include one the model itself names as a shadow |
 | 47 | u32 | first clipping mask per drawable | a running offset |
-| 48 | u32 | clipping mask count per drawable | offset plus count equals the next drawable's offset, exactly, all the way along -- the same closure argument that fixed the drawable tables |
+| 48 | u32 | clipping mask count per drawable | begin plus count equals the next drawable's begin for **all 567 adjacent pairs**, and the last lands exactly on count slot 17 — the same closure argument that fixed the drawable tables |
+| 80 | u32 | the flat mask list, as drawable indices | the only section in three models whose length matches count slot 17 and whose every entry is a valid drawable index. Then confirmed by meaning rather than by shape: it clips `eye_r01` and `eye_r02` to `eye_r03`, which is an iris and a highlight clipped to their own eye white |
 | 70 | u32 | drawable keyform position offsets | the offsets the padding rule of §3 already predicts, stored explicitly; useful as a cross-check |
 
 Section 42 is a **byte** array, not a word array. A scan that assumes four-byte
 entries walks straight past it, which is why it was missed on the first pass.
 
+Sections 4 to 9 are per *part*: 5 is the identity, 4, 6, 7 and 8 are constant on
+every model seen, and 9 is the parent part index with `u32::MAX` at a root.
+Notably **none of them orders the parts**, which matters for §6.
 
 ## 3. What was confirmed, and against what
 
@@ -244,28 +250,43 @@ in one real model. Turning draw orders into a render order needs the part tree,
 so section 87 is what the emitter sorts by, and section 69 is decoded and
 carried but not yet used.
 
-That distinction has a visible consequence. On one model the eyes do not appear,
-and the reason is not that the meshes are absent: all 28 of them are present,
-correctly placed, at full opacity, named `eye_r01`, `eyelash_down_r03`,
-`eyelids_r02` and so on. Two separate gaps hide them.
+That distinction has a visible consequence. On one model the eyes do not
+appear, and the reason is not that the meshes are absent: all 28 are present,
+correctly placed, at full opacity, and named `eye_r01`, `eyelash_down_r03`,
+`eyelids_r02` and so on. Chasing it down produced three findings, only one of
+which is fixed.
 
-**The face skin is drawn in front of them.** `face_02` sits at section-87 order
-534 against eye meshes at 519 to 526, and covers 100% of their bounding box.
-Suppressing that one mesh reveals the eyes immediately. So section 87 is not by
-itself the correct render order for every mesh — the part tree is needed to
-resolve it.
+**Fixed: the eyes were unclipped.** `eye_r01` and `eye_r02` -- an iris and a
+highlight -- each declare one mask, and it is `eye_r03`, their own eye white.
+Masks are now read and emitted, and the irises clip correctly.
 
-**The eyes are unclipped.** `eye_r01`, `eye_r02`, `eye_l01` and `eye_l02` each
-declare one clipping mask in sections 47 and 48, and masks are not decoded, so
-an iris that should be clipped to the eye white paints its whole quad. With the
-face skin removed they show as raw rectangles carrying visible atlas edges
-rather than as eyes.
+**Not fixed: the face skin draws in front of them.** `face_02` is a solid mesh
+whose atlas region is 68% opaque, and section 87 puts it at 534 against eye
+meshes at 519 to 526. Suppressing that one mesh reveals the eyes immediately.
 
-Both are decoding gaps rather than renderer ones: `a2d-render` already does
-stencil clipping for the Spine path, and `RenderMesh` already carries a
-`clipping_mask` and a `blend_mode`. What is missing is reading sections 39, 42,
-47 and 48 and the mask index array, and computing a render order from the part
-tree.
+Section 87 is the only permutation of the drawables in the whole file, so there
+is no other candidate for a render order, and it is not internally coherent: the
+right eye's lashes sit at 509 to 513, *behind* that eye at 519 to 521, while the
+left eye's sit at 527 to 533, in front of its own. So the resolved order must be
+computed rather than read. In Cubism that computation involves the part tree,
+but the part sections carry no ordering: sorting part-major by part index does
+better on hand-written ordering rules than section 87 does (6 of 8 against 5 of
+8) and is still wrong, and no per-part section holds an order. **This is
+unsolved.**
+
+**Not fixed, and probably the deeper problem: the face is laid out on a rotated
+axis.** Taking the posed centres of the facial meshes, the brow-to-eye-to-nose
+-to-mouth axis runs along decreasing `x` while the right-to-left axis runs along
+`y` -- the face's own vertical is the screen's horizontal. But sweeping
+`ParamEyeBallX` moves the pupils along `x`, which in that layout is the face's
+*vertical*. The geometry and the parameter wiring disagree by a quarter turn,
+and they cannot both be right. Whichever is wrong, a defect that rotates the
+head would also explain why nothing in the face lands where a render order
+expects it.
+
+That last point is why no render-order rule should be guessed at until it is
+settled: fitting an ordering to geometry that is itself suspect would bake the
+error in.
 
 ## 7. How correctness is judged without a reference runtime
 
@@ -312,12 +333,12 @@ These are `crates/a2d-cli/tests/cubism_orientation.rs`, gated on
   model poses and draws but does not play its own animation.
 - **Physics, pose files, expressions, hit areas.** All live outside the MOC3 and
   are not read.
-- **Clipping masks and blend modes.** Sections 42, 47 and 48 are identified but
-  not read, so masked meshes draw unclipped and multiply-blended ones draw
-  normally. See §6.
-- **Render order.** Section 87's resolved order places at least one face mesh in
-  front of the eyes; resolving it properly needs the part tree in section 39.
-- **Multiple texture pages.** Every drawable is assumed to sample page zero.
-  Section 41 holds the per-drawable texture index and is all zero on the models
-  seen, so the assumption holds for them, but it is not read.
+- **Render order.** Section 87 places the face skin in front of the eyes and
+  orders the two eyes' lashes inconsistently with each other. No section holds a
+  part order, and part-major sorting does not fix it either. See §6.
+- **Head orientation.** The facial meshes are laid out on an axis a quarter turn
+  from the one the eye parameters move along. See §6.
+- **Multiple texture pages.** Section 41 gives each drawable a texture index and
+  is read, but the emitter still puts every mesh on one page, because nothing
+  loads a second one yet. It is all zero on every model seen.
 - **Glue.** Identifiers are read; the constraint is not applied.
