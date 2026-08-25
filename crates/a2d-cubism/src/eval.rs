@@ -127,6 +127,17 @@ pub struct Pose {
     /// One entry per drawable, in the model's own order, holding `x, y` pairs
     /// in canvas units.
     pub drawables: Vec<Vec<(f32, f32)>>,
+    /// One opacity per drawable, blended from its keyforms.
+    ///
+    /// A model that carries no opacity track leaves these at one, which draws
+    /// exactly as it did before the track was read.
+    pub opacities: Vec<f32>,
+    /// One draw order per drawable, blended from its keyforms.
+    ///
+    /// Cubism animates draw order, so a hand passing in front of a face is a
+    /// change in this rather than a change in geometry. Falls back to the fixed
+    /// order when the model carries no track.
+    pub draw_orders: Vec<f32>,
     /// Drawables whose deformer chain produced something unusable, and which
     /// therefore hold their own coordinates rather than a posed result.
     ///
@@ -205,11 +216,22 @@ impl Moc3 {
 
         let mut unstable = Vec::new();
         let mut drawables = Vec::with_capacity(self.drawables.len());
+        let mut opacities = Vec::with_capacity(self.drawables.len());
+        let mut draw_orders = Vec::with_capacity(self.drawables.len());
         for (index, d) in self.drawables.iter().enumerate() {
             let weights = self.weights_for(d.keyform_binding, &resolved);
             let mut points = vec![(0.0f32, 0.0f32); d.vertex_count()];
+            let mut opacity = if self.drawable_keyform_opacities.is_empty() { 1.0 } else { 0.0 };
+            let mut order = if self.drawable_keyform_draw_orders.is_empty() { d.draw_order as f32 } else { 0.0 };
             for (keyform, weight) in &weights {
-                let Some(source) = self.keyforms.drawable(d.keyform_begin as usize + keyform, points.len()) else {
+                let at = d.keyform_begin as usize + keyform;
+                if let Some(o) = self.drawable_keyform_opacities.get(at) {
+                    opacity += o * weight;
+                }
+                if let Some(o) = self.drawable_keyform_draw_orders.get(at) {
+                    order += o * weight;
+                }
+                let Some(source) = self.keyforms.drawable(at, points.len()) else {
                     continue;
                 };
                 for (out, pair) in points.iter_mut().zip(source.chunks_exact(2)) {
@@ -217,6 +239,8 @@ impl Moc3 {
                     out.1 += pair[1] * weight;
                 }
             }
+            opacities.push(opacity.clamp(0.0, 1.0));
+            draw_orders.push(order);
 
             // Keep the un-deformed coordinates: if the chain produces something
             // unusable they are what is reported, so a caller never receives a
@@ -230,7 +254,7 @@ impl Moc3 {
             drawables.push(points);
         }
 
-        Pose { drawables, unstable }
+        Pose { drawables, opacities, draw_orders, unstable }
     }
 
     /// Parameter values, defaulted and clamped.
@@ -501,6 +525,34 @@ fn rotate_point(frame: &RotationKeyform, point: (f32, f32), unit: (f32, f32)) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_without_an_opacity_track_poses_fully_opaque() {
+        // Every model read before these sections were identified drew opaque,
+        // and must keep doing so rather than turning invisible.
+        let moc = crate::Moc3::parse(&crate::moc3::tests::Builder::new().build()).expect("should parse");
+        assert!(moc.drawable_keyform_opacities.is_empty());
+        let pose = moc.pose(&[]);
+        assert!(pose.opacities.iter().all(|o| *o == 1.0), "{:?}", pose.opacities);
+    }
+
+    #[test]
+    fn opacity_blends_across_keyforms_like_position_does() {
+        // The fixture's parameter has keys at -30, 0 and 30, so a value of 15
+        // sits halfway between the second and third keyform.
+        let bytes = crate::moc3::tests::Builder::new().opacities(&[1.0, 1.0, 0.0]).build();
+        let moc = crate::Moc3::parse(&bytes).expect("should parse");
+        assert_eq!(moc.drawable_keyform_opacities.len(), moc.keyforms.drawable_offsets.len());
+
+        let at = |value: f32| {
+            let mut values: Vec<f32> = moc.parameters.iter().map(|p| p.default).collect();
+            values[0] = value;
+            moc.pose(&values).opacities[0]
+        };
+        assert!((at(0.0) - 1.0).abs() < 1e-5, "{}", at(0.0));
+        assert!((at(30.0) - 0.0).abs() < 1e-5, "{}", at(30.0));
+        assert!((at(15.0) - 0.5).abs() < 1e-5, "halfway between keys should be halfway: {}", at(15.0));
+    }
 
     fn keys(values: &[f32]) -> Vec<f32> {
         values.to_vec()

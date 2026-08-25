@@ -149,6 +149,21 @@ mod section {
     pub const PARAMETER_KEY_COUNT: usize = 76;
     pub const PARAMETER_KEYS: usize = 77;
 
+    /// Opacity carried by each *drawable* keyform.
+    ///
+    /// Identified by shape: one float per drawable keyform, every value inside
+    /// `[0, 1]`, and only a handful of distinct values across a whole model --
+    /// which is what an opacity track looks like and what none of the
+    /// neighbouring sections do.
+    pub const DRAWABLE_KEYFORM_OPACITY: usize = 68;
+    /// Draw order carried by each *drawable* keyform.
+    ///
+    /// Identified the same way: one float per drawable keyform, spanning 499 to
+    /// 1000 with a resting value of 510. Cubism's draw order runs 0 to 1000
+    /// about a default of 500, so this is the animated order, distinct from the
+    /// fixed one in [`DRAWABLE_DRAW_ORDER`].
+    pub const DRAWABLE_KEYFORM_DRAW_ORDER: usize = 69;
+
     /// Where each *warp* keyform's coordinates begin, in floats. Drawable
     /// keyforms are not listed; they follow the same rule after the warps.
     pub const KEYFORM_POSITION_OFFSETS: usize = 60;
@@ -413,6 +428,14 @@ pub struct Moc3 {
     pub keyform_bindings: Vec<KeyformBinding>,
     /// The keyform coordinate pool, undivided.
     pub keyforms: Keyforms,
+    /// Opacity of each drawable keyform, in the same order as
+    /// [`Keyforms::drawable_offsets`].
+    ///
+    /// Empty when the section is absent, in which case a model draws fully
+    /// opaque -- which is what it did before this was read at all.
+    pub drawable_keyform_opacities: Vec<f32>,
+    /// Draw order of each drawable keyform, in the same order.
+    pub drawable_keyform_draw_orders: Vec<f32>,
     /// Every section offset, so later work can reach data this does not decode.
     pub sections: Vec<u32>,
 }
@@ -494,6 +517,17 @@ impl Moc3 {
         check_keyform_grids(&keyform_bindings, &parameter_bindings, &warp_deformers, &rotation_deformers, &drawables)?;
         let keyforms = read_keyforms(bytes, &sections, &warp_deformers, &drawables)?;
 
+        // A model that predates these sections, or one whose layout moved them,
+        // is read without them rather than refused: a drawn model missing its
+        // opacity track is worth more than no model at all, and the absence is
+        // visible as an empty vector rather than as silently opaque data.
+        let drawable_keyform_count = keyforms.drawable_offsets.len() as u32;
+        let optional = |index: usize, what: &str| -> Vec<f32> {
+            read_floats(bytes, &sections, index, drawable_keyform_count, what).unwrap_or_default()
+        };
+        let drawable_keyform_opacities = optional(section::DRAWABLE_KEYFORM_OPACITY, "drawable opacity");
+        let drawable_keyform_draw_orders = optional(section::DRAWABLE_KEYFORM_DRAW_ORDER, "drawable draw order");
+
         Ok(Moc3 {
             version,
             counts,
@@ -511,6 +545,8 @@ impl Moc3 {
             parameter_bindings,
             keyform_bindings,
             keyforms,
+            drawable_keyform_opacities,
+            drawable_keyform_draw_orders,
             sections,
         })
     }
@@ -1330,6 +1366,9 @@ pub(crate) mod tests {
         deformers: Vec<&'static str>,
         warp_divisions: (u32, u32),
         version: u8,
+        /// Opacity of each drawable keyform, or none to omit the section the
+        /// way an older model does.
+        opacities: Option<Vec<f32>>,
     }
 
     impl Builder {
@@ -1341,7 +1380,14 @@ pub(crate) mod tests {
                 deformers: vec!["Rotation1", "Warp1"],
                 warp_divisions: (1, 1),
                 version: 2,
+                opacities: None,
             }
+        }
+
+        /// Gives every drawable keyform an opacity, in keyform order.
+        pub(crate) fn opacities(mut self, values: &[f32]) -> Self {
+            self.opacities = Some(values.to_vec());
+            self
         }
 
         /// A non-square grid, for tests where rows and columns must differ.
@@ -1522,6 +1568,18 @@ pub(crate) mod tests {
             }
             let pool_bytes: Vec<u8> = pool.iter().flat_map(|v| v.to_le_bytes()).collect();
             offsets[section::KEYFORM_POSITIONS] = place(&mut body, &pool_bytes);
+
+            if let Some(values) = &self.opacities {
+                let mut opacity = vec![1.0f32; d * per_element];
+                for (slot, v) in opacity.iter_mut().zip(values) {
+                    *slot = *v;
+                }
+                let bytes: Vec<u8> = opacity.iter().flat_map(|v| v.to_le_bytes()).collect();
+                offsets[section::DRAWABLE_KEYFORM_OPACITY] = place(&mut body, &bytes);
+                let orders: Vec<u8> =
+                    std::iter::repeat_n(510.0f32, d * per_element).flat_map(|v| v.to_le_bytes()).collect();
+                offsets[section::DRAWABLE_KEYFORM_DRAW_ORDER] = place(&mut body, &orders);
+            }
 
             counts[count::DEFORMERS] = (warps + rotations) as u32;
             counts[count::WARP_DEFORMERS] = warps as u32;

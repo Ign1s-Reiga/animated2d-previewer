@@ -22,6 +22,15 @@ impl Moc3 {
     pub fn emit(&self, pose: &Pose, texture: TextureId, out: &mut RenderList) {
         // Drawables are listed in model order but drawn in draw order, so a
         // stable sort of one against the other gives the sequence to emit.
+        //
+        // This is the *render* order -- the resolved back-to-front sequence,
+        // which arrives as a permutation of the drawables. It is not the same
+        // thing as [`Pose::draw_orders`], the artist's per-drawable value that
+        // Cubism animates: turning those into a render order needs the part
+        // tree, which is not decoded, and the two disagree on 567 of 568
+        // drawables in one real model. Sorting by the wrong one would reshuffle
+        // the whole character, so the resolved order is what is used until the
+        // part tree can be read.
         let mut order: Vec<usize> = (0..self.drawables.len()).collect();
         order.sort_by_key(|i| self.drawables[*i].draw_order);
 
@@ -32,12 +41,21 @@ impl Moc3 {
                 continue;
             }
 
+            // A fully transparent drawable is not drawn at all. Cubism hides
+            // parts this way -- a closed-eye variant sits on top of the open one
+            // at zero opacity -- so painting them opaque covers what should show
+            // through, which is worse than drawing nothing.
+            let opacity = pose.opacities.get(index).copied().unwrap_or(1.0);
+            if opacity <= 1.0 / 512.0 {
+                continue;
+            }
+
             let mut mesh = out.take_mesh();
             mesh.vertices.extend(points.iter().map(|(x, y)| Vec2::new(*x, *y)));
             mesh.uvs.extend(drawable.uvs.iter().map(|(u, v)| Vec2::new(*u, *v)));
             mesh.indices.extend_from_slice(&drawable.indices);
             mesh.texture = texture;
-            mesh.color = Rgba::WHITE;
+            mesh.color = Rgba::new(1.0, 1.0, 1.0, opacity);
             mesh.z_order = z as u32;
             if mesh.is_well_formed() {
                 out.push_mesh(mesh);
@@ -72,6 +90,26 @@ impl Moc3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opacity_reaches_the_mesh_and_a_transparent_drawable_is_not_drawn() {
+        // Cubism hides a part by taking it to zero opacity rather than by
+        // removing it, so drawing one opaque covers what should show through.
+        let bytes = crate::moc3::tests::Builder::new().opacities(&[0.5, 0.5, 0.5]).build();
+        let moc = Moc3::parse(&bytes).expect("should parse");
+        let pose = moc.pose(&[]);
+        let mut list = RenderList::new();
+        moc.emit(&pose, TextureId(0), &mut list);
+        assert_eq!(list.meshes().len(), 1);
+        assert!((list.meshes()[0].color.a - 0.5).abs() < 1e-5, "{:?}", list.meshes()[0].color);
+
+        let bytes = crate::moc3::tests::Builder::new().opacities(&[0.0, 0.0, 0.0]).build();
+        let moc = Moc3::parse(&bytes).expect("should parse");
+        let pose = moc.pose(&[]);
+        let mut list = RenderList::new();
+        moc.emit(&pose, TextureId(0), &mut list);
+        assert!(list.meshes().is_empty(), "a fully transparent drawable should not be emitted");
+    }
 
     #[test]
     fn a_posed_model_emits_one_mesh_per_drawable() {
