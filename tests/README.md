@@ -34,6 +34,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | GPU | `crates/a2d-render/tests/render.rs` | clear, tint, blend modes, draw order, stencil clipping, read-back, buffer growth — all against real pixels |
 | Visual regression | `crates/a2d-cli/tests/visual.rs` | fixed timestamps rendered through the whole stack; determinism and movement |
 | Real-asset | `crates/a2d-unity/tests/real_bundle.rs`, `crates/a2d-cli/tests/{unity_inspect,real_moc3}.rs` | a real Unity bundle parses, every object is addressable, the inventory holds what §12 asks for, and the MOC3 inside it reads with sane identifiers and parameter ranges — `#[ignore]`, gated on `A2D_FIXTURE_CUBISM` |
+| Cubism assembly | `crates/a2d-cli/tests/cubism_orientation.rs` | a posed model is coherent — its pupil axes stay square and right-handed — and fits its canvas once un-zoomed; asserted from Cubism's conventional parameter meanings rather than from a reference image — `#[ignore]`, gated on `A2D_FIXTURE_CUBISM` |
 | Constraint geometry | `crates/a2d-runtime/src/spine/pose.rs` | IK, the four transform-constraint modes, and path constraints against hand-computed geometry — a straight path and a square one have exactly known arc lengths |
 | Viewer behaviour | `crates/a2d-desktop/src/{config,state,tray}.rs` | config persistence and clamping, drag/scale/selection, tray id mapping — all without opening a window |
 | Subprocess | `crates/a2d-cli/tests/viewer_process.rs` | the real binary opens a window, presents frames, and writes settings on the way out |
@@ -65,7 +66,7 @@ Document each new variable in the table below.
 | `A2D_REQUIRE_GPU` | any value; turns a missing-GPU skip into a failure | every GPU test |
 | `A2D_BASELINE_DIR` | a directory of baseline frames | `a2d-cli --test visual` |
 | `A2D_CONFIG_DIR` | a directory to keep `config.json` in, instead of the per-user one | the viewer; `a2d-cli --test viewer_process` |
-| `A2D_FIXTURE_CUBISM` | a Unity AssetBundle holding a Cubism model | `a2d-unity --test real_bundle`, `a2d-cli --test unity_inspect` |
+| `A2D_FIXTURE_CUBISM` | a Unity AssetBundle holding a Cubism model | `a2d-unity --test real_bundle`, `a2d-cli --test {unity_inspect,real_moc3,cubism_orientation}` |
 
 ## Visual regression
 
@@ -96,6 +97,36 @@ A2D_BASELINE_DIR=tests/fixtures/local/baseline cargo test -p a2d-cli --test visu
 ```
 
 Delete a baseline file to re-record it.
+
+## Whether a Cubism model is assembled coherently
+
+A model can parse cleanly, pose with no unstable drawable, and still come out
+mirrored, sheared, or several times too large. Nothing structural notices, and
+there is no reference image to compare against.
+
+Cubism's parameter names are conventional, which is the way in: `ParamEyeBallX`
+slides the pupils left and right, `ParamEyeBallY` up and down. The tempting
+assertion — that the first must therefore move them along the screen's x axis —
+is wrong, because it only holds for a character drawn upright. Measured across
+three real models the pupil axes came out at 0, -60 and -95 degrees, every one
+of them with total agreement between drawables. That is artwork, not error: a
+reclining character is drawn reclining.
+
+What holds regardless of the pose is that the two axes stay **perpendicular and
+right-handed**. A chain that transposed a warp grid, mirrored a deformer or
+sheared a rotation breaks that; a tilted head does not.
+
+Size is checked separately, and needed its own discovery. A model's stored
+parameter defaults are not necessarily its display values: one of the three
+ships a zoom parameter defaulted to 8 of 10, which scales the whole model by
+about five and makes an ordinary canvas-wide backdrop measure four and a half
+canvases across. Winding the parameters that drive the root deformer back to
+their minimum gives the widest view, and there every model sits inside its own
+canvas.
+
+```bash
+A2D_FIXTURE_CUBISM=tests/fixtures/local/bundle cargo test -p a2d-cli --test cubism_orientation -- --ignored
+```
 
 ## The window
 

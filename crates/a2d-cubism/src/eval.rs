@@ -52,14 +52,22 @@
 //! # How well it works, measured
 //!
 //! Across six models from the same source, **2130 of 2131 drawables pose
-//! inside their own canvas**, and five of the six place every drawable. The
-//! one that remains is a single four-vertex sheet nearly three canvases wide
-//! whose chain holds no warp deformer at all — a backdrop that genuinely
-//! overhangs its frame, not a chain defect. On the model this was developed
-//! against the posed extent is 1.24 by 1.12 against a canvas of 0.94 by 1.66 —
-//! a character occupying its frame rather than merely a finite result. No
-//! chain produces anything unusable, so [`Pose::unstable`] is empty on all
-//! six.
+//! inside their own canvas**, and five of the six place every drawable. On the
+//! model this was developed against the posed extent is 1.24 by 1.12 against a
+//! canvas of 0.94 by 1.66 — a character occupying its frame rather than merely
+//! a finite result. No chain produces anything unusable, so [`Pose::unstable`]
+//! is empty on all six.
+//!
+//! The sixth model, whose drawables measured up to four and a half canvases
+//! across, turned out not to be a chain defect either. Its root deformer is
+//! driven by a zoom parameter running 0 to 10 whose *stored default is 8*,
+//! which scales the whole model by about five. Wound back to 0 the model
+//! measures 0.91 by 0.96 against a canvas of 1.00 by 1.35, and the sheet that
+//! read as an impossible backdrop is an ordinary canvas-wide one. The lesson
+//! generalises: **a MOC3's stored parameter defaults are not necessarily the
+//! values it is displayed at.** The display values live on the Unity side, one
+//! `CubismParameter` component per parameter, and recovering them belongs to
+//! the importer.
 //!
 //! Two further things support the composition independently. A warp's child
 //! space really is normalised: drawables under a warp carry coordinates near
@@ -74,6 +82,15 @@
 //! reclining figure under a pine branch in one, a character on a swing in
 //! another. Each drawable is well formed and correctly textured, and the parts
 //! sit where a scene needs them.
+//!
+//! One measurement is worth more than the impression. Sweeping `ParamEyeBallX`
+//! and `ParamEyeBallY` and taking the direction each moves the pupils gives two
+//! axes that come out **perpendicular and right-handed** in every model, with
+//! the responding drawables in total agreement. A chain that transposed a grid,
+//! mirrored a warp or sheared a rotation could not do that. Their absolute
+//! angle varies between models — 0, -60 and -95 degrees — which is head tilt in
+//! the artwork rather than error, and is why the assertion is on the pair
+//! rather than on either one alone.
 //!
 //! Two things about that are worth more than the picture itself. A model and
 //! its own low-detail variant -- separately authored rigs, 101 drawables
