@@ -246,15 +246,20 @@ const EXPORT_SIZE: u32 = 512;
 /// The package pipeline does not reach Cubism yet, so this goes from bundle to
 /// pixels directly. It exists to answer one question -- does the model come out
 /// looking like the character -- which nothing structural can answer.
-fn render_cubism_bundle(out: &mut dyn std::io::Write, bytes: &[u8], frames_dir: &Path) -> Result<(), CliError> {
-    let mut report = LoadReport::new();
-    let inventory = a2d_import::inspect_bundle(bytes, &mut report)?;
-    let moc_bytes = inventory
+/// Pulls the Cubism model and its atlas out of a Unity bundle.
+///
+/// Both the frame export and the window need exactly this, and doing it in one
+/// place is what keeps them showing the same thing.
+fn cubism_from_bundle(
+    bytes: &[u8],
+    report: &mut LoadReport,
+) -> Result<(String, a2d_cubism::Moc3, Vec<a2d_unity::Texture>), CliError> {
+    let inventory = a2d_import::inspect_bundle(bytes, report)?;
+    let moc = inventory
         .moc
         .as_ref()
-        .map(|m| m.bytes.clone())
         .ok_or_else(|| DecodeError::UnsupportedFormat("this bundle holds no Cubism model".into()))?;
-    let model = a2d_cubism::Moc3::parse(&moc_bytes)?;
+    let model = a2d_cubism::Moc3::parse(&moc.bytes)?;
 
     let bundle = a2d_unity::Bundle::parse(bytes)?;
     let node = bundle
@@ -264,6 +269,79 @@ fn render_cubism_bundle(out: &mut dyn std::io::Write, bytes: &[u8], frames_dir: 
         .ok_or_else(|| DecodeError::UnsupportedFormat("the bundle holds no serialized file".into()))?;
     let file = a2d_unity::SerializedFile::parse(bundle.node_data(node)?)?;
     let textures = a2d_unity::read_textures(&file)?;
+    Ok((moc.name.clone(), model, textures))
+}
+
+/// Opens a Cubism model from a Unity bundle in the desktop window.
+///
+/// `a2d-desktop` cannot read a bundle -- the importers are above it in the
+/// dependency order (spec §3) -- so the model is decoded here and handed over
+/// behind the shared interface, which is the whole point of that interface.
+fn open_cubism_viewer(
+    out: &mut dyn std::io::Write,
+    path: &Path,
+    bytes: &[u8],
+    exit_after: Option<Duration>,
+) -> Result<(), CliError> {
+    let mut report = LoadReport::new();
+    let (name, moc, textures) = cubism_from_bundle(bytes, &mut report)?;
+
+    writeln!(out, "Model:     {} drawables, {} parameters", moc.drawables.len(), moc.parameters.len())?;
+
+    // Every drawable samples page zero; a model needing more would need the per
+    // drawable texture index, which is not decoded yet.
+    let mut pages = Vec::new();
+    match textures.into_iter().next() {
+        Some(t) => {
+            writeln!(out, "Texture:   {} {}x{}", t.name, t.width, t.height)?;
+            let image = Rgba8Image { width: t.width, height: t.height, pixels: t.rgba };
+            // Cubism atlases are straight alpha, not premultiplied.
+            pages.push((t.name, Some(image), false, Default::default()));
+        }
+        None => {
+            report.note("the bundle holds no texture; a placeholder is drawn instead");
+            pages.push(("missing".to_string(), None, false, Default::default()));
+        }
+    }
+
+    let model = a2d_cubism::GenericCubismModel::load(moc, name);
+    if !model.unstable().is_empty() {
+        report.note(format!("{} drawable(s) could not be posed and are drawn undeformed", model.unstable().len()));
+    }
+    let loaded = a2d_desktop::LoadedModel::from_parts(path, Box::new(model), pages, &mut report);
+
+    writeln!(
+        out,
+        "
+Opening {} in the desktop viewer.",
+        path.display()
+    )?;
+    writeln!(out, "  drag to move, scroll to scale, Space pauses, Esc quits.")?;
+    if let Some(after) = exit_after {
+        writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;
+    }
+    writeln!(out)?;
+
+    // No packages: the remembered list would otherwise open a Spine model too.
+    let options = a2d_desktop::RunOptions { packages: Vec::new(), exit_after };
+    let result = a2d_desktop::run_with(options, vec![loaded], &mut report);
+    print_report(out, &report)?;
+
+    let summary = result?;
+    writeln!(
+        out,
+        "
+Presented {} frames in {:.1}s ({:.0} fps).",
+        summary.frames,
+        summary.elapsed.as_secs_f32(),
+        summary.frames as f32 / summary.elapsed.as_secs_f32().max(f32::MIN_POSITIVE)
+    )?;
+    Ok(())
+}
+
+fn render_cubism_bundle(out: &mut dyn std::io::Write, bytes: &[u8], frames_dir: &Path) -> Result<(), CliError> {
+    let mut report = LoadReport::new();
+    let (_, model, textures) = cubism_from_bundle(bytes, &mut report)?;
 
     let pose = model.pose(&[]);
     writeln!(out, "Model:     {} drawables, {} parameters", model.drawables.len(), model.parameters.len())?;
@@ -336,14 +414,11 @@ pub fn preview(
     // A Unity bundle is not a package, but it is what a Cubism model arrives
     // in, so `preview` opens one directly rather than refusing.
     if let Some(bytes) = unity_bundle_bytes(package_dir) {
-        let Some(frames) = frames_dir else {
-            return Err(DecodeError::UnsupportedFormat(
-                "rendering a Unity bundle needs -o <dir> to write the frame into".into(),
-            )
-            .into());
-        };
         writeln!(out, "Input:     {}", package_dir.display())?;
-        return render_cubism_bundle(out, &bytes, frames);
+        return match frames_dir {
+            Some(frames) => render_cubism_bundle(out, &bytes, frames),
+            None => open_cubism_viewer(out, package_dir, &bytes, exit_after),
+        };
     }
 
     match frames_dir {
