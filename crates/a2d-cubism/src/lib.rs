@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod emit;
 pub mod eval;
 pub mod moc3;
 

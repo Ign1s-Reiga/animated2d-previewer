@@ -123,6 +123,8 @@ mod section {
     pub const ROTATION_KEYFORM_BEGIN: usize = 26;
     pub const ROTATION_KEYFORM_COUNT: usize = 27;
 
+    /// Order the drawables are painted in, back to front.
+    pub const DRAWABLE_DRAW_ORDER: usize = 87;
     pub const DRAWABLE_KEYFORM_BINDING: usize = 34;
     pub const DRAWABLE_KEYFORM_BEGIN: usize = 35;
     pub const DRAWABLE_KEYFORM_COUNT: usize = 36;
@@ -230,6 +232,12 @@ pub struct Drawable {
     pub uvs: Vec<(f32, f32)>,
     /// Triangle indices, local to this drawable's own vertices.
     pub indices: Vec<u16>,
+    /// Where this drawable sits back to front. Lower is drawn first.
+    ///
+    /// A permutation of the drawables in five of the six models checked; in the
+    /// sixth it repeats, so it is treated as a sort key rather than an index
+    /// and ties fall back to model order.
+    pub draw_order: u32,
     /// This drawable's own keyforms, as a range in the drawable keyform list.
     pub keyform_begin: u32,
     pub keyform_count: u32,
@@ -682,6 +690,7 @@ fn read_drawables(
     };
 
     let parents = u32s(section::DRAWABLE_PARENT_DEFORMERS, "drawable parent")?;
+    let draw_order = u32s(section::DRAWABLE_DRAW_ORDER, "drawable draw order")?;
     let keyform_binding = u32s(section::DRAWABLE_KEYFORM_BINDING, "drawable keyform binding")?;
     let keyform_begin = u32s(section::DRAWABLE_KEYFORM_BEGIN, "drawable keyform begin")?;
     let keyform_count = u32s(section::DRAWABLE_KEYFORM_COUNT, "drawable keyform count")?;
@@ -767,6 +776,7 @@ fn read_drawables(
         out.push(Drawable {
             id: ids.get(i).cloned().unwrap_or_default(),
             parent_deformer: parents[i],
+            draw_order: draw_order[i],
             uvs,
             indices,
             keyform_begin: keyform_begin[i],
@@ -1441,6 +1451,8 @@ pub(crate) mod tests {
 
             // --- drawables ------------------------------------------------
             let d_begin: Vec<u32> = (0..d).map(|i| (i * per_element) as u32).collect();
+            offsets[section::DRAWABLE_DRAW_ORDER] =
+                place(&mut body, &u32_array(&(0..d as u32).rev().collect::<Vec<_>>()));
             offsets[section::DRAWABLE_KEYFORM_BINDING] = place(&mut body, &u32_array(&vec![0u32; d]));
             offsets[section::DRAWABLE_KEYFORM_BEGIN] = place(&mut body, &u32_array(&d_begin));
             offsets[section::DRAWABLE_KEYFORM_COUNT] = place(&mut body, &u32_array(&vec![per_element as u32; d]));

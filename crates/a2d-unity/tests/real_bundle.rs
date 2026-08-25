@@ -123,3 +123,49 @@ fn a_cubism_bundle_carries_a_moc_a_texture_and_motions() {
     println!("textures: {:?}", textures.iter().map(|t| &t.name).collect::<Vec<_>>());
     println!("clips: {:?}", clips.iter().map(|c| &c.name).collect::<Vec<_>>());
 }
+
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Unity AssetBundle"]
+fn a_real_texture_decodes_and_can_be_checked_against_another_reader() {
+    // Block-compressed formats are the kind of thing that decodes to something
+    // plausible while being wrong, so the test prints a digest of the pixels.
+    // Comparing it against an independent reader is what settles correctness;
+    // the assertions here only cover what can be checked from inside.
+    let Some((_, file)) = open() else { return };
+    let textures = a2d_unity::read_textures(&file).expect("textures should decode");
+    assert!(!textures.is_empty(), "a Cubism model needs a texture");
+
+    for t in &textures {
+        assert_eq!(t.rgba.len(), t.width as usize * t.height as usize * 4);
+        // A character page is neither blank nor fully opaque; both would mean a
+        // decode that produced structure-free output.
+        let opaque = t.rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
+        let clear = t.rgba.chunks_exact(4).filter(|p| p[3] == 0).count();
+        let total = t.rgba.len() / 4;
+        assert!(opaque > 0 && clear > 0, "{}: alpha is uniform, which no character page is", t.name);
+        assert!(opaque < total, "{}: nothing is transparent", t.name);
+
+        // Optional raw dump, so the pixels can be diffed against another
+        // decoder without this crate taking an image dependency.
+        if let Ok(dir) = std::env::var("A2D_DUMP_TEXTURE") {
+            let path = std::path::Path::new(&dir).join(format!("{}.rgba", t.name));
+            std::fs::write(&path, &t.rgba).expect("dump should be writable");
+            println!("dumped {} ({}x{})", path.display(), t.width, t.height);
+        }
+
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in &t.rgba {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        println!(
+            "{} {}x{} {:?}  opaque {:.1}%  clear {:.1}%  fnv1a {hash:016x}",
+            t.name,
+            t.width,
+            t.height,
+            t.format,
+            opaque as f64 * 100.0 / total as f64,
+            clear as f64 * 100.0 / total as f64
+        );
+    }
+}

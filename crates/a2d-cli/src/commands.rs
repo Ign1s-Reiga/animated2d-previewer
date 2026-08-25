@@ -8,12 +8,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use a2d_core::{AnimatedModel, DecodeError, LoadReport, RuntimeError};
+use a2d_core::{AnimatedModel, DecodeError, LoadReport, RenderList, Rgba, RuntimeError};
 use a2d_desktop::{LoadedModel, Viewer, ViewerError};
 use a2d_import::games::{self, Importer};
 use a2d_import::generic;
 use a2d_pack::Package;
-use a2d_render::{GpuContext, OffscreenTarget, RenderError, Viewport};
+use a2d_render::{Camera, FrameSettings, GpuContext, OffscreenTarget, RenderError, Renderer, Rgba8Image, Viewport};
 use a2d_runtime::GenericSpineModel;
 
 /// Anything a command can fail with.
@@ -241,12 +241,111 @@ const EXPORT_SIZE: u32 = 512;
 /// Without `-o`, opens the package in the desktop viewer (spec §14). With `-o`,
 /// renders the regression timestamps offscreen and writes them as PNGs, which
 /// is what a machine with no display or no compositor can still do.
+/// Renders a Cubism model straight out of a Unity bundle.
+///
+/// The package pipeline does not reach Cubism yet, so this goes from bundle to
+/// pixels directly. It exists to answer one question -- does the model come out
+/// looking like the character -- which nothing structural can answer.
+fn render_cubism_bundle(out: &mut dyn std::io::Write, bytes: &[u8], frames_dir: &Path) -> Result<(), CliError> {
+    let mut report = LoadReport::new();
+    let inventory = a2d_import::inspect_bundle(bytes, &mut report)?;
+    let moc_bytes = inventory
+        .moc
+        .as_ref()
+        .map(|m| m.bytes.clone())
+        .ok_or_else(|| DecodeError::UnsupportedFormat("this bundle holds no Cubism model".into()))?;
+    let model = a2d_cubism::Moc3::parse(&moc_bytes)?;
+
+    let bundle = a2d_unity::Bundle::parse(bytes)?;
+    let node = bundle
+        .nodes
+        .iter()
+        .find(|n| n.is_serialized())
+        .ok_or_else(|| DecodeError::UnsupportedFormat("the bundle holds no serialized file".into()))?;
+    let file = a2d_unity::SerializedFile::parse(bundle.node_data(node)?)?;
+    let textures = a2d_unity::read_textures(&file)?;
+
+    let pose = model.pose(&[]);
+    writeln!(out, "Model:     {} drawables, {} parameters", model.drawables.len(), model.parameters.len())?;
+    if !pose.is_stable() {
+        writeln!(out, "  note: {} drawable(s) could not be posed", pose.unstable.len())?;
+    }
+
+    let mut list = RenderList::new();
+    model.emit(&pose, a2d_core::TextureId(0), &mut list);
+    writeln!(out, "Meshes:    {}", list.meshes().len())?;
+
+    let gpu = GpuContext::headless()?;
+    writeln!(out, "GPU:       {} ({})", gpu.adapter_name, gpu.backend)?;
+    let mut renderer = Renderer::new(gpu.clone());
+    match textures.first() {
+        Some(t) => {
+            writeln!(out, "Texture:   {} {}x{} {:?}", t.name, t.width, t.height, t.format)?;
+            let image = Rgba8Image { width: t.width, height: t.height, pixels: t.rgba.clone() };
+            // Cubism atlases are straight alpha, not premultiplied.
+            let id = renderer.textures_mut().upload(&gpu, &t.name, &image, false, Default::default())?;
+            debug_assert_eq!(id, a2d_core::TextureId(0), "the first upload takes slot zero");
+        }
+        None => {
+            writeln!(out, "Texture:   none; drawing untextured")?;
+            renderer.textures_mut().install_fallback(&gpu)?;
+        }
+    }
+
+    let target = OffscreenTarget::new(&gpu, EXPORT_SIZE, EXPORT_SIZE)?;
+    let viewport = Viewport::new(EXPORT_SIZE, EXPORT_SIZE);
+
+    // Frame by the canvas, not by the posed bounds. A single drawable that
+    // poses wrongly would otherwise dominate the fit and shrink the character
+    // to nothing, which is exactly what happened first time round.
+    let canvas = model.canvas;
+    let (half_w, half_h) = (canvas.size.0 / canvas.pixels_per_unit * 0.5, canvas.size.1 / canvas.pixels_per_unit * 0.5);
+    let mut frame = a2d_core::Aabb::EMPTY;
+    frame.extend(a2d_core::Vec2::new(-half_w, -half_h));
+    frame.extend(a2d_core::Vec2::new(half_w, half_h));
+    if let Some((lo, hi)) = model.bounds(&pose) {
+        writeln!(out, "Bounds:    x {:.3}..{:.3}  y {:.3}..{:.3}", lo.x, hi.x, lo.y, hi.y)?;
+    }
+    writeln!(out, "Canvas:    {:.3} x {:.3} units", half_w * 2.0, half_h * 2.0)?;
+    let camera = Camera::fit(frame, viewport, 0.04);
+
+    let settings = FrameSettings::new(viewport, camera).with_clear_color(Rgba::new(0.0, 0.0, 0.0, 0.0));
+    let stats = renderer.render(target.view(), target.format(), settings, &list)?;
+    let image = target.read_pixels(&gpu)?;
+
+    std::fs::create_dir_all(frames_dir)
+        .map_err(|e| DecodeError::corrupt(format!("could not create {}: {e}", frames_dir.display())))?;
+    let path = frames_dir.join("pose.png");
+    let png = a2d_render::encode_png(&image)?;
+    std::fs::write(&path, png).map_err(|e| DecodeError::corrupt(format!("could not write {}: {e}", path.display())))?;
+
+    let covered = image.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+    writeln!(out, "Wrote:     {}", path.display())?;
+    writeln!(out, "Draws:     {} calls, {} triangles", stats.draw_calls, stats.triangles)?;
+    writeln!(out, "Coverage:  {:.1}% of the frame", covered as f64 * 100.0 / (EXPORT_SIZE * EXPORT_SIZE) as f64)?;
+    print_report(out, &report)?;
+    Ok(())
+}
+
 pub fn preview(
     out: &mut dyn std::io::Write,
     package_dir: &Path,
     frames_dir: Option<&Path>,
     exit_after: Option<Duration>,
 ) -> Result<(), CliError> {
+    // A Unity bundle is not a package, but it is what a Cubism model arrives
+    // in, so `preview` opens one directly rather than refusing.
+    if let Some(bytes) = unity_bundle_bytes(package_dir) {
+        let Some(frames) = frames_dir else {
+            return Err(DecodeError::UnsupportedFormat(
+                "rendering a Unity bundle needs -o <dir> to write the frame into".into(),
+            )
+            .into());
+        };
+        writeln!(out, "Input:     {}", package_dir.display())?;
+        return render_cubism_bundle(out, &bytes, frames);
+    }
+
     match frames_dir {
         Some(dir) => export_frames(out, package_dir, dir),
         None => open_viewer(out, package_dir, exit_after),

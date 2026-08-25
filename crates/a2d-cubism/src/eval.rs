@@ -78,9 +78,13 @@
 //! The assumptions that a render would settle, and their symptoms:
 //!
 //! 1. **Keyform ordering.** An element's keyforms form a grid with one axis per
-//!    parameter, and this takes the last axis as varying fastest. If that is
-//!    backwards, single-parameter elements still pose correctly and
-//!    multi-parameter ones do not.
+//!    parameter, and this takes the last axis as varying fastest. Reversing it
+//!    was tried and is worse: on the six models it drops 2130 drawables inside
+//!    their canvas to 1990, so the current reading is not merely untested. It
+//!    is not *confirmed* either — a smoothness argument over the keyform grid
+//!    appeared to favour the reverse until it turned out to be confounded,
+//!    because unequal axis lengths give the two reshapes different numbers of
+//!    neighbour pairs and so incomparable totals.
 //! 2. **Rotation composition.** Applied as
 //!    `origin + rotate(angle) * scale * p / unit`.
 
