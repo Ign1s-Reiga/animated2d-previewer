@@ -67,7 +67,7 @@ used by the parser:
 | 35 | drawable keyform begin | | 77 | parameter keys |
 | 36 | drawable keyform count | | 78 | vertex UVs |
 | 40 | drawable parent deformer | | 79 | vertex indices |
-| 43 | drawable vertex counts | | 87 | drawable draw order |
+| 43 | drawable vertex counts | | 87 | the paint sequence |
 | 44 | drawable vertex offsets (floats) | | 90 | glue ids |
 | 45 | drawable index offsets | | | |
 | 46 | drawable index counts | | | |
@@ -267,51 +267,45 @@ removing it, so a decoder that paints every drawable opaque covers whatever
 should have shown through. A fully transparent drawable is not emitted at all.
 
 **Draw order** (section 69) runs 499 to 1000 about a resting 510. This is the
-artist's per-drawable value, and it is **not** the same thing as the resolved
-back-to-front sequence in section 87: the two disagree on 567 of 568 drawables
-in one real model. Turning draw orders into a render order needs the part tree,
-so section 87 is what the emitter sorts by, and section 69 is decoded and
-carried but not yet used.
+artist's per-drawable value, and it is **not** the resolved back-to-front
+sequence — that is section 87, and turning draw orders into one would need the
+part tree. Section 58 holds a per-part draw order on the same 0-to-1000 scale,
+but it is 500 for all but three parts on the model measured, so it separates
+nothing. Section 69 is therefore decoded and carried but not yet used.
 
-That distinction has a visible consequence. On one model the eyes do not
-appear, and the reason is not that the meshes are absent: all 28 are present,
-correctly placed, at full opacity, and named `eye_r01`, `eyelash_down_r03`,
-`eyelids_r02` and so on. Chasing it down produced three findings, only one of
-which is fixed.
+### Section 87 is a sequence, not a key
 
-**Fixed: the eyes were unclipped.** `eye_r01` and `eye_r02` -- an iris and a
-highlight -- each declare one mask, and it is `eye_r03`, their own eye white.
-Masks are now read and emitted, and the irises clip correctly.
+Slot `k` names the drawable painted `k`-th. It is *not* a per-drawable value
+saying where each one sits — that reading is the inverse permutation.
 
-**Not fixed: the face skin draws in front of them.** `face_02` is a solid mesh
-whose atlas region is 68% opaque, and section 87 puts it at 534 against eye
-meshes at 519 to 526. Suppressing that one mesh reveals the eyes immediately.
+The inverse is dangerously plausible. It is still a permutation, it still paints
+every drawable exactly once, and the result still looks broadly like the
+character. What it does is scatter the paint order locally: on one model it put
+the face's skin (`face_02`) over the eyes, which is why that model rendered with
+a blank face, and it ordered one eye's lashes behind its own eye while the other
+eye's sat in front — an asymmetry that no coherent order would produce, and the
+clue that the reading was wrong rather than the data.
 
-Section 87 is the only permutation of the drawables in the whole file, so there
-is no other candidate for a render order, and it is not internally coherent: the
-right eye's lashes sit at 509 to 513, *behind* that eye at 519 to 521, while the
-left eye's sit at 527 to 533, in front of its own. So the resolved order must be
-computed rather than read. In Cubism that computation involves the part tree,
-but the part sections carry no ordering: sorting part-major by part index does
-better on hand-written ordering rules than section 87 does (6 of 8 against 5 of
-8) and is still wrong, and no per-part section holds an order. **This is
-unsolved.**
+The fixture pins the direction with a *rotation* rather than a reversal,
+because a reversal is its own inverse and could not tell the two apart.
 
-**Fixed: the whole model was assembled transposed.** The facial meshes ran
-brow-to-mouth along `x` and separated right-from-left along `y` — the face's own
-vertical lying along the screen's horizontal. It was not a rotation but a
-*mirror*, and it applied to the entire rig, not the head: measured on the ears,
-hands, chest and torso, every frame came out left-handed the same way. The cause
-is the file's axis order (§3), and correcting that puts the face upright and
-right-handed and takes uv agreement from 1% to 99%.
+A model whose table repeats an entry rather than permuting cleanly — one of the
+six does — has the unnamed drawables appended in model order, so nothing goes
+unpainted.
 
-Worth recording is that the parameter measurements were a red herring throughout.
-They are carried through the same deformer chain as the geometry, so they cannot
-witness against it, and they are not even uniform across rigs: one model moves
-its pupils vertically for `ParamEyeBallX` while its face is plainly upright.
-Reasoning from them produced two wrong conclusions — first "a quarter turn",
-then "the head alone" — before the texture coordinates settled it in one
-measurement.
+### Why the eyes were invisible
+
+Three separate problems, all now fixed, and each hid the next:
+
+1. the whole model was assembled transposed (§3), so nothing was where it looked;
+2. the irises were unclipped, drawing their full quads rather than being cut to
+   their own eye whites (sections 47, 48 and 80);
+3. section 87 was read as a key rather than a sequence, painting the face skin
+   over the eyes.
+
+Only the third was visible as "no eyes". The first was mistaken for a head
+rotation and the second for the cause of the third, which is why they were
+untangled in the wrong order.
 
 ## 7. How correctness is judged without a reference runtime
 
@@ -362,9 +356,11 @@ These are `crates/a2d-cli/tests/cubism_orientation.rs`, gated on
   model poses and draws but does not play its own animation.
 - **Physics, pose files, expressions, hit areas.** All live outside the MOC3 and
   are not read.
-- **Render order.** Section 87 places the face skin in front of the eyes and
-  orders the two eyes' lashes inconsistently with each other. No section holds a
-  part order, and part-major sorting does not fix it either. See §6.
+- **Animated draw order.** Section 69 is decoded but unused: turning the
+  artist's per-drawable values into a render order needs the part tree, and the
+  per-part orders in section 58 are equal on every model measured. The setup
+  sequence in section 87 is used instead, so a model that reorders during an
+  animation will not.
 - **Multiple texture pages.** Section 41 gives each drawable a texture index and
   is read, but the emitter still puts every mesh on one page, because nothing
   loads a second one yet. It is all zero on every model seen.
