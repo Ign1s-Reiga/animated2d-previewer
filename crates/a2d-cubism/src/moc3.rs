@@ -34,6 +34,11 @@
 //!   every one of the 9554 stored offsets exactly and ends precisely on the
 //!   declared total. A wrong padding rule or a wrong ordering would miss on the
 //!   very first deformer.
+//! * The warp grid orientation — which division count is columns — was settled
+//!   by reading every non-square grid in six models both ways: with
+//!   `divisions.1 + 1` points to a row, 713 of 729 grids are perfectly
+//!   monotone lattices; the other reading interleaves rows and makes not one
+//!   of them monotone. See [`WarpDeformer::divisions`].
 //!
 //! # What is missing
 //!
@@ -304,8 +309,16 @@ pub struct RotationKeyform {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WarpDeformer {
     pub id: String,
-    /// Grid divisions. Which is rows and which is columns cannot be told apart
-    /// from the file, and nothing here needs to, so neither is claimed.
+    /// Grid divisions: `.0` down the grid's y axis, `.1` across its x axis.
+    ///
+    /// The stored lattice is row-major with `divisions.1 + 1` points to a row,
+    /// and x runs along a row. The layout alone could not tell the two counts
+    /// apart; reading every non-square grid in six real models both ways did.
+    /// Read this way, 713 of 729 such grids are perfectly monotone — x
+    /// increasing along every row, y along every column — and most of the rest
+    /// are coherently mirrored rather than scrambled. Read with
+    /// `divisions.0 + 1` points to a row instead, the rows interleave and not
+    /// one grid is monotone.
     pub divisions: (u32, u32),
     /// Control point count, always `(a + 1) * (b + 1)`.
     pub point_count: u32,
@@ -1305,6 +1318,7 @@ pub(crate) mod tests {
         drawables: Vec<&'static str>,
         parameters: Vec<(&'static str, f32, f32, f32)>,
         deformers: Vec<&'static str>,
+        warp_divisions: (u32, u32),
         version: u8,
     }
 
@@ -1315,8 +1329,15 @@ pub(crate) mod tests {
                 drawables: vec!["ArtMesh1"],
                 parameters: vec![("ParamAngleX", -30.0, 30.0, 0.0), ("ParamEyeLOpen", 0.0, 1.2, 1.0)],
                 deformers: vec!["Rotation1", "Warp1"],
+                warp_divisions: (1, 1),
                 version: 2,
             }
+        }
+
+        /// A non-square grid, for tests where rows and columns must differ.
+        pub(crate) fn warp_divisions(mut self, rows: u32, columns: u32) -> Self {
+            self.warp_divisions = (rows, columns);
+            self
         }
 
         pub(crate) fn build(&self) -> Vec<u8> {
@@ -1429,7 +1450,7 @@ pub(crate) mod tests {
             // the drawables hanging off the warp.
             let warps = 1usize;
             let rotations = 1usize;
-            let (div_a, div_b) = (1u32, 1u32);
+            let (div_a, div_b) = self.warp_divisions;
             let grid_points = (div_a + 1) * (div_b + 1);
 
             offsets[section::WARP_KEYFORM_BINDING] = place(&mut body, &u32_array(&[0]));
@@ -1468,14 +1489,18 @@ pub(crate) mod tests {
             offsets[section::KEYFORM_POSITION_OFFSETS] = place(&mut body, &u32_array(&warp_kf_offsets));
 
             let mut pool = vec![0.0f32; warp_floats + draw_floats];
-            // The grid is a quad that doubles in size across the three keys, so
-            // a blend between them is visible in the result.
+            // The grid is a regular lattice spanning 10 by 20 that doubles
+            // across the three keys, so a blend between them is visible in the
+            // result. It is stored row-major with `div_b + 1` points to a row,
+            // the orientation established in the module docs; with the default
+            // 1x1 divisions it is the quad (0,0)-(10,0)-(0,20)-(10,20).
             for k in 0..warp_keyforms {
                 let scale = [0.5f32, 1.0, 2.0][k % 3];
-                let quad = [(0.0, 0.0), (10.0, 0.0), (0.0, 20.0), (10.0, 20.0)];
-                for (pt, (x, y)) in quad.iter().enumerate() {
-                    pool[k * warp_stride + pt * 2] = x * scale;
-                    pool[k * warp_stride + pt * 2 + 1] = y * scale;
+                for pt in 0..grid_points as usize {
+                    let column = (pt % (div_b as usize + 1)) as f32;
+                    let row = (pt / (div_b as usize + 1)) as f32;
+                    pool[k * warp_stride + pt * 2] = column * 10.0 / div_b as f32 * scale;
+                    pool[k * warp_stride + pt * 2 + 1] = row * 20.0 / div_a as f32 * scale;
                 }
             }
             // Drawable vertices sit in the warp's unit square.

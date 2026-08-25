@@ -31,14 +31,35 @@
 //! amount of staring at aggregate statistics produced that; one readable tree
 //! did.
 //!
+//! # The grid orientation, and how it was found
+//!
+//! A warp's two division counts arrive with nothing in the layout to say which
+//! is rows and which is columns, and for a square grid it cannot matter — the
+//! lookup is identical either way. Reading every non-square grid in the same
+//! six models both ways settled it: with `divisions.1 + 1` points to a stored
+//! row, 713 of 729 such grids are perfectly monotone lattices and most of the
+//! rest are coherently mirrored; with `divisions.0 + 1`, the rows interleave
+//! and not one grid is monotone.
+//!
+//! The wrong reading had survived because a scrambled lattice still lands
+//! points *inside* the grid within the grid's own bounds. What exposed it was
+//! the 22 drawables (all in one model family) whose geometry overhangs a
+//! non-square grid: there the mapping extrapolates the edge cells, a scrambled
+//! edge cell has the wrong slope, and chains amplified that into excursions of
+//! up to eight orders of magnitude. With the orientation fixed, every one of
+//! them poses inside its canvas.
+//!
 //! # How well it works, measured
 //!
-//! Across six models from the same source, **2108 of 2131 drawables pose inside
-//! their own canvas**, and three of the six place every drawable. On the model
-//! this was developed against the posed extent is 1.31 by 1.17 against a canvas
-//! of 0.94 by 1.66 — a character occupying its frame rather than merely a
-//! finite result. No chain now produces anything unusable, so
-//! [`Pose::unstable`] is empty on all six.
+//! Across six models from the same source, **2130 of 2131 drawables pose
+//! inside their own canvas**, and five of the six place every drawable. The
+//! one that remains is a single four-vertex sheet nearly three canvases wide
+//! whose chain holds no warp deformer at all — a backdrop that genuinely
+//! overhangs its frame, not a chain defect. On the model this was developed
+//! against the posed extent is 1.24 by 1.12 against a canvas of 0.94 by 1.66 —
+//! a character occupying its frame rather than merely a finite result. No
+//! chain produces anything unusable, so [`Pose::unstable`] is empty on all
+//! six.
 //!
 //! Two further things support the composition independently. A warp's child
 //! space really is normalised: drawables under a warp carry coordinates near
@@ -52,9 +73,7 @@
 //! **No reference render has been compared against.** Landing in the right
 //! frame is strong evidence the chain composes correctly, but it cannot show
 //! that a particular warp bends the way Live2D bends it, or that keyform
-//! blending weights are right between keys rather than only on them. The
-//! remaining 23 drawables of 2131 are all in one model family and are not yet
-//! explained.
+//! blending weights are right between keys rather than only on them.
 //!
 //! The assumptions that a render would settle, and their symptoms:
 //!
@@ -62,10 +81,7 @@
 //!    parameter, and this takes the last axis as varying fastest. If that is
 //!    backwards, single-parameter elements still pose correctly and
 //!    multi-parameter ones do not.
-//! 2. **Grid orientation.** A warp's divisions are two numbers with nothing to
-//!    say which is rows and which is columns. Backwards transposes the
-//!    deformation.
-//! 3. **Rotation composition.** Applied as
+//! 2. **Rotation composition.** Applied as
 //!    `origin + rotate(angle) * scale * p / unit`.
 
 use crate::moc3::{Deformer, DeformerKind, KeyformBinding, Moc3, RotationKeyform};
@@ -79,10 +95,10 @@ pub struct Pose {
     /// Drawables whose deformer chain produced something unusable, and which
     /// therefore hold their own coordinates rather than a posed result.
     ///
-    /// This is not a formality: on a real model it is currently non-zero, and
-    /// what it counts is the assumption named in the module docs that is still
-    /// wrong. A caller should treat a non-zero count as "this pose is not
-    /// finished" rather than as a rounding detail.
+    /// Empty on every model measured so far, but not a formality: a chain
+    /// composed in the wrong units overflows within a few levels, and this is
+    /// where that lands. A caller should treat a non-zero count as "this pose
+    /// is not finished" rather than as a rounding detail.
     pub unstable: Vec<usize>,
 }
 
@@ -266,9 +282,12 @@ impl Moc3 {
             match deformer.kind {
                 DeformerKind::Warp(i) => {
                     if let (Some(grid), Some(shape)) = (warps.get(i as usize), self.warp_deformers.get(i as usize)) {
-                        let (a, b) = shape.divisions;
+                        // The second division count is the one that runs along
+                        // a stored row (see `WarpDeformer::divisions`), so it
+                        // is the x axis here.
+                        let (rows, columns) = shape.divisions;
                         for point in points.iter_mut() {
-                            *point = warp_point(grid, a as usize, b as usize, *point);
+                            *point = warp_point(grid, columns as usize, rows as usize, *point);
                         }
                     }
                     // A warp extrapolates outside its grid, so a child that
@@ -517,6 +536,19 @@ mod tests {
     fn a_single_key_axis_has_nowhere_to_interpolate_to() {
         let at = locate(&keys(&[5.0]), 99.0);
         assert_eq!((at.lower, at.fraction), (0, 0.0));
+    }
+
+    #[test]
+    fn a_non_square_grid_reads_its_columns_from_the_second_division() {
+        // A regular 10-by-20 lattice with one row division and two column
+        // divisions. Its corners only land back on themselves when the second
+        // division count is read as the number of columns; read the other way
+        // the rows interleave and the right edge collapses onto the middle
+        // column, which is the defect this pins down.
+        let bytes = crate::moc3::tests::Builder::new().warp_divisions(1, 2).build();
+        let moc = crate::Moc3::parse(&bytes).expect("should parse");
+        let points = moc.pose(&[0.0]).drawables.into_iter().next().expect("one drawable");
+        assert_eq!(points, [(0.0, 0.0), (10.0, 0.0), (0.0, 20.0)]);
     }
 
     #[test]

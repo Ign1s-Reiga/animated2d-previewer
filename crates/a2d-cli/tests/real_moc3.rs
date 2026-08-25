@@ -277,9 +277,10 @@ fn posing_a_real_model_lands_somewhere_the_canvas_can_hold() {
     let _ = (width, height);
 
     // Most of the model does pose into its own canvas, and how much is the
-    // number worth guarding: it should only ever go up. The rest are the
-    // documented gap -- chains through a rotation deformer that hangs off a
-    // warp -- so this is a floor, not a target.
+    // number worth guarding: it should only ever go up. Five of the six
+    // reference models place every drawable and the sixth misses only a
+    // backdrop sheet genuinely wider than its canvas, but a model this test
+    // has never seen may miss more, so this is a floor, not a target.
     let limit = units.0.max(units.1) * 2.0;
     let inside =
         pose.drawables.iter().filter(|verts| verts.iter().all(|(x, y)| x.abs() <= limit && y.abs() <= limit)).count();
