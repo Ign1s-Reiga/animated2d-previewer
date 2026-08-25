@@ -36,7 +36,7 @@ pub mod state;
 pub mod tray;
 pub mod viewer;
 
-pub use app::{run, RunOptions, RunSummary};
+pub use app::{run, run_with, RunOptions, RunSummary};
 pub use config::{Config, ModelConfig, WindowConfig, CONFIG_DIR_ENV};
 pub use state::{Action, ModelEntry, ViewerState};
 pub use tray::TrayCommand;

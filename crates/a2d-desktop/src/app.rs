@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use a2d_core::{AnimatedModel, LoadReport, PlayOptions, Vec2};
+use a2d_core::{LoadReport, PlayOptions, Vec2};
 use a2d_render::{GpuContext, RenderError, Viewport};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -61,6 +61,19 @@ pub struct RunSummary {
 ///
 /// The config supplies the remembered window placement and selection.
 pub fn run(options: RunOptions, report: &mut LoadReport) -> Result<RunSummary, ViewerError> {
+    run_with(options, Vec::new(), report)
+}
+
+/// Runs the viewer, showing models the caller decoded itself as well.
+///
+/// The importers sit above this crate in the dependency order (spec §3), so a
+/// model that only an importer can produce is built by the caller and handed
+/// over ready to show. The viewer never learns where it came from.
+pub fn run_with(
+    options: RunOptions,
+    preloaded: Vec<LoadedModel>,
+    report: &mut LoadReport,
+) -> Result<RunSummary, ViewerError> {
     let (config, config_report) = Config::load();
     report.absorb(config_report);
 
@@ -73,7 +86,13 @@ pub fn run(options: RunOptions, report: &mut LoadReport) -> Result<RunSummary, V
         }
     }
 
-    let models = Viewer::load_all(&paths, report);
+    // A preloaded model already covers its own path. Without this the viewer
+    // would try to read it again as a package the moment the config remembered
+    // it, and report a failure for a model that is on screen.
+    paths.retain(|path| !preloaded.iter().any(|m| m.package_path == *path));
+
+    let mut models = preloaded;
+    models.extend(Viewer::load_all(&paths, report));
     if models.is_empty() {
         return Err(ViewerError::NoModels);
     }

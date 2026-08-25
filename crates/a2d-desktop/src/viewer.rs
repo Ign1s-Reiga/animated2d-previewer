@@ -32,14 +32,26 @@ pub enum ViewerError {
 }
 
 /// One package, decoded and ready to play.
-#[derive(Debug)]
 pub struct LoadedModel {
     pub package_path: PathBuf,
-    pub model: GenericSpineModel,
+    /// Any runtime family, behind the shared interface (spec §5). The viewer
+    /// deliberately cannot name a concrete model type: knowing which family it
+    /// is showing is exactly what it must not need.
+    pub model: Box<dyn AnimatedModel>,
     /// Texture pages as stored, kept so a model can be re-uploaded when it
     /// becomes active again without re-reading the package from disk.
     pages: Vec<(String, Option<Rgba8Image>, bool, SamplerConfig)>,
     idle: IdleDirector,
+}
+
+impl std::fmt::Debug for LoadedModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedModel")
+            .field("package_path", &self.package_path)
+            .field("model", &self.model.display_name())
+            .field("pages", &self.pages.len())
+            .finish()
+    }
 }
 
 impl LoadedModel {
@@ -86,7 +98,7 @@ impl LoadedModel {
             pages.push((page.name.clone(), image, page.premultiplied_alpha, sampler));
         }
 
-        let model = GenericSpineModel::load(ir, &package.manifest.display_name);
+        let model: Box<dyn AnimatedModel> = Box::new(GenericSpineModel::load(ir, &package.manifest.display_name));
         model.absorb_degradations(report);
         // Seeded from the package name so a character's idle rhythm is its own
         // and is reproducible between runs.
@@ -94,6 +106,23 @@ impl LoadedModel {
         let idle = IdleDirector::from_animations(model.animations(), seed);
 
         Ok(LoadedModel { package_path: path.to_path_buf(), model, pages, idle })
+    }
+
+    /// Builds a model the caller has already decoded.
+    ///
+    /// The importers live above this crate in the dependency order (spec §3),
+    /// so anything that needs one -- a Cubism model out of a game bundle, say --
+    /// is assembled by the caller and handed over ready to show.
+    pub fn from_parts(
+        path: &Path,
+        model: Box<dyn AnimatedModel>,
+        pages: Vec<(String, Option<Rgba8Image>, bool, SamplerConfig)>,
+        report: &mut LoadReport,
+    ) -> LoadedModel {
+        model.absorb_degradations(report);
+        let seed = model.display_name().bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+        let idle = IdleDirector::from_animations(model.animations(), seed);
+        LoadedModel { package_path: path.to_path_buf(), model, pages, idle }
     }
 
     /// The selector entry describing this model.
