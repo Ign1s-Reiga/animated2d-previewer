@@ -31,5 +31,6 @@ pub mod texture;
 
 pub use bundle::{Bundle, Compression, Node};
 pub use objects::{Inventory, ObjectInfo, ScriptInfo};
+pub use reader::{Endian, Reader};
 pub use serialized::{ClassId, SerializedFile};
 pub use texture::{read_textures, Texture, TextureFormat};

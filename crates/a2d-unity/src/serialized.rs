@@ -48,6 +48,7 @@ impl ClassId {
     pub const MONO_BEHAVIOUR: ClassId = ClassId(114);
     pub const MONO_SCRIPT: ClassId = ClassId(115);
     pub const SPRITE: ClassId = ClassId(213);
+    pub const TEXT_ASSET: ClassId = ClassId(49);
     pub const ASSET_BUNDLE: ClassId = ClassId(142);
 
     /// A readable name, falling back to the bare number.
