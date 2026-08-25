@@ -128,12 +128,32 @@ points, then drawables under the same rule — reproduces every one of the 9554
 stored offsets and ends precisely on the declared total. A wrong padding rule or
 a wrong ordering misses on the very first deformer.
 
-**Warp grid orientation.** Two division counts arrive with nothing to say which
-is rows and which is columns, and for a square grid it cannot matter. Reading
-every non-square grid across six models both ways settled it: with
-`divisions.1 + 1` points to a stored row, 713 of 729 grids are perfectly
-monotone lattices and most of the rest are coherently mirrored; the other
-reading interleaves rows and leaves not one grid monotone.
+**The axis order — checked against the one witness outside the chain.** MOC3
+writes the **vertical component of a point first**. This is the single most
+consequential fact in the format, because getting it wrong transposes the entire
+model, and it fixes four things at once:
+
+- every stored point pair is swapped as it is read;
+- the two rotation-origin sections go into the opposite fields;
+- rotation angles turn the other way, so their sense is flipped once, at parse;
+- a warp's stored runs walk **down a column**, not along a row.
+
+It hides well. Reading the point pairs and the lattice in the same wrong order
+transposes both, so the model stays internally consistent and a census of
+monotone lattices scores the two readings identically — an earlier version of
+this document claimed the orientation had been settled that way, and it had not
+been. The parameters cannot witness against it either, since they are carried
+through the very chain under test.
+
+What settled it was each drawable's **own texture coordinates**. A mesh is the
+same shape in uv space as in canvas space, so the map between them is a
+similarity; atlas packing may rotate a region, but a rotation cannot flip the
+sign of a determinant and a mirror can. Exactly one mirror is expected, `v`
+running down the atlas against `y` running up the canvas, so every drawable
+should fit negative. Read the old way 1% did; read this way 99% do, on all three
+models measured. The face then comes out upright and right-handed as well,
+though that is a consequence rather than the evidence — a character may
+legitimately be drawn tilted.
 
 Anything not on this list is left unparsed rather than guessed at. The raw
 section table is exposed so later work can extend the parser without
@@ -171,13 +191,16 @@ is the one that renders correctly.
 Deformers form a forest; a drawable names one parent deformer and inherits the
 chain above it. There are two kinds.
 
-A **warp deformer** is a grid of control points. Its children live in the grid's
-unit square, and posing a point is a bilinear lookup. Outside the square the
-edge cells are *extended* rather than clamped, so geometry that overhangs a
-deformer keeps its shape instead of collapsing onto the border.
+A **warp deformer** is a grid of control points, stored column-major:
+`divisions.1 + 1` consecutive points walk down one column, and there are
+`divisions.0 + 1` columns. Its children live in the grid's unit square, and
+posing a point is a bilinear lookup. Outside the square the edge cells are
+*extended* rather than clamped, so geometry that overhangs a deformer keeps its
+shape instead of collapsing onto the border.
 
 A **rotation deformer** is a rigid frame: origin, angle in degrees, uniform
-scale, opacity. Posing a point is `origin + R(angle) · (point · scale)`.
+scale, opacity. Posing a point is `origin + R(angle) · (point · scale)`, with
+the angle's sense already flipped at parse to match a vertical-first file.
 
 Constraints are applied in the order the chain is walked, from the drawable
 outward to the root.
@@ -274,19 +297,21 @@ better on hand-written ordering rules than section 87 does (6 of 8 against 5 of
 8) and is still wrong, and no per-part section holds an order. **This is
 unsolved.**
 
-**Not fixed, and probably the deeper problem: the face is laid out on a rotated
-axis.** Taking the posed centres of the facial meshes, the brow-to-eye-to-nose
--to-mouth axis runs along decreasing `x` while the right-to-left axis runs along
-`y` -- the face's own vertical is the screen's horizontal. But sweeping
-`ParamEyeBallX` moves the pupils along `x`, which in that layout is the face's
-*vertical*. The geometry and the parameter wiring disagree by a quarter turn,
-and they cannot both be right. Whichever is wrong, a defect that rotates the
-head would also explain why nothing in the face lands where a render order
-expects it.
+**Fixed: the whole model was assembled transposed.** The facial meshes ran
+brow-to-mouth along `x` and separated right-from-left along `y` — the face's own
+vertical lying along the screen's horizontal. It was not a rotation but a
+*mirror*, and it applied to the entire rig, not the head: measured on the ears,
+hands, chest and torso, every frame came out left-handed the same way. The cause
+is the file's axis order (§3), and correcting that puts the face upright and
+right-handed and takes uv agreement from 1% to 99%.
 
-That last point is why no render-order rule should be guessed at until it is
-settled: fitting an ordering to geometry that is itself suspect would bake the
-error in.
+Worth recording is that the parameter measurements were a red herring throughout.
+They are carried through the same deformer chain as the geometry, so they cannot
+witness against it, and they are not even uniform across rigs: one model moves
+its pupils vertically for `ParamEyeBallX` while its face is plainly upright.
+Reasoning from them produced two wrong conclusions — first "a quarter turn",
+then "the head alone" — before the texture coordinates settled it in one
+measurement.
 
 ## 7. How correctness is judged without a reference runtime
 
@@ -306,19 +331,23 @@ same scene. A wrong chain would have to distort both identically.
 coordinates near one whether their parent's grid is in `[0, 1]` or in units
 running to 64.
 
-**The pupil axes stay square and right-handed.** Sweeping `ParamEyeBallX` and
-`ParamEyeBallY` and measuring which way each moves the pupils gives two axes
-that are perpendicular and right-handed in every model, with the responding
-drawables in total agreement. A chain that transposed a grid, mirrored a warp or
-sheared a rotation could not produce that.
+**Every drawable agrees with the texture it samples.** This is the strongest of
+the four, because it is the only one that compares the geometry against
+something *outside* the deformer chain. A mesh is the same shape in uv space as
+in canvas space, so the map between them is a similarity; only a mirror flips
+the sign of its determinant, and exactly one mirror is expected because `v` runs
+down the atlas while `y` runs up the canvas. 99%, 96% and 97% of drawables fit
+negative on the three models measured. A model assembled transposed scores near
+zero, which is how one was caught.
 
-Their *absolute* angle varies between models — 0, -60 and -95 degrees — and that
-is head tilt in the artwork, not error: a reclining character is drawn
-reclining. This is why the assertion is on the pair rather than on either axis
-alone, and it is a correction of an earlier conclusion that read the varying
-angle as a quarter-turn bug. The measurement also has to average *unit* vectors
-rather than displacements, or a single mis-scaled drawable speaks for the whole
-model.
+An earlier version of this document listed a fifth criterion — that sweeping
+`ParamEyeBallX` and `ParamEyeBallY` gives two perpendicular, right-handed axes —
+and it was wrong twice over. Those parameters are carried through the very chain
+under test, so they cannot witness against it; and the wiring is not uniform
+across rigs anyway. One model moves its pupils vertically for `ParamEyeBallX`
+with its face plainly upright, and the handedness of the pair depends on which
+way a rig takes positive to mean. The assertion has been removed rather than
+weakened: one that fails on correct data is worse than none.
 
 These are `crates/a2d-cli/tests/cubism_orientation.rs`, gated on
 `A2D_FIXTURE_CUBISM` because extracted assets are never committed (§11).
@@ -336,8 +365,6 @@ These are `crates/a2d-cli/tests/cubism_orientation.rs`, gated on
 - **Render order.** Section 87 places the face skin in front of the eyes and
   orders the two eyes' lashes inconsistently with each other. No section holds a
   part order, and part-major sorting does not fix it either. See §6.
-- **Head orientation.** The facial meshes are laid out on an axis a quarter turn
-  from the one the eye parameters move along. See §6.
 - **Multiple texture pages.** Section 41 gives each drawable a texture index and
   is read, but the emitter still puts every mesh on one page, because nothing
   loads a second one yet. It is all zero on every model seen.
