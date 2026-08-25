@@ -30,25 +30,39 @@
 //!    has its origin inside the unit square. The model holds.
 //! 4. **Rotation composition.** Applied as `origin + rotate(angle) * scale * p`.
 //!
-//! # The one that is known to be wrong
+//! # How well this actually works, measured
 //!
-//! **How a rotation deformer's children are scaled into its frame is not
-//! solved.** A drawable under one carries coordinates in the tens — one mesh
-//! spans ±23 — and the rotation's own scale is near 1, so composing them
-//! overshoots the unit square its parent warp expects by an order of magnitude.
-//! Every further warp then extrapolates, and on a deep chain the result runs
-//! away.
+//! On the model it was built against, **572 of 601 drawables pose inside the
+//! canvas**, with a median coordinate of 0.51 against a canvas 0.94 by 1.66
+//! units. That is a character-shaped result rather than a plausible-looking
+//! one, and it is asserted as a floor by the real-asset tests so it can only
+//! improve.
 //!
-//! The consequence is visible rather than hidden: [`Pose::unstable`] lists the
-//! drawables whose chain produced something unusable, and those keep their
-//! un-deformed coordinates instead. On the model this was built against that is
-//! 1 drawable of 601 — but the other 600 are not thereby *right*, only finite.
-//! The posed extent comes out around ten thousand units against a canvas of
-//! under two, which is the same error showing up quietly instead of loudly.
+//! Two independent things support the composition beyond that count. A warp's
+//! child space is normalised: drawables under a warp have coordinates near 1
+//! whether their parent's own grid is in `[0, 1]` or in units running to 64, so
+//! the normalisation is real and not an artefact of where they sit. And the
+//! root rotation's scale is 0.00026192, whose reciprocal is 3818 against a
+//! canvas of 3792 pixels per unit — that deformer is the pixels-to-units
+//! bridge, which is what the transform being applied correctly predicts.
 //!
-//! So this is machinery, not a working pose. What it gives is somewhere for the
-//! missing scale rule to be dropped in once a reference render exists to
-//! measure it against.
+//! # The 29 that do not
+//!
+//! **A rotation deformer whose parent is a warp is still wrong.** Its origin
+//! sits in the warp's unit square, as it should, but its own children carry
+//! coordinates in the tens, and its scale is near 1 — so composing them
+//! overshoots the unit square by an order of magnitude, and every warp above
+//! extrapolates from there. Fifteen deformers are in that position, and the
+//! chains through them account for all 29 outliers.
+//!
+//! The needed correction is not a constant: it works out near 1/30 for one and
+//! 1/70 for another, so it is not a missing global factor but something read
+//! from the model that has not been found yet.
+//!
+//! The consequence stays visible rather than hidden. [`Pose::unstable`] lists
+//! drawables whose chain produced something unusable — one of 601 — and those
+//! keep their un-deformed coordinates, so a renderer is never handed a vertex
+//! it cannot draw.
 //!
 //! Where a model exercises none of the ambiguous cases — one parameter, one
 //! deformer — the result follows from the data alone and the assumptions do not

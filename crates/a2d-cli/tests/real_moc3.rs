@@ -274,9 +274,19 @@ fn posing_a_real_model_lands_somewhere_the_canvas_can_hold() {
     let width = hi_x - lo_x;
     let height = hi_y - lo_y;
     assert!(width > 0.0 && height > 0.0, "the pose collapsed to a point");
-    // No bound is asserted on the extent yet. The chain is known to be wrong
-    // for some drawables, so a bound would either pass vacuously or fail for a
-    // reason already reported above; asserting it would only encode today's
-    // wrongness as tomorrow's expectation.
-    let _ = (width, height, units);
+    let _ = (width, height);
+
+    // Most of the model does pose into its own canvas, and how much is the
+    // number worth guarding: it should only ever go up. The rest are the
+    // documented gap -- chains through a rotation deformer that hangs off a
+    // warp -- so this is a floor, not a target.
+    let limit = units.0.max(units.1) * 2.0;
+    let inside =
+        pose.drawables.iter().filter(|verts| verts.iter().all(|(x, y)| x.abs() <= limit && y.abs() <= limit)).count();
+    println!("  drawables posed inside the canvas: {inside} of {}", pose.drawables.len());
+    assert!(
+        inside * 100 >= pose.drawables.len() * 90,
+        "only {inside} of {} drawables posed inside the canvas; the deformer chain has regressed",
+        pose.drawables.len()
+    );
 }
