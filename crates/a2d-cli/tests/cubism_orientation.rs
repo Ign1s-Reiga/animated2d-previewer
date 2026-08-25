@@ -1,29 +1,36 @@
-//! Is a posed Cubism model assembled coherently, and at the right size?
+//! Is a posed Cubism model assembled the right way round, and at the right size?
 //!
-//! Nothing structural answers either question. A model can parse cleanly, pose
-//! with no unstable drawable, and still come out mirrored, sheared, or several
-//! times too large.
+//! A model can parse cleanly, pose with no unstable drawable, and still come out
+//! transposed, mirrored or several times too large. Nothing structural notices.
 //!
 //! # What can and cannot be asserted
 //!
-//! Cubism's parameter names are conventional: `ParamEyeBallX` slides the pupils
-//! left and right, `ParamEyeBallY` up and down. It is tempting to assert that
-//! the first therefore moves them along the screen's x axis -- but that only
-//! holds for a character whose head is drawn upright, and a reclining or
-//! tumbling one is drawn at whatever angle the artist chose. Measured across
-//! three real models the pupil axes came out at 0, -60 and -95 degrees, all
-//! with total agreement between drawables: artwork, not error.
+//! The check that works compares the geometry against something **independent
+//! of it**: the drawable's own texture coordinates. A mesh is the same shape in
+//! both spaces, so the map between them is a similarity. Atlas packing may
+//! rotate a region, but a rotation cannot flip a determinant and a mirror can.
+//! Exactly one mirror is expected, since `v` runs down the atlas while `y` runs
+//! up the canvas — so every drawable should fit with a *negative* determinant.
+//! A model assembled transposed scores near zero here, which is how one was
+//! caught being exactly that.
 //!
-//! What *does* hold whatever the pose is that the two axes stay perpendicular
-//! and right-handed. A deformer chain that transposed a grid, mirrored a warp
-//! or sheared a rotation would break that; a tilted head does not.
+//! Two tempting alternatives do **not** work, and were both tried first:
 //!
-//! The second test covers size. A model's own parameter defaults are not
-//! necessarily its display values -- one of the three ships a zoom parameter
-//! defaulted to 8 of 10, which scales the whole model by about five and makes
-//! an ordinary canvas-wide backdrop measure four and a half canvases across.
-//! With the parameters that drive the root wound back to their minimum, every
-//! model should sit inside its own canvas.
+//! * *"the face should be upright"* — a character may legitimately be drawn
+//!   reclining or tilted, so there is no angle to assert.
+//! * *"`ParamEyeBallX` should move the pupils horizontally"*, or the weaker
+//!   *"the two pupil axes should at least stay square and right-handed"* —
+//!   neither holds. Those parameters are carried through the very chain under
+//!   test, so they cannot witness against it; and measured across real models
+//!   the wiring is not uniform anyway. One rig moves its pupils vertically for
+//!   `ParamEyeBallX` while its face is plainly upright, and the handedness of
+//!   the pair depends on which way a rig takes positive to mean. An assertion
+//!   that fails on correct data is worse than no assertion.
+//!
+//! Size is checked separately. A model's stored parameter defaults are not
+//! necessarily its display values: one ships a zoom parameter defaulted to 8 of
+//! 10, which scales it about fivefold. Wound back to its minimum, every model
+//! sits inside its own canvas.
 //!
 //! Gated on `A2D_FIXTURE_CUBISM`, like the other real-asset tests: extracted
 //! assets are never committed (§11).
@@ -39,82 +46,67 @@ fn model() -> Option<Moc3> {
     Moc3::parse(&inventory.moc.as_ref()?.bytes).ok()
 }
 
-fn centroids(moc: &Moc3, values: &[f32]) -> Vec<(f32, f32)> {
-    moc.pose(values)
-        .drawables
-        .iter()
-        .map(|points| {
-            if points.is_empty() {
-                return (f32::NAN, f32::NAN);
-            }
-            let n = points.len() as f32;
-            let sum = points.iter().fold((0.0, 0.0), |a, p| (a.0 + p.0, a.1 + p.1));
-            (sum.0 / n, sum.1 / n)
-        })
-        .collect()
-}
-
-/// Which way the model travels as one parameter sweeps, as a unit vector, with
-/// how strongly the responding drawables agree on it.
-///
-/// The direction is a mean of *unit* vectors rather than of displacements. A
-/// magnitude-weighted mean is decided by whichever drawable moves furthest, so
-/// a single mis-scaled one would speak for the whole model.
-fn travel(moc: &Moc3, id: &str) -> Option<(f32, f32, f32)> {
-    let index = moc.parameters.iter().position(|p| p.id == id)?;
-    let parameter = &moc.parameters[index];
-    let base: Vec<f32> = moc.parameters.iter().map(|p| p.default).collect();
-
-    let at = |value: f32| {
-        let mut values = base.clone();
-        values[index] = value;
-        centroids(moc, &values)
-    };
-    let (lo, hi) = (at(parameter.minimum), at(parameter.maximum));
-
-    let mut moved: Vec<(f32, f32, f32)> = lo
-        .iter()
-        .zip(&hi)
-        .filter(|(a, b)| a.0.is_finite() && b.0.is_finite())
-        .map(|(a, b)| {
-            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-            ((dx * dx + dy * dy).sqrt(), dx, dy)
-        })
-        .filter(|m| m.0 > 1e-6)
-        .collect();
-    if moved.is_empty() {
+/// Determinant of the least-squares map from a drawable's uvs to its posed
+/// vertices.
+fn uv_to_position_determinant(uvs: &[(f32, f32)], points: &[(f32, f32)]) -> Option<f64> {
+    let n = uvs.len() as f64;
+    if n < 3.0 {
         return None;
     }
-    moved.sort_by(|l, r| r.0.total_cmp(&l.0));
+    let mean = |f: &dyn Fn(usize) -> f64| (0..uvs.len()).map(f).sum::<f64>() / n;
+    let (mu, mv) = (mean(&|i| uvs[i].0 as f64), mean(&|i| uvs[i].1 as f64));
+    let (mx, my) = (mean(&|i| points[i].0 as f64), mean(&|i| points[i].1 as f64));
 
-    // Only the drawables that really respond; the rest are noise around zero.
-    let largest = moved[0].0;
-    let responsive: Vec<_> = moved.iter().filter(|m| m.0 > largest * 0.25).collect();
-    let n = responsive.len() as f32;
-    let sum = responsive.iter().fold((0.0, 0.0), |a, m| (a.0 + m.1 / m.0, a.1 + m.2 / m.0));
-    let (x, y) = (sum.0 / n, sum.1 / n);
-    Some((x, y, (x * x + y * y).sqrt()))
+    let (mut suu, mut suv, mut svv) = (0.0, 0.0, 0.0);
+    let (mut sux, mut svx, mut suy, mut svy) = (0.0, 0.0, 0.0, 0.0);
+    for i in 0..uvs.len() {
+        let (du, dv) = (uvs[i].0 as f64 - mu, uvs[i].1 as f64 - mv);
+        let (dx, dy) = (points[i].0 as f64 - mx, points[i].1 as f64 - my);
+        suu += du * du;
+        suv += du * dv;
+        svv += dv * dv;
+        sux += du * dx;
+        svx += dv * dx;
+        suy += du * dy;
+        svy += dv * dy;
+    }
+    let spread = suu * svv - suv * suv;
+    if spread.abs() < 1e-14 {
+        return None;
+    }
+    let a = (sux * svv - svx * suv) / spread;
+    let b = (svx * suu - sux * suv) / spread;
+    let c = (suy * svv - svy * suv) / spread;
+    let d = (svy * suu - suy * suv) / spread;
+    Some(a * d - b * c)
 }
 
 #[test]
 #[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Unity bundle"]
-fn the_two_pupil_axes_stay_square_to_each_other() {
+fn posed_geometry_agrees_with_the_texture_it_samples() {
     let Some(moc) = model() else { return };
-    let (Some(x), Some(y)) = (travel(&moc, "ParamEyeBallX"), travel(&moc, "ParamEyeBallY")) else { return };
+    let pose = moc.pose(&[]);
 
-    // Without agreement there is no direction to speak of, so there would be
-    // nothing to compare and the test would be asserting on noise.
-    assert!(x.2 > 0.9 && y.2 > 0.9, "the pupils disagree about where they are going: {x:?} {y:?}");
+    let (mut agree, mut total) = (0usize, 0usize);
+    for (index, drawable) in moc.drawables.iter().enumerate() {
+        let Some(points) = pose.drawables.get(index) else { continue };
+        if points.len() != drawable.uvs.len() {
+            continue;
+        }
+        let Some(det) = uv_to_position_determinant(&drawable.uvs, points) else { continue };
+        total += 1;
+        if det < 0.0 {
+            agree += 1;
+        }
+    }
 
-    let dot = x.0 * y.0 + x.1 * y.1;
+    assert!(total > 0, "no drawable could be fitted");
+    // Not every drawable: a degenerate or near-collinear mesh fits noisily.
     assert!(
-        dot.abs() < 0.15,
-        "the pupil axes are {:.0} degrees apart, not 90; the deformer chain is shearing them",
-        (dot.clamp(-1.0, 1.0).acos()).to_degrees()
+        agree * 10 >= total * 9,
+        "only {agree} of {total} drawables are oriented to match their own texture; \
+         a model assembled transposed scores near zero here"
     );
-
-    let cross = x.0 * y.1 - x.1 * y.0;
-    assert!(cross > 0.0, "the pupil axes come out left-handed ({cross:.3}); the chain mirrors the model");
 }
 
 #[test]
