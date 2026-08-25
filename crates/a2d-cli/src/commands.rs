@@ -246,6 +246,108 @@ const EXPORT_SIZE: u32 = 512;
 /// The package pipeline does not reach Cubism yet, so this goes from bundle to
 /// pixels directly. It exists to answer one question -- does the model come out
 /// looking like the character -- which nothing structural can answer.
+/// Opens a Spine rig from a Unity bundle in the desktop window.
+///
+/// Phase 5's goal: a Unity-packaged rig shown through the ordinary Generic
+/// Spine runtime, with no Unity knowledge below the importer.
+fn open_spine_bundle(
+    out: &mut dyn std::io::Write,
+    path: &Path,
+    inventory: a2d_import::SpineInventory,
+    mut report: LoadReport,
+    frames_dir: Option<&Path>,
+    exit_after: Option<Duration>,
+) -> Result<(), CliError> {
+    let (Some(skeleton), Some(atlas)) = (&inventory.skeleton, &inventory.atlas) else {
+        return Err(DecodeError::UnsupportedFormat("this bundle holds no complete Spine rig".into()).into());
+    };
+
+    let text = String::from_utf8_lossy(&atlas.bytes);
+    let (pages_ir, atlas_report) = a2d_spine::parse_atlas(&text)?;
+    report.absorb(atlas_report);
+    let (ir, detection) = a2d_spine::decode_skeleton(&skeleton.bytes, pages_ir, &mut report)?;
+    writeln!(out, "Rig:       {} bones, {} slots, {}", ir.bones.len(), ir.slots.len(), detection.version)?;
+
+    // Atlas pages name image files; the bundle holds them as Texture2D under
+    // the same stem. A page with no match keeps its slot so texture ids stay
+    // aligned with the atlas.
+    let bundle = a2d_unity::Bundle::parse(&std::fs::read(path)?)?;
+    let node = bundle
+        .nodes
+        .iter()
+        .find(|n| n.is_serialized())
+        .ok_or_else(|| DecodeError::UnsupportedFormat("the bundle holds no serialized file".into()))?;
+    let file = a2d_unity::SerializedFile::parse(bundle.node_data(node)?)?;
+    let decoded = a2d_unity::read_textures(&file)?;
+
+    let stem = |name: &str| {
+        name.rsplit('/').next().unwrap_or(name).rsplit_once('.').map(|(a, _)| a).unwrap_or(name).to_ascii_lowercase()
+    };
+    let mut pages = Vec::with_capacity(ir.atlas.pages.len());
+    for page in &ir.atlas.pages {
+        let sampler = a2d_render::SamplerConfig {
+            min_filter: page.min_filter,
+            mag_filter: page.mag_filter,
+            u_wrap: page.u_wrap,
+            v_wrap: page.v_wrap,
+        };
+        let wanted = stem(&page.name);
+        let image = decoded.iter().find(|t| stem(&t.name) == wanted).map(|t| Rgba8Image {
+            width: t.width,
+            height: t.height,
+            pixels: t.rgba.clone(),
+        });
+        if image.is_none() {
+            report.note(format!("texture page {:?} is not in this bundle", page.name));
+        } else {
+            writeln!(out, "Texture:   {}", page.name)?;
+        }
+        pages.push((page.name.clone(), image, page.premultiplied_alpha, sampler));
+    }
+
+    let name = skeleton.name.rsplit_once('.').map(|(a, _)| a).unwrap_or(&skeleton.name).to_string();
+    let mut model = a2d_runtime::GenericSpineModel::load(std::sync::Arc::new(ir), &name);
+    // Pose before framing: a skeleton's setup pose can be degenerate, and the
+    // bounds are what say whether there is anything to look at.
+    if let Some(first) = model.default_animation().map(str::to_string) {
+        let _ = a2d_core::AnimatedModel::pose_at(&mut model, &first, 0.0);
+        writeln!(out, "Animation: {first}")?;
+    }
+    let bounds = a2d_core::AnimatedModel::bounds(&model);
+    writeln!(out, "Bounds:    x {:.1}..{:.1}  y {:.1}..{:.1}", bounds.min.x, bounds.max.x, bounds.min.y, bounds.max.y)?;
+    let loaded = a2d_desktop::LoadedModel::from_parts(path, Box::new(model), pages, &mut report);
+    if let Some(dir) = frames_dir {
+        return render_frames(out, loaded, dir, report);
+    }
+
+    writeln!(
+        out,
+        "
+Opening {} in the desktop viewer.",
+        path.display()
+    )?;
+    writeln!(out, "  drag to move, scroll to scale, Space pauses, Tab cycles animations, Esc quits.")?;
+    if let Some(after) = exit_after {
+        writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;
+    }
+    writeln!(out)?;
+
+    let options = a2d_desktop::RunOptions { packages: Vec::new(), exit_after };
+    let result = a2d_desktop::run_with(options, vec![loaded], &mut report);
+    print_report(out, &report)?;
+
+    let summary = result?;
+    writeln!(
+        out,
+        "
+Presented {} frames in {:.1}s ({:.0} fps).",
+        summary.frames,
+        summary.elapsed.as_secs_f32(),
+        summary.frames as f32 / summary.elapsed.as_secs_f32().max(f32::MIN_POSITIVE)
+    )?;
+    Ok(())
+}
+
 /// Pulls the Cubism model and its atlas out of a Unity bundle.
 ///
 /// Both the frame export and the window need exactly this, and doing it in one
@@ -415,6 +517,15 @@ pub fn preview(
     // in, so `preview` opens one directly rather than refusing.
     if let Some(bytes) = unity_bundle_bytes(package_dir) {
         writeln!(out, "Input:     {}", package_dir.display())?;
+
+        // A bundle holds one family or the other, and Spine is the decisive
+        // check: a skeleton and an atlas, both recognised by content.
+        let mut report = LoadReport::new();
+        let spine = a2d_import::inspect_spine_bundle(&bytes, &mut report)?;
+        if spine.is_spine() {
+            return open_spine_bundle(out, package_dir, spine, report, frames_dir, exit_after);
+        }
+
         return match frames_dir {
             Some(frames) => render_cubism_bundle(out, &bytes, frames),
             None => open_cubism_viewer(out, package_dir, &bytes, exit_after),
@@ -458,8 +569,17 @@ Presented {} frames in {:.1}s ({:.0} fps).",
 fn export_frames(out: &mut dyn std::io::Write, package_dir: &Path, frames_dir: &Path) -> Result<(), CliError> {
     let mut report = LoadReport::new();
     let model = LoadedModel::load(package_dir, &mut report)?;
-
     writeln!(out, "Package:   {}", package_dir.display())?;
+    render_frames(out, model, frames_dir, report)
+}
+
+/// Renders the regression timestamps of a model that is already loaded.
+fn render_frames(
+    out: &mut dyn std::io::Write,
+    model: LoadedModel,
+    frames_dir: &Path,
+    mut report: LoadReport,
+) -> Result<(), CliError> {
     writeln!(out, "Model:     {}", model.model.display_name())?;
     let animation = model
         .model
