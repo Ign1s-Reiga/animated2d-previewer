@@ -338,8 +338,10 @@ rotate: 90\n";
         let (atlas, _) = parse_atlas(LEGACY).unwrap();
         let arm = atlas.region(atlas.find("arm").unwrap()).unwrap();
         assert_eq!(arm.rotate_deg, 90);
+        // `size` is the art's own size, whichever way the packer laid it down.
         assert_eq!(arm.size, (40, 90));
-        assert_eq!(arm.unrotated_size(), (90, 40));
+        assert_eq!(arm.unrotated_size(), (40, 90));
+        assert_eq!(arm.packed_size(), (90, 40), "on the sheet it lies on its side");
     }
 
     #[test]

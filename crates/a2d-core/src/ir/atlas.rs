@@ -72,7 +72,14 @@ pub struct AtlasRegion {
     pub page: AtlasPageId,
     /// Top-left corner on the page, in pixels.
     pub xy: (u32, u32),
-    /// Size on the page, in pixels, *before* un-rotating.
+    /// The region's size in pixels **before** it was packed, so it does not
+    /// change when the packer rotates it.
+    ///
+    /// The rectangle the region actually occupies on its page is
+    /// [`AtlasRegion::packed_size`], which swaps these for a quarter turn.
+    /// Reading this as the page rectangle instead puts 34 of one real atlas's
+    /// regions outside their own page, one of them by 597 pixels, and smears a
+    /// thin strip of the sheet across every rotated attachment.
     pub size: (u32, u32),
     /// Degrees the sub-image was rotated by when packed: 0, 90, 180 or 270.
     /// The legacy `rotate: true` flag means 90.
@@ -90,8 +97,15 @@ pub struct AtlasRegion {
 }
 
 impl AtlasRegion {
-    /// Size of this region as it appears once un-rotated.
+    /// Size of this region as it appears once un-rotated, which is how the
+    /// atlas already writes it.
     pub fn unrotated_size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// The rectangle this region occupies on its page, which is the un-rotated
+    /// size turned on its side when the packer rotated it.
+    pub fn packed_size(&self) -> (u32, u32) {
         if self.rotate_deg == 90 || self.rotate_deg == 270 {
             (self.size.1, self.size.0)
         } else {
@@ -110,10 +124,13 @@ impl AtlasRegion {
             return None;
         }
         let (pw, ph) = (pw as f32, ph as f32);
+        // The rectangle on the page, not the un-rotated size: a quarter-turned
+        // region is as wide on the sheet as it is tall in the art.
+        let (rw, rh) = self.packed_size();
         let u0 = self.xy.0 as f32 / pw;
         let v0 = self.xy.1 as f32 / ph;
-        let u1 = (self.xy.0 + self.size.0) as f32 / pw;
-        let v1 = (self.xy.1 + self.size.1) as f32 / ph;
+        let u1 = (self.xy.0 + rw) as f32 / pw;
+        let v1 = (self.xy.1 + rh) as f32 / ph;
 
         // Corners of the packed rectangle, then rotated so that index 0 is the
         // un-rotated image's bottom-left regardless of packing orientation.
@@ -196,15 +213,34 @@ mod tests {
     }
 
     #[test]
-    fn unrotated_size_swaps_only_for_quarter_turns() {
+    fn the_page_rectangle_turns_but_the_art_does_not() {
+        // The atlas writes the size the art has un-rotated; only the rectangle
+        // it occupies on the sheet turns with it.
         let mut r = region("a", -1);
-        assert_eq!(r.unrotated_size(), (30, 40));
+        for turn in [0, 90, 180, 270] {
+            r.rotate_deg = turn;
+            assert_eq!(r.unrotated_size(), (30, 40), "the art's own size never changes");
+        }
+        r.rotate_deg = 0;
+        assert_eq!(r.packed_size(), (30, 40));
         r.rotate_deg = 90;
-        assert_eq!(r.unrotated_size(), (40, 30));
+        assert_eq!(r.packed_size(), (40, 30));
         r.rotate_deg = 180;
-        assert_eq!(r.unrotated_size(), (30, 40));
+        assert_eq!(r.packed_size(), (30, 40));
         r.rotate_deg = 270;
-        assert_eq!(r.unrotated_size(), (40, 30));
+        assert_eq!(r.packed_size(), (40, 30));
+    }
+
+    #[test]
+    fn a_turned_region_stays_inside_its_page() {
+        // The check that caught this: read as the page rectangle, a quarter
+        // turned region can claim pixels the page does not have.
+        let mut r = region("a", -1);
+        r.rotate_deg = 90;
+        let uvs = r.corner_uvs(&page()).expect("page has a size");
+        for uv in uvs {
+            assert!((0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y), "{uv:?} is off the page");
+        }
     }
 
     #[test]
@@ -218,12 +254,24 @@ mod tests {
     }
 
     #[test]
-    fn rotation_permutes_the_corner_order() {
+    fn rotation_turns_the_page_rectangle_as_well_as_relabelling_its_corners() {
+        // This test used to assert that turning a region merely permuted the
+        // same four uvs. That is what a reading where `size` is the page
+        // rectangle predicts, and it is wrong: the rectangle turns too.
         let mut r = region("a", -1);
-        let flat = r.corner_uvs(&page()).unwrap();
+        // 30 by 40 at (10, 20) on a 100 by 200 page.
+        assert_eq!(
+            r.corner_uvs(&page()).expect("sized page"),
+            [Vec2::new(0.10, 0.30), Vec2::new(0.40, 0.30), Vec2::new(0.40, 0.10), Vec2::new(0.10, 0.10)]
+        );
+
         r.rotate_deg = 90;
-        let turned = r.corner_uvs(&page()).unwrap();
-        assert_eq!(turned, [flat[1], flat[2], flat[3], flat[0]]);
+        // The same art now lies 40 across and 30 down, and the corner that is
+        // its bottom-left has moved round with it.
+        assert_eq!(
+            r.corner_uvs(&page()).expect("sized page"),
+            [Vec2::new(0.50, 0.25), Vec2::new(0.50, 0.10), Vec2::new(0.10, 0.10), Vec2::new(0.10, 0.25)]
+        );
     }
 
     #[test]

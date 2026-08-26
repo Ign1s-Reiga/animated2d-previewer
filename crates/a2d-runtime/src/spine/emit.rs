@@ -334,7 +334,9 @@ mod tests {
             size,
             rotate_deg: rotate,
             offset: (0, 0),
-            original_size: if rotate == 90 || rotate == 270 { (size.1, size.0) } else { size },
+            // Untrimmed size, which like `size` describes the art rather than
+            // the rectangle it was packed into, so it does not turn either.
+            original_size: size,
             index: -1,
             splits: None,
             pads: None,
@@ -683,8 +685,8 @@ mod tests {
         let mut list = RenderList::new();
         emit(&pose, 1.0, &mut list);
         let mesh = &list.meshes()[0];
-        // A 90-degree packed region occupies 20x10 on the page but represents a
-        // 10x20 image, so the emitted quad keeps the attachment's proportions.
+        // The region's art is 20 by 10 and lies 10 by 20 on the page. Either
+        // way the quad takes the attachment's own size, which is 10 by 20.
         assert_close2(mesh.bounds().size(), Vec2::new(10.0, 20.0));
         assert_eq!(mesh.uvs.len(), 4);
         assert!(mesh.uvs.iter().all(|uv| (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)));
