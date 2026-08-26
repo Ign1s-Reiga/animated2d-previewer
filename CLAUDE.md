@@ -430,7 +430,15 @@ When a task spans layers, do the work layer by layer with the owning agent, then
 
 ## 16. Legal / ethical boundary
 
-This project targets assets the user has extracted from software they own, for personal offline
-viewing. Do not add DRM circumvention, license-check bypass, game-server communication, or account
-automation. Do not commit or redistribute game assets or proprietary SDK binaries.
+This project is for **academic and personal use**: studying how these undocumented formats work
+and recording the findings, and viewing assets the user has extracted from software they own,
+offline and privately. Both halves matter — where a format is reverse-engineered, write down what
+established each claim, not only the layout (see `docs/cubism-moc3.md`).
+
+Do not add DRM circumvention, license-check bypass, game-server communication, or account
+automation. Do not commit or redistribute game assets or proprietary SDK binaries, and do not add
+anything that distributes extracted assets to third parties.
 If a task drifts toward those, stop and say so.
+
+This is the project's intended scope, not a licence term: the code stays MIT / Apache-2.0, and
+nothing here narrows what that grants.
