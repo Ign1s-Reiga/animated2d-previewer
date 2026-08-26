@@ -194,10 +194,34 @@ fn decode(format: TextureFormat, width: u32, height: u32, data: &[u8], name: &st
                 dst.copy_from_slice(&[src[0], src[1], src[2], 255]);
             }
         }
-        TextureFormat::Dxt1 => decode_blocks(width, height, data, &mut out, false, name)?,
-        TextureFormat::Dxt5 => decode_blocks(width, height, data, &mut out, true, name)?,
+        TextureFormat::Dxt1 => return decode_blocks(width, height, data, &mut out, false, name).map(|()| out),
+        TextureFormat::Dxt5 => return decode_blocks(width, height, data, &mut out, true, name).map(|()| out),
     }
+    // The uncompressed formats are copied row for row above, so they still
+    // carry Unity's bottom-up order; the block formats undo it themselves as
+    // they go. Both must come out top row first, or an atlas built on one
+    // samples upside down against coordinates written for the other -- which
+    // is exactly what happened: a rig whose page was Rgba32 rather than DXT5
+    // drew a correct silhouette out of mostly empty texture.
+    flip_rows(&mut out, width, height);
     Ok(out)
+}
+
+/// Turns a bottom-up image top-down, in place.
+fn flip_rows(pixels: &mut [u8], width: u32, height: u32) {
+    let stride = width as usize * 4;
+    if stride == 0 || height < 2 {
+        return;
+    }
+    for row in 0..height as usize / 2 {
+        let (top, bottom) = (row * stride, (height as usize - 1 - row) * stride);
+        if bottom + stride > pixels.len() {
+            return;
+        }
+        for i in 0..stride {
+            pixels.swap(top + i, bottom + i);
+        }
+    }
 }
 
 /// Decodes BC1 or BC3 blocks.
@@ -316,6 +340,28 @@ mod tests {
         assert_eq!(TextureFormat::Dxt1.encoded_size(2048, 2048), 2_097_152);
         assert_eq!(TextureFormat::Dxt5.encoded_size(5, 5), 2 * 2 * 16);
         assert_eq!(TextureFormat::Rgba32.encoded_size(10, 10), 400);
+    }
+
+    #[test]
+    fn an_uncompressed_texture_comes_out_top_row_first() {
+        // Unity stores rows bottom-up whatever the format. The block decoders
+        // undo that as they go; the uncompressed paths copy row for row, so
+        // they have to be turned afterwards. A page that skipped this drew a
+        // rig's correct silhouette out of mostly empty texture, because every
+        // atlas coordinate landed on the wrong row.
+        let (w, h) = (2u32, 2u32);
+        // Bottom row red, top row blue, in Unity's order: red comes first.
+        let data: Vec<u8> = [[255u8, 0, 0, 255], [255, 0, 0, 255], [0, 0, 255, 255], [0, 0, 255, 255]].concat();
+        let out = decode(TextureFormat::Rgba32, w, h, &data, "test").expect("should decode");
+        assert_eq!(&out[..4], &[0, 0, 255, 255], "the first row read out must be the one Unity stored last");
+        assert_eq!(&out[12..16], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn flipping_an_odd_height_leaves_the_middle_row_alone() {
+        let mut pixels: Vec<u8> = (0..3u8).flat_map(|row| [row, row, row, row]).collect();
+        flip_rows(&mut pixels, 1, 3);
+        assert_eq!(pixels, vec![2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0]);
     }
 
     /// One BC3 block of solid opaque red, as the format stores it.
