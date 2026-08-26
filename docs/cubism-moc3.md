@@ -216,6 +216,34 @@ scale, opacity. Posing a point is `origin + R(angle) · (point · scale)`.
 Constraints are applied in the order the chain is walked, from the drawable
 outward to the root.
 
+### Which way is up
+
+**A MOC3 stores y running down the canvas**, the way an image's rows do. Every
+space in the file agrees on this — keyform points, deformer grids, rotation
+origins — so nothing inside the format needs converting; the flip belongs at the
+boundary where a posed model leaves `formats/`, and `Moc3::pose` is where it is
+applied.
+
+*What established it:* not an argument from conventions, which got this wrong
+once already. The Spine path is known to render upright, so the sign it produces
+for the map from a mesh's texture coordinates to its posed positions is the
+convention the renderer and texture pipeline actually implement. Measured the
+same way on both:
+
+| path | meshes | determinant positive | negative |
+|---|---|---|---|
+| Spine, 8 real rigs | 1276 | 3 | **1273** |
+| Cubism, 6 real models | 1797 | **1771** | 26 |
+
+The two disagree, and the Cubism models rendered upside down. Which side was
+inverted — the positions or the texture coordinates — was settled the same way:
+negating position y renders a coherent upright model, while flipping uv `v`
+satisfies the determinant equally but shreds the art across meshes.
+
+The earlier reasoning held that the sign should be positive because `a2d-unity`
+flips Unity's bottom-up rows when it reads a `Texture2D`. That flip is real; the
+conclusion drawn from it was not.
+
 ### The scale rule
 
 **Every space in a model is canvas pixels, with one exception: a warp

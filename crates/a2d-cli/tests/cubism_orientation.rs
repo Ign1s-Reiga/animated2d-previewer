@@ -14,12 +14,23 @@
 //! which is worth saying plainly: it was once mistaken for a full orientation
 //! check, and a correct model was "fixed" on the strength of it.
 //!
-//! The expected sign is **positive** — no net mirror. It is tempting to argue
-//! the opposite, since texture rows usually run down while `y` runs up the
-//! canvas, but `a2d-unity`'s decoder flips Unity's bottom-up rows when it reads
-//! a `Texture2D`, and that flip is what makes the two agree. Reasoning about
-//! the convention without accounting for it is exactly the mistake that was
-//! made.
+//! The expected sign is **negative**, and that is measured rather than argued.
+//! The Spine path is known to render upright, so whichever sign it produces is
+//! the convention the renderer and the texture pipeline actually implement:
+//! across eight real rigs, 1273 of 1276 meshes come out negative. The Cubism
+//! path measured 1771 of 1797 *positive* — the opposite — and every model
+//! rendered upside down.
+//!
+//! This assertion used to demand the positive sign, on an argument about
+//! `a2d-unity` flipping Unity's bottom-up rows when it reads a `Texture2D`.
+//! The argument was wrong, and the test held the bug in place rather than
+//! catching it. Measuring against a path already known to be correct settles
+//! what reasoning from conventions did not.
+//!
+//! Which side was inverted was settled the same way rather than by argument:
+//! negating position `y` renders a coherent upright model, and flipping uv `v`
+//! shreds the art across meshes. Both satisfy the determinant; only one is a
+//! picture.
 //!
 //! Nothing here checks rotation. Two tempting alternatives do **not** work:
 //!
@@ -102,7 +113,7 @@ fn posed_geometry_agrees_with_the_texture_it_samples() {
         }
         let Some(det) = uv_to_position_determinant(&drawable.uvs, points) else { continue };
         total += 1;
-        if det > 0.0 {
+        if det < 0.0 {
             agree += 1;
         }
     }
@@ -111,8 +122,8 @@ fn posed_geometry_agrees_with_the_texture_it_samples() {
     // Not every drawable: a degenerate or near-collinear mesh fits noisily.
     assert!(
         agree * 10 >= total * 9,
-        "only {agree} of {total} drawables are oriented to match their own texture; \
-         a mirrored model scores near zero here, though a rotated one scores \
+        "only {agree} of {total} drawables carry the sign the Spine path does; \
+         a vertically mirrored model scores near zero here, though a rotated one scores \
          just as well as an upright one: a determinant cannot see a turn"
     );
 }

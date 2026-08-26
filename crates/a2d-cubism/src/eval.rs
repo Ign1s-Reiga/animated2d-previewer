@@ -272,6 +272,16 @@ impl Moc3 {
                 points = local;
                 unstable.push(index);
             }
+
+            // A MOC3 stores y running down the canvas, the way an image's rows
+            // do; everything downstream of `formats/` takes y as running up.
+            // Converting here rather than at emit keeps `bounds` and `emit`
+            // agreeing, and keeps the whole chain above -- deformer grids,
+            // rotation frames, keyform blending -- working in the file's own
+            // space, where the numbers mean what the format says they mean.
+            for point in &mut points {
+                point.1 = -point.1;
+            }
             drawables.push(points);
         }
 
@@ -583,6 +593,16 @@ mod tests {
 
     /// The fixture in `moc3` has one parameter with keys at -30, 0 and 30, a
     /// quad that doubles across them, and a drawable in the warp's unit square.
+    /// Converts an expectation written in the file's own space.
+    ///
+    /// The fixture's keyforms are authored the way a MOC3 stores them, with y
+    /// running down; `pose` hands back the upward y everything downstream uses.
+    /// Keeping the expectations in the authored space and converting them here
+    /// means each test still reads against the numbers the fixture contains.
+    fn up(points: &[(f32, f32)]) -> Vec<(f32, f32)> {
+        points.iter().map(|(x, y)| (*x, -*y)).collect()
+    }
+
     fn posed(angle: f32) -> Vec<(f32, f32)> {
         let moc = crate::Moc3::parse(&crate::moc3::tests::Builder::new().build()).expect("should parse");
         moc.pose(&[angle]).drawables.into_iter().next().expect("one drawable")
@@ -593,21 +613,21 @@ mod tests {
         // At zero the grid is the unit quad, so the drawable's corners land on
         // it: (0,0), (1,0) and (0,1) of the square map to the quad's corners.
         let points = posed(0.0);
-        assert_eq!(points, [(0.0, 0.0), (10.0, 0.0), (0.0, 20.0)]);
+        assert_eq!(points, up(&[(0.0, 0.0), (10.0, 0.0), (0.0, 20.0)]));
     }
 
     #[test]
     fn a_parameter_between_keys_blends_the_keyforms_around_it() {
         // Half way from key 0 to key 30 blends a unit quad with a doubled one.
         let points = posed(15.0);
-        assert_eq!(points, [(0.0, 0.0), (15.0, 0.0), (0.0, 30.0)]);
+        assert_eq!(points, up(&[(0.0, 0.0), (15.0, 0.0), (0.0, 30.0)]));
     }
 
     #[test]
     fn a_parameter_past_its_range_is_clamped_before_it_is_used() {
         // The parameter's own maximum is 30, so anything beyond poses as 30.
         assert_eq!(posed(999.0), posed(30.0));
-        assert_eq!(posed(30.0), [(0.0, 0.0), (20.0, 0.0), (0.0, 40.0)]);
+        assert_eq!(posed(30.0), up(&[(0.0, 0.0), (20.0, 0.0), (0.0, 40.0)]));
     }
 
     #[test]
@@ -658,7 +678,7 @@ mod tests {
         let bytes = crate::moc3::tests::Builder::new().warp_divisions(1, 2).build();
         let moc = crate::Moc3::parse(&bytes).expect("should parse");
         let points = moc.pose(&[0.0]).drawables.into_iter().next().expect("one drawable");
-        assert_eq!(points, [(0.0, 0.0), (10.0, 0.0), (0.0, 20.0)]);
+        assert_eq!(points, up(&[(0.0, 0.0), (10.0, 0.0), (0.0, 20.0)]));
     }
 
     #[test]

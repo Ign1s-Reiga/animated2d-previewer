@@ -1477,6 +1477,34 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn posing_turns_the_file_s_downward_y_into_the_upward_y_used_downstream() {
+        // A drawable with no parent deformer is posed from its keyforms alone,
+        // so the only thing between the stored numbers and the result is the
+        // coordinate conversion -- which makes the sign readable directly.
+        let bytes = Builder::new().drawable_parents(&[u32::MAX]).build();
+        let moc = Moc3::parse(&bytes).expect("fixture");
+        let d = &moc.drawables[0];
+        let count = d.uvs.len();
+
+        // The premise: every stored y in this fixture's keyforms is non-negative.
+        // A blend of them is a weighted average, so it stays non-negative too.
+        let mut stored_max: f32 = 0.0;
+        for k in 0..d.keyform_count as usize {
+            let points = moc.keyforms.drawable(d.keyform_begin as usize + k, count).expect("keyform");
+            for y in points.iter().skip(1).step_by(2) {
+                assert!(*y >= 0.0, "the premise of this test is that stored y is non-negative, found {y}");
+                stored_max = stored_max.max(*y);
+            }
+        }
+        assert!(stored_max > 0.0, "a fixture with every y at zero could not show a sign change");
+
+        let pose = moc.pose(&[]);
+        let posed = &pose.drawables[0];
+        assert!(posed.iter().all(|(_, y)| *y <= 0.0), "posed y should come out negated: {posed:?}");
+        assert!(posed.iter().any(|(_, y)| *y < 0.0), "at least one point has to have moved off the axis");
+    }
+
+    #[test]
     fn a_drawable_may_hang_off_the_model_root_rather_than_a_deformer() {
         // `0xFFFFFFFF` is the format's "none", the same sentinel a deformer's
         // own parent uses. Read as an index it is four billion, so getting
