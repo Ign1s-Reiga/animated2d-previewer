@@ -1299,7 +1299,7 @@ fn read_draw_order_timeline(
         let mut moves = Vec::with_capacity(offset_count);
         for _ in 0..offset_count {
             let slot = SlotId(r.varint()? as u16);
-            let offset = r.varint_signed()?;
+            let offset = r.varint_i32()?;
             moves.push((slot, offset));
         }
         let order = if moves.is_empty() {

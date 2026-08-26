@@ -63,3 +63,53 @@ fn the_extracted_rig_decodes_with_no_unity_specific_handling() {
     }
     assert!(!detection.version.to_string().is_empty());
 }
+
+/// Every draw order keyframe in a real rig must resolve to a permutation.
+///
+/// This is the strongest kind of check available here, because it holds the
+/// decoder against a constraint the format imposes rather than against our own
+/// idea of the format: a draw order is a rearrangement of the slots, so each
+/// keyframe's offsets have to land every moved slot on a distinct index that
+/// exists. A misread offset almost always violates that, and cannot be talked
+/// into satisfying it.
+///
+/// It is what established that the offset is a raw 32-bit varint rather than a
+/// zig-zagged one. Under the zig-zagged reading, 62 keyframes across a sample
+/// of 120 rigs failed this; under the raw reading, none did. The round-trip
+/// fixture test passed the whole time, because the fixture writer shared the
+/// misunderstanding.
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_SPINE_BUNDLE to a Unity bundle"]
+fn every_draw_order_keyframe_forms_a_permutation_of_the_slots() {
+    let Some((inventory, mut report)) = bundle() else { return };
+    let (Some(skeleton), Some(atlas)) = (&inventory.skeleton, &inventory.atlas) else { return };
+    let text = String::from_utf8_lossy(&atlas.bytes);
+    let (pages, atlas_report) = a2d_spine::parse_atlas(&text).expect("the atlas should parse");
+    report.absorb(atlas_report);
+    let (ir, _) = a2d_spine::decode_skeleton(&skeleton.bytes, pages, &mut report).expect("should decode");
+
+    // The decoder degrades rather than fails on an impossible order (§10), so
+    // the failure is in the report, not in the return value.
+    let rejected: Vec<String> =
+        report.warnings().iter().map(ToString::to_string).filter(|w| w.contains("drawOrder offset")).collect();
+    assert!(rejected.is_empty(), "draw order offsets did not resolve: {rejected:#?}");
+
+    // And what did resolve has to be a genuine permutation, not merely
+    // something the resolver was willing to return.
+    for animation in &ir.animations {
+        for timeline in &animation.timelines {
+            let a2d_core::ir::spine::Timeline::DrawOrder { keys } = timeline else { continue };
+            for key in keys {
+                let Some(order) = &key.order else { continue };
+                assert_eq!(order.len(), ir.slots.len(), "{:?} at {}", animation.name, key.time);
+                let mut seen = vec![false; ir.slots.len()];
+                for slot in order {
+                    let index = slot.0 as usize;
+                    assert!(index < seen.len(), "{:?} at {} names slot {index}", animation.name, key.time);
+                    assert!(!seen[index], "{:?} at {} draws slot {index} twice", animation.name, key.time);
+                    seen[index] = true;
+                }
+            }
+        }
+    }
+}

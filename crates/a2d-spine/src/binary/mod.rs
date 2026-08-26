@@ -104,6 +104,11 @@ pub(crate) mod writer {
             }
         }
 
+        /// Counterpart to `BinaryReader::varint_i32`: no zig-zag step.
+        pub fn varint_i32(&mut self, v: i32) -> &mut Self {
+            self.varint(v as u32)
+        }
+
         pub fn varint_signed(&mut self, v: i32) -> &mut Self {
             self.varint(((v << 1) ^ (v >> 31)) as u32)
         }
@@ -385,7 +390,7 @@ mod tests {
         w.varint(1);
         w.f32(0.0);
         w.varint(1);
-        w.varint(1).varint_signed(-1); // slot 1 moves to the front
+        w.varint(1).varint_i32(-1); // slot 1 moves to the front
 
         // Events.
         w.varint(1);
@@ -632,6 +637,11 @@ mod tests {
         }
     }
 
+    /// Note this only shows the decoder and the fixture writer agree on the
+    /// draw order encoding. They agreed on a wrong one for a long time; what
+    /// established the right one was decoding real exports, where the offsets
+    /// have to form a permutation and did not. The byte-level pinning lives in
+    /// `reader::tests`, and the real-asset check in `a2d-cli`'s gated tests.
     #[test]
     fn draw_order_offsets_expand_to_an_explicit_order() {
         let (ir, _) = decode_fixture(true);

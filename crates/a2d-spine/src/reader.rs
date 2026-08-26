@@ -121,6 +121,22 @@ impl<'a> BinaryReader<'a> {
         Ok(result)
     }
 
+    /// Varint holding a 32-bit value directly, without the zig-zag step.
+    ///
+    /// Spine's binary format carries signed numbers two different ways and
+    /// chooses per field, so this is not interchangeable with
+    /// [`varint_signed`](Self::varint_signed). An event's int value is
+    /// zig-zagged; a draw order offset is not -- it is the raw two's-complement
+    /// pattern written as a varint, so -1 arrives as a five-byte `0xFFFFFFFF`
+    /// rather than as `1`.
+    ///
+    /// Reading one as the other is quiet rather than loud: `+1` and `-1` both
+    /// decode to a plausible small number of the wrong sign, and only larger
+    /// negatives come out far enough out of range to be noticed.
+    pub fn varint_i32(&mut self) -> Result<i32, DecodeError> {
+        Ok(self.varint()? as i32)
+    }
+
     /// Zig-zag decoded variable-length signed integer.
     pub fn varint_signed(&mut self) -> Result<i32, DecodeError> {
         let raw = self.varint()?;
@@ -206,6 +222,28 @@ mod tests {
             let bytes = encode_varint(v);
             assert_eq!(BinaryReader::new(&bytes).varint().unwrap(), v, "value {v}");
         }
+    }
+
+    #[test]
+    fn a_raw_signed_varint_is_not_a_zig_zagged_one() {
+        // Spine chooses between the two signed encodings per field, so these
+        // bytes are pinned literally rather than produced by our own writer:
+        // a writer that shares the decoder's misunderstanding agrees with it.
+        // This is the five-byte pattern a real export carries for -1.
+        let minus_one = [0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
+        assert_eq!(BinaryReader::new(&minus_one).varint_i32().unwrap(), -1);
+        assert_ne!(
+            BinaryReader::new(&minus_one).varint_signed().unwrap(),
+            -1,
+            "the two encodings must not be interchangeable, or nothing here is being tested"
+        );
+
+        // The dangerous direction is the quiet one. A small positive value
+        // decodes either way without complaint, to different numbers of
+        // different signs -- so mixing the two corrupts a draw order silently
+        // and only trips an out-of-range check on the larger negatives.
+        assert_eq!(BinaryReader::new(&[0x02]).varint_i32().unwrap(), 2);
+        assert_eq!(BinaryReader::new(&[0x02]).varint_signed().unwrap(), 1);
     }
 
     #[test]
