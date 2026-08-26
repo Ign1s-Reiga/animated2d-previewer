@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use a2d_core::{AnimatedModel, DecodeError, LoadReport, PlayOptions, RenderList, Rgba, Vec2};
+use a2d_core::{Aabb, AnimatedModel, DecodeError, LoadReport, PlayOptions, RenderList, Rgba, Vec2};
 use a2d_pack::Package;
 use a2d_render::{
     Camera, FrameSettings, FrameStats, GpuContext, RenderError, Renderer, Rgba8Image, SamplerConfig, Viewport,
@@ -38,10 +38,57 @@ pub struct LoadedModel {
     /// deliberately cannot name a concrete model type: knowing which family it
     /// is showing is exactly what it must not need.
     pub model: Box<dyn AnimatedModel>,
+    /// The box the camera frames, worked out once when the model is loaded.
+    ///
+    /// Fitting the live pose every frame would rescale the character whenever
+    /// an animation reached further than the last: measured on one rig, the
+    /// same window drew it 128 by 180 while a standing animation played and
+    /// 376 by 636 moments later. A mascot that shrinks when it swings a rifle
+    /// is not what anyone wants, so the frame is taken from the opening
+    /// animation and then held, and movement happens *within* it.
+    framing: Aabb,
     /// Texture pages as stored, kept so a model can be re-uploaded when it
     /// becomes active again without re-reading the package from disk.
     pages: Vec<(String, Option<Rgba8Image>, bool, SamplerConfig)>,
     idle: IdleDirector,
+}
+
+/// The box to frame a model in, from the animation it opens with.
+///
+/// Sampling the opening animation rather than the pose of the moment is what
+/// makes the frame stable: a rig whose standing pose is compact but whose
+/// attack reaches twice its own height would otherwise be framed differently
+/// depending on when the camera happened to be asked.
+///
+/// A model that cannot be posed at a timestamp -- the Cubism family, whose
+/// motions are not decoded -- falls back to whatever it reports now, which for
+/// those is the canvas and already stable.
+fn frame_of(model: &mut dyn AnimatedModel) -> Aabb {
+    let opening = model.default_animation().map(str::to_string);
+    let Some(name) = opening else { return model.bounds() };
+    let duration = model.animations().iter().find(|a| a.name == name).map(|a| a.duration).unwrap_or(0.0);
+
+    let mut framing = Aabb::EMPTY;
+    const SAMPLES: u32 = 8;
+    for step in 0..=SAMPLES {
+        let at = duration * step as f32 / SAMPLES as f32;
+        if model.pose_at(&name, at).is_err() {
+            return model.bounds();
+        }
+        let bounds = model.bounds();
+        if !bounds.is_empty() {
+            framing.extend(bounds.min);
+            framing.extend(bounds.max);
+        }
+    }
+    // Leave it where it started rather than at the last sample, so the pose the
+    // viewer first shows is the one the animation opens on.
+    let _ = model.pose_at(&name, 0.0);
+    if framing.is_empty() {
+        model.bounds()
+    } else {
+        framing
+    }
 }
 
 impl std::fmt::Debug for LoadedModel {
@@ -105,7 +152,9 @@ impl LoadedModel {
         let seed = package.manifest.display_name.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
         let idle = IdleDirector::from_animations(model.animations(), seed);
 
-        Ok(LoadedModel { package_path: path.to_path_buf(), model, pages, idle })
+        let mut model = model;
+        let framing = frame_of(model.as_mut());
+        Ok(LoadedModel { package_path: path.to_path_buf(), model, framing, pages, idle })
     }
 
     /// Builds a model the caller has already decoded.
@@ -122,7 +171,9 @@ impl LoadedModel {
         model.absorb_degradations(report);
         let seed = model.display_name().bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
         let idle = IdleDirector::from_animations(model.animations(), seed);
-        LoadedModel { package_path: path.to_path_buf(), model, pages, idle }
+        let mut model = model;
+        let framing = frame_of(model.as_mut());
+        LoadedModel { package_path: path.to_path_buf(), model, framing, pages, idle }
     }
 
     /// The selector entry describing this model.
@@ -291,7 +342,7 @@ impl Viewer {
     /// the user's remembered placement is applied on top of a sensible default
     /// rather than replacing it.
     pub fn camera(&self, viewport: Viewport, scale: f32, offset: Vec2) -> Camera {
-        let mut camera = Camera::fit(self.active().model.bounds(), viewport, 0.1);
+        let mut camera = Camera::fit(self.active().framing, viewport, 0.1);
         camera.pixels_per_unit *= scale.max(f32::MIN_POSITIVE);
         // The offset is in logical pixels, so it converts to model units
         // through the zoom — otherwise the character would drift as it scales.
@@ -325,6 +376,117 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model whose extent grows partway through its animation, like a rig
+    /// that swings a weapon well past its standing silhouette.
+    struct Reaching {
+        animations: Vec<a2d_core::AnimationInfo>,
+        at: f32,
+    }
+
+    impl AnimatedModel for Reaching {
+        fn update(&mut self, _dt: Duration) -> Result<(), a2d_core::RuntimeError> {
+            Ok(())
+        }
+        fn emit(&self, _out: &mut RenderList) {}
+        fn play_animation(&mut self, _n: &str, _o: PlayOptions) -> Result<(), a2d_core::RuntimeError> {
+            Ok(())
+        }
+        fn stop_animation(&mut self, _n: &str) {}
+        fn set_expression(&mut self, _n: &str) -> Result<(), a2d_core::RuntimeError> {
+            Ok(())
+        }
+        fn animations(&self) -> &[a2d_core::AnimationInfo] {
+            &self.animations
+        }
+        fn expressions(&self) -> &[a2d_core::ExpressionInfo] {
+            &[]
+        }
+        fn bounds(&self) -> Aabb {
+            // Compact at the ends, twice as tall in the middle.
+            let reach = if (self.at - 0.5).abs() < 0.01 { 20.0 } else { 10.0 };
+            let mut b = Aabb::EMPTY;
+            b.extend(Vec2::new(-5.0, 0.0));
+            b.extend(Vec2::new(5.0, reach));
+            b
+        }
+        fn hit_test(&self, _x: f32, _y: f32) -> Option<a2d_core::HitAreaId> {
+            None
+        }
+        fn dispose(&mut self) {}
+        fn display_name(&self) -> &str {
+            "reaching"
+        }
+        fn pose_at(&mut self, _animation: &str, time: f32) -> Result<(), a2d_core::RuntimeError> {
+            self.at = time;
+            Ok(())
+        }
+    }
+
+    fn reaching() -> Reaching {
+        Reaching { animations: vec![a2d_core::AnimationInfo { name: "Stand".into(), duration: 1.0 }], at: 0.0 }
+    }
+
+    #[test]
+    fn the_frame_covers_the_whole_opening_animation() {
+        // Fitting whatever pose happens to be current rescales the character
+        // every time an animation reaches further than the last. Sampling the
+        // opening animation once gives a frame that already contains it.
+        let mut model = reaching();
+        let framing = frame_of(&mut model);
+        assert_eq!(framing.max.y, 20.0, "the frame must contain the animation's furthest reach");
+        assert_eq!(framing.min.y, 0.0);
+    }
+
+    #[test]
+    fn sampling_leaves_the_model_at_the_start_of_its_animation() {
+        // Otherwise the first frame a viewer shows is the last one sampled.
+        let mut model = reaching();
+        let _ = frame_of(&mut model);
+        assert_eq!(model.at, 0.0);
+    }
+
+    #[test]
+    fn a_model_that_cannot_seek_is_framed_by_what_it_reports() {
+        // The Cubism family: its motions are not decoded, and its bounds are
+        // the canvas, which does not move anyway.
+        struct Fixed;
+        impl AnimatedModel for Fixed {
+            fn update(&mut self, _dt: Duration) -> Result<(), a2d_core::RuntimeError> {
+                Ok(())
+            }
+            fn emit(&self, _out: &mut RenderList) {}
+            fn play_animation(&mut self, _n: &str, _o: PlayOptions) -> Result<(), a2d_core::RuntimeError> {
+                Ok(())
+            }
+            fn stop_animation(&mut self, _n: &str) {}
+            fn set_expression(&mut self, _n: &str) -> Result<(), a2d_core::RuntimeError> {
+                Ok(())
+            }
+            fn animations(&self) -> &[a2d_core::AnimationInfo] {
+                &[]
+            }
+            fn expressions(&self) -> &[a2d_core::ExpressionInfo] {
+                &[]
+            }
+            fn bounds(&self) -> Aabb {
+                let mut b = Aabb::EMPTY;
+                b.extend(Vec2::new(-1.0, -2.0));
+                b.extend(Vec2::new(1.0, 2.0));
+                b
+            }
+            fn hit_test(&self, _x: f32, _y: f32) -> Option<a2d_core::HitAreaId> {
+                None
+            }
+            fn dispose(&mut self) {}
+            fn display_name(&self) -> &str {
+                "fixed"
+            }
+        }
+        let framing = frame_of(&mut Fixed);
+        assert_eq!(framing.min, Vec2::new(-1.0, -2.0));
+        assert_eq!(framing.max, Vec2::new(1.0, 2.0));
+    }
 
     #[test]
     fn loading_a_missing_package_reports_rather_than_panicking() {
