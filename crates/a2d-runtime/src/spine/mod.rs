@@ -104,12 +104,7 @@ impl GenericSpineModel {
 
     /// A sensible animation to start with: `idle` if present, else the first.
     pub fn default_animation(&self) -> Option<&str> {
-        self.animations
-            .iter()
-            .find(|a| a.name.eq_ignore_ascii_case("idle"))
-            .or_else(|| self.animations.iter().find(|a| a.name.to_ascii_lowercase().contains("idle")))
-            .or_else(|| self.animations.first())
-            .map(|a| a.name.as_str())
+        a2d_core::preferred_animation(&self.animations)
     }
 
     /// Poses the skeleton at an exact time without advancing any track.

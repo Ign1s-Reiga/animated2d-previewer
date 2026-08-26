@@ -95,6 +95,31 @@ pub struct ExpressionInfo {
 ///
 /// `load` is deliberately not a trait method: it is a constructor on each
 /// concrete type, so a model never exists in a partially initialised state.
+/// Picks a sensible animation to open a model with.
+///
+/// A viewer opening a character wants it standing there, not swinging a
+/// weapon. Rigs do not agree on what to call that pose, so the common names are
+/// tried in turn before falling back to whatever comes first:
+///
+/// * `idle`, then any name containing it;
+/// * `stand`, then any name containing it -- one real rig's animations are
+///   `Hitaction_1`, `Hitaction_2`, `Stand` and `Stop`, and without this it
+///   opens mid-attack with the camera fitted to a swing twice the character's
+///   height.
+///
+/// `stop` is deliberately not in the list: it reads as a standing pose but is
+/// a zero-length one on every rig seen, so it has nothing to play.
+pub fn preferred_animation(all: &[AnimationInfo]) -> Option<&str> {
+    let exact = |want: &str| all.iter().find(|a| a.name.eq_ignore_ascii_case(want));
+    let loose = |want: &str| all.iter().find(|a| a.name.to_ascii_lowercase().contains(want));
+    exact("idle")
+        .or_else(|| loose("idle"))
+        .or_else(|| exact("stand"))
+        .or_else(|| loose("stand"))
+        .or_else(|| all.first())
+        .map(|a| a.name.as_str())
+}
+
 /// `render` is deliberately split into [`AnimatedModel::emit`] plus a renderer,
 /// so that no GPU type reaches this crate.
 pub trait AnimatedModel {
@@ -133,12 +158,7 @@ pub trait AnimatedModel {
     /// The rule is the same for every runtime family, so it lives here rather
     /// than being restated per model.
     fn default_animation(&self) -> Option<&str> {
-        let all = self.animations();
-        all.iter()
-            .find(|a| a.name.eq_ignore_ascii_case("idle"))
-            .or_else(|| all.iter().find(|a| a.name.to_ascii_lowercase().contains("idle")))
-            .or_else(|| all.first())
-            .map(|a| a.name.as_str())
+        preferred_animation(self.animations())
     }
 
     /// Scales the whole model. A negative component mirrors it.
@@ -169,6 +189,40 @@ pub trait AnimatedModel {
 
 #[cfg(test)]
 mod tests {
+    fn named(names: &[&str]) -> Vec<AnimationInfo> {
+        names.iter().map(|n| AnimationInfo { name: (*n).to_string(), duration: 1.0 }).collect()
+    }
+
+    #[test]
+    fn an_idle_animation_wins_however_it_is_capitalised() {
+        assert_eq!(preferred_animation(&named(&["Attack", "IDLE", "Stand"])), Some("IDLE"));
+        assert_eq!(preferred_animation(&named(&["Attack", "idle_loop", "Stand"])), Some("idle_loop"));
+    }
+
+    #[test]
+    fn a_standing_animation_is_taken_when_there_is_no_idle() {
+        // A real rig: without this the viewer opens mid-attack, with the camera
+        // fitted to a swing twice the character's height.
+        assert_eq!(preferred_animation(&named(&["Hitaction_1", "Hitaction_2", "Stand", "Stop"])), Some("Stand"));
+    }
+
+    #[test]
+    fn idle_is_preferred_over_standing() {
+        assert_eq!(preferred_animation(&named(&["Stand", "Idle"])), Some("Idle"));
+    }
+
+    #[test]
+    fn stop_is_not_mistaken_for_a_standing_pose() {
+        // It reads like one but is zero-length on every rig seen, so there
+        // would be nothing to play.
+        assert_eq!(preferred_animation(&named(&["Hitaction_1", "Stop"])), Some("Hitaction_1"));
+    }
+
+    #[test]
+    fn a_model_with_no_animations_has_no_default() {
+        assert_eq!(preferred_animation(&[]), None);
+    }
+
     use super::*;
 
     #[test]

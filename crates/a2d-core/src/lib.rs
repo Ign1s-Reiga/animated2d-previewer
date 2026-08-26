@@ -18,6 +18,6 @@ pub mod report;
 
 pub use error::{DecodeError, ModelKind, RuntimeError};
 pub use math::{Aabb, Affine2, Bezier, Interpolation, Rgb, Rgba, Vec2};
-pub use model::{AnimatedModel, AnimationInfo, ExpressionInfo, PlayOptions};
+pub use model::{preferred_animation, AnimatedModel, AnimationInfo, ExpressionInfo, PlayOptions};
 pub use render::{BlendMode, HitAreaId, MaskId, RenderList, RenderMask, RenderMesh, TextureId};
 pub use report::{Degradation, LoadReport};
