@@ -648,9 +648,9 @@ fn print_moc3(
     // A count that disagrees with the Unity components means one of the two
     // readings is wrong, and saying which is which beats picking one.
     let rows: [(&str, u32, usize); 3] = [
-        ("parameters", model.counts.parameters, inventory.parameters),
-        ("parts", model.counts.parts, inventory.parts),
-        ("drawables", model.counts.drawables, inventory.drawables),
+        ("parameters:", model.counts.parameters, inventory.parameters),
+        ("parts:", model.counts.parts, inventory.parts),
+        ("drawables:", model.counts.drawables, inventory.drawables),
     ];
     for (label, from_moc, from_unity) in rows {
         let note =
