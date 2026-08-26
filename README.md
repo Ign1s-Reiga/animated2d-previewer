@@ -105,6 +105,41 @@ character.a2dpack/
 シリアライズは決定論的（フィールド順固定・マップはソート・浮動小数の書式固定）である必要が
 あります。ゴールデンテストがこれに依存します。
 
+---
+
+## ナイトリービルド
+
+`main` の最新コミットから自動ビルドされたバイナリを、`nightly` プレリリースとして
+公開しています。ビルドのたびに同じタグへ置き換えられるため、以下のリンクは常に
+最新版を指します。
+
+| プラットフォーム | ダウンロード |
+| --- | --- |
+| Windows (x86_64) | [`animated2d-x86_64-pc-windows-msvc.zip`](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/download/nightly/animated2d-x86_64-pc-windows-msvc.zip) |
+| Linux (x86_64) | [`animated2d-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/download/nightly/animated2d-x86_64-unknown-linux-gnu.tar.gz) |
+| macOS (Apple silicon) | [`animated2d-aarch64-apple-darwin.tar.gz`](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/download/nightly/animated2d-aarch64-apple-darwin.tar.gz) |
+
+一覧とリリースノートは [Releases](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/tag/nightly)、ビルドの実行ログは
+[Actions](https://github.com/Ign1s-Reiga/animated2d-previewer/actions/workflows/nightly.yml) にあります。
+チェックサムは同じリリースの `SHA256SUMS` で検証できます。
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+**注意事項:**
+
+- **プレリリースです。** タグ付きの安定版ではなく、`main` の状態をそのまま反映します。
+- **署名していません。** Windows SmartScreen と macOS Gatekeeper の両方が警告します。
+  macOS では実行前に `xattr -d com.apple.quarantine animated2d` が必要です。
+- **CI にグラフィックスアダプタはありません。** GPU テストとウィンドウテストは自動的に
+  スキップされるため、ナイトリーが緑であることは「コードが通り、デコーダ・ランタイム・
+  パッケージングのテストが通った」ことを意味し、「描画が正しい」ことは意味しません。
+
+自分でビルドする場合は下の「開発環境」を参照してください。
+
+---
+
 ## CLI
 
 ```bash

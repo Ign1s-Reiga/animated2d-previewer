@@ -1,0 +1,196 @@
+name: Nightly
+
+# Builds the viewer for each desktop platform and republishes them as a rolling
+# `nightly` prerelease, so the README can link to a download URL that never
+# changes.
+#
+# Nothing is published from a red tree: `check` gates the build, and the build
+# gates the publish.
+
+on:
+  schedule:
+    # 18:00 UTC, which is early morning in JST.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+# Only one nightly at a time; a scheduled run and a manual one would otherwise
+# race to replace the same release.
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # A nightly is not the place to debug a slow linker; fail rather than hang.
+  CARGO_NET_RETRY: 3
+
+jobs:
+  check:
+    name: Format, lints and tests
+    runs-on: ubuntu-latest
+    outputs:
+      worth-building: ${{ steps.recent.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `git log --since` needs more than the default shallow clone.
+          fetch-depth: 0
+
+      - name: Is there anything new since the last nightly?
+        id: recent
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Manual run: building regardless."
+          elif [ -n "$(git log --since='24 hours ago' --oneline)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No commits in the last day; skipping the build."
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libayatana-appindicator3-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev pkg-config
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # A2D_REQUIRE_GPU is deliberately unset: a runner has no adapter, and the
+      # GPU and window tests skip themselves rather than fail. That does mean a
+      # nightly is not proof the renderer works, only that everything else does.
+      - run: cargo test --workspace
+
+  build:
+    name: ${{ matrix.label }}
+    needs: check
+    if: needs.check.outputs.worth-building == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows (x86_64)
+            archive: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: Linux (x86_64)
+            archive: tar
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macOS (Apple silicon)
+            archive: tar
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: System libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libayatana-appindicator3-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev pkg-config
+
+      - name: Build the viewer
+        run: cargo build --release --locked --target ${{ matrix.target }} -p a2d-cli
+
+      # The archive name carries no date or commit, so the README's download
+      # links stay valid from one nightly to the next.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="animated2d-${{ matrix.target }}"
+          mkdir -p "dist/$staging"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/animated2d.exe" "dist/$staging/"
+          else
+            cp "target/${{ matrix.target }}/release/animated2d" "dist/$staging/"
+          fi
+          cp README.md LICENSE LICENSE-APACHE LICENSE-MIT "dist/$staging/"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a -tzip "$staging.zip" "$staging" >/dev/null
+          else
+            tar czf "$staging.tar.gz" "$staging"
+          fi
+          rm -rf "$staging"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Publish the rolling nightly
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Replace the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'NOTES'
+          Built automatically from `main`. This is a **prerelease**: it is
+          rebuilt and replaced whenever `main` changes, so the download links
+          always point at the newest build and never at a fixed one.
+
+          The binaries are unsigned. Windows SmartScreen and macOS Gatekeeper
+          will both object; on macOS you will need
+          `xattr -d com.apple.quarantine animated2d` before it will run.
+
+          CI has no graphics adapter, so the GPU and window tests skip
+          themselves. A green nightly says the code compiles and the decoders,
+          runtime and packaging pass their tests — it does not say the renderer
+          drew anything.
+
+          Verify a download against `SHA256SUMS`.
+          NOTES
+          # Delete rather than edit: it is the only way to move the tag onto the
+          # new commit without a force push, and it keeps assets from a previous
+          # build from lingering beside the current ones.
+          gh release delete nightly --cleanup-tag --yes || true
+          gh release create nightly \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Nightly build" \
+            --notes-file notes.md \
+            dist/*
