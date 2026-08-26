@@ -191,6 +191,19 @@ is the one that renders correctly.
 Deformers form a forest; a drawable names one parent deformer and inherits the
 chain above it. There are two kinds.
 
+A drawable need not name a deformer at all: section 40 stores `0xFFFFFFFF` for a
+mesh parented straight to the model root, and such a mesh is already in model
+space. This is the same "none" sentinel used by a deformer's own parent
+(section 16) and by a drawable's part (section 9), so it is the format's general
+convention rather than a special case here.
+
+*What established it:* reading the field as a plain index rejected two of the
+six real models available, each naming deformer 4294967295 out of 220 and 456
+respectively. Both load once the sentinel is honoured, and the meshes concerned
+are ones with nothing above them to inherit. The failure is loud rather than
+subtle only by luck — the value is far out of range, so it tripped a bounds
+check instead of deforming something quietly.
+
 A **warp deformer** is a grid of control points, stored row-major with
 `divisions.1 + 1` points to a row. Its children live in the grid's unit square, and
 posing a point is a bilinear lookup. Outside the square the edge cells are

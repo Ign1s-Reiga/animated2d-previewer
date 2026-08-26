@@ -154,7 +154,11 @@ fn a_real_model_yields_meshes_whose_triangles_are_all_in_range() {
         for &(u, v) in &d.uvs {
             assert!((-0.01..=1.01).contains(&u) && (-0.01..=1.01).contains(&v), "{} has a uv at ({u}, {v})", d.id);
         }
-        assert!(d.parent_deformer < moc.counts.deformers, "{} names a deformer out of range", d.id);
+        // `None` is legitimate: a drawable can hang off the model root rather
+        // than off a deformer, which the format spells `0xFFFFFFFF`.
+        if let Some(parent) = d.parent_deformer {
+            assert!(parent < moc.counts.deformers, "{} names a deformer out of range", d.id);
+        }
         vertices += d.vertex_count();
         triangles += d.triangle_count();
     }

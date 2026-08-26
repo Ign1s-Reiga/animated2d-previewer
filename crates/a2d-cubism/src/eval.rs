@@ -343,13 +343,15 @@ impl Moc3 {
     /// Carries points up the deformer chain until they reach canvas space.
     fn carry_up(
         &self,
-        from: u32,
+        from: Option<u32>,
         points: &mut [(f32, f32)],
         warps: &[Vec<(f32, f32)>],
         rotations: &[RotationKeyform],
         units: &[(f32, f32)],
     ) {
-        let mut at = Some(from);
+        // `None` is not a special case to handle: a drawable with no parent
+        // deformer is already in model space, so the walk simply does not run.
+        let mut at = from;
         // The tree is checked acyclic on parse, so this terminates; the counter
         // is belt and braces against a future change that stops checking.
         let mut guard = 0usize;

@@ -273,8 +273,14 @@ impl Parameter {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Drawable {
     pub id: String,
-    /// Index of the deformer that moves this mesh.
-    pub parent_deformer: u32,
+    /// Deformer that moves this mesh, or `None` when nothing does.
+    ///
+    /// A drawable may be parented straight to the model root rather than to a
+    /// deformer, and the format spells that `0xFFFFFFFF` -- the same sentinel
+    /// [`Deformer::parent`] and [`Drawable::part`] use. Read as an index it is
+    /// four billion, so a model that uses it fails to load outright rather
+    /// than deforming oddly.
+    pub parent_deformer: Option<u32>,
     /// Texture coordinates, one per vertex.
     pub uvs: Vec<(f32, f32)>,
     /// Triangle indices, local to this drawable's own vertices.
@@ -904,16 +910,22 @@ fn read_drawables(
                 indices.len()
             )));
         }
-        if parents[i] as u64 >= counts.deformers as u64 {
+        // `0xFFFFFFFF` means "no deformer", exactly as it does for a
+        // deformer's own parent; anything else has to be a real index.
+        let parent_deformer = if parents[i] == u32::MAX {
+            None
+        } else if (parents[i] as u64) < counts.deformers as u64 {
+            Some(parents[i])
+        } else {
             return Err(DecodeError::corrupt(format!(
                 "drawable {i} names deformer {} of {}",
                 parents[i], counts.deformers
             )));
-        }
+        };
 
         out.push(Drawable {
             id: ids.get(i).cloned().unwrap_or_default(),
-            parent_deformer: parents[i],
+            parent_deformer,
             uvs,
             indices,
             keyform_begin: keyform_begin[i],
@@ -1465,10 +1477,28 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn a_drawable_may_hang_off_the_model_root_rather_than_a_deformer() {
+        // `0xFFFFFFFF` is the format's "none", the same sentinel a deformer's
+        // own parent uses. Read as an index it is four billion, so getting
+        // this wrong rejects the whole model rather than misplacing one mesh --
+        // which is how it was found: two of the six real models available
+        // would not load at all.
+        let bytes = Builder::new().drawables(2).drawable_parents(&[u32::MAX, 1]).build();
+        let moc = Moc3::parse(&bytes).expect("a root-parented drawable is valid");
+        assert_eq!(moc.drawables[0].parent_deformer, None);
+        assert_eq!(moc.drawables[1].parent_deformer, Some(1));
+
+        // A parent that is neither the sentinel nor a real deformer is still
+        // an error, so the sentinel is not being used to wave through nonsense.
+        let bad = Builder::new().drawables(2).drawable_parents(&[9999, 1]).build();
+        assert!(Moc3::parse(&bad).is_err(), "an out-of-range parent must still be rejected");
+    }
+
+    #[test]
     fn flags_choose_the_blend_mode() {
         let mut d = Drawable {
             id: String::new(),
-            parent_deformer: 0,
+            parent_deformer: Some(0),
             uvs: Vec::new(),
             indices: Vec::new(),
             keyform_begin: 0,
@@ -1519,6 +1549,8 @@ pub(crate) mod tests {
         /// way an older model does.
         opacities: Option<Vec<f32>>,
         masked: bool,
+        /// Parent deformer of each drawable; `u32::MAX` means the model root.
+        drawable_parents: Option<Vec<u32>>,
     }
 
     impl Builder {
@@ -1532,6 +1564,7 @@ pub(crate) mod tests {
                 version: 2,
                 opacities: None,
                 masked: false,
+                drawable_parents: None,
             }
         }
 
@@ -1552,6 +1585,12 @@ pub(crate) mod tests {
         /// Gives every drawable keyform an opacity, in keyform order.
         pub(crate) fn opacities(mut self, values: &[f32]) -> Self {
             self.opacities = Some(values.to_vec());
+            self
+        }
+
+        /// Sets each drawable's parent deformer, `u32::MAX` meaning none.
+        pub(crate) fn drawable_parents(mut self, parents: &[u32]) -> Self {
+            self.drawable_parents = Some(parents.to_vec());
             self
         }
 
@@ -1724,7 +1763,8 @@ pub(crate) mod tests {
             offsets[section::DEFORMER_TYPE] = place(&mut body, &u32_array(&[1, 0]));
             offsets[section::DEFORMER_INDEX_IN_TYPE] = place(&mut body, &u32_array(&[0, 0]));
             // Drawables hang off the warp, which is deformer 1.
-            offsets[section::DRAWABLE_PARENT_DEFORMERS] = place(&mut body, &u32_array(&vec![1u32; d]));
+            let parents = self.drawable_parents.clone().unwrap_or_else(|| vec![1u32; d]);
+            offsets[section::DRAWABLE_PARENT_DEFORMERS] = place(&mut body, &u32_array(&parents));
 
             // --- the keyform pool ------------------------------------------
             let warp_stride = padded_points(grid_points) as usize * 2;
