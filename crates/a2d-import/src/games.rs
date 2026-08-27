@@ -62,7 +62,15 @@ impl Importer {
 /// choice, and an unclear guess falls back to [`Importer::Generic`] rather than
 /// asserting a source.
 pub fn guess_importer(path: &Path) -> Importer {
-    let dir = if path.is_dir() { path.to_path_buf() } else { path.parent().unwrap_or(Path::new(".")).to_path_buf() };
+    // A file identifies itself. Reading the directory it happens to sit in
+    // does not, and costs far more than it sounds: a sample folder holds
+    // thousands of assets, and opening the head of 256 of them to identify one
+    // file took over five minutes on a real one -- long enough to read as a
+    // hang rather than as slowness.
+    if path.is_file() {
+        return guess_from_file(path);
+    }
+    let dir = path.to_path_buf();
     let Ok(entries) = std::fs::read_dir(&dir) else { return Importer::Generic };
 
     let mut has_unity = false;
@@ -87,6 +95,38 @@ pub fn guess_importer(path: &Path) -> Importer {
         // guessed from that alone.
         (false, true) => Importer::Generic,
         (false, false) => Importer::Generic,
+    }
+}
+
+/// Guesses the importer for a single file, from that file alone.
+///
+/// A Unity bundle is the only case needing more than its own header, because
+/// the container says nothing about which ecosystem is inside it. Looking is
+/// affordable here in a way it is not during a directory scan: one bundle,
+/// once, on a path the caller named explicitly.
+fn guess_from_file(path: &Path) -> Importer {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    // The tell here is the doubled suffix, not the file's content.
+    if name.ends_with(".skel.bytes") || name.ends_with(".atlas.txt") {
+        return Importer::SpineBytes;
+    }
+    let Ok(head) = read_head(path, 64) else { return Importer::Generic };
+    if !matches!(classify(&head), AssetKind::UnityBundle { .. }) {
+        return Importer::Generic;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return Importer::Generic };
+
+    // Spine is the decisive check -- a skeleton and an atlas, both recognised
+    // by content -- so it is asked first and Cubism is what remains.
+    let mut report = LoadReport::new();
+    if crate::inspect_spine_bundle(&bytes, &mut report).map(|s| s.is_spine()).unwrap_or(false) {
+        return Importer::UnitySpine;
+    }
+    let mut report = LoadReport::new();
+    match crate::inspect_bundle(&bytes, &mut report) {
+        Ok(inventory) if inventory.moc.is_some() => Importer::UnityCubism,
+        // Neither shape: say so by falling back rather than by asserting one.
+        _ => Importer::Generic,
     }
 }
 
@@ -137,6 +177,51 @@ mod tests {
         for importer in Importer::all() {
             assert_eq!(Importer::parse(importer.as_str()), Some(importer));
         }
+    }
+
+    /// A directory holding a decoy that would flip the guess if it were read.
+    fn dir_with_a_decoy(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("a2d-guess-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir should be creatable");
+        // Reading the directory would see this and answer `spine_bytes`.
+        std::fs::write(dir.join("decoy.skel.bytes"), b"not read").expect("decoy");
+        dir
+    }
+
+    #[test]
+    fn a_named_file_is_identified_by_itself_and_not_by_its_neighbours() {
+        // The cost of the old behaviour was the point: identifying one file by
+        // opening up to 256 of its neighbours took over five minutes in a real
+        // sample folder. This pins the *behaviour* that fixed it, which is
+        // cheap to check -- a neighbour that would change the answer must not
+        // change it.
+        let dir = dir_with_a_decoy("neighbours");
+        let target = dir.join("character.json");
+        std::fs::write(&target, b"{}").expect("target");
+
+        assert_eq!(guess_importer(&target), Importer::Generic, "the decoy beside it must not decide this file");
+        // The same directory, asked as a directory, may still consult it.
+        assert_eq!(guess_importer(&dir), Importer::SpineBytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_doubled_suffix_still_names_its_own_importer() {
+        let dir = dir_with_a_decoy("suffix");
+        let target = dir.join("hero.skel.bytes");
+        std::fs::write(&target, b"not a real skeleton").expect("target");
+        assert_eq!(guess_importer(&target), Importer::SpineBytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_bundle_falls_back_rather_than_asserting_a_source() {
+        let dir = dir_with_a_decoy("plain");
+        let target = dir.join("notes.txt");
+        std::fs::write(&target, b"nothing to see").expect("target");
+        assert_eq!(guess_importer(&target), Importer::Generic);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
