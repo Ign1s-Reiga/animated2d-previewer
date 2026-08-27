@@ -1,13 +1,18 @@
 //! Posing a MOC3 model: parameter values in, vertex positions out.
 //!
-//! # Status: it poses; it is not yet compared against a reference
+//! # Status: it poses, and the result has been looked at
 //!
 //! Everything the [`crate::moc3`] reader exposes was checked against an
-//! independent source before being believed. This is checked differently: by
-//! whether the result lands where a character should. That is weaker than a
-//! reference render but far from nothing, because the deformer chain is deep
-//! enough that a wrong composition does not land anywhere plausible at all --
-//! an earlier version was out by four orders of magnitude.
+//! independent source before being believed. This was checked for a long time
+//! only by whether the result *landed* where a character should, and that
+//! turned out to be much weaker than it reads: a model can put every drawable
+//! at the right size in a plausible frame and still be a quarter turn over.
+//!
+//! What the chain is now checked by is drawing it with its own texture and
+//! looking. Three characters from one source come out as coherent scenes —
+//! each figure whole, correctly textured, and placed against its own scenery
+//! inside its own canvas. That is not a reference render, but it is the first
+//! criterion here that a wrong pose cannot quietly pass.
 //!
 //! # The scale rule, and how it was found
 //!
@@ -70,12 +75,12 @@
 //!
 //! # How well it works, measured
 //!
-//! Across six models from the same source, **2130 of 2131 drawables pose
-//! inside their own canvas**, and five of the six place every drawable. On the
-//! model this was developed against the posed extent is 1.24 by 1.12 against a
-//! canvas of 0.94 by 1.66 — a character occupying its frame rather than merely
-//! a finite result. No chain produces anything unusable, so [`Pose::unstable`]
-//! is empty on all six.
+//! Landing inside the canvas is now known to be a weak criterion — see the
+//! base angle below, where a rule that improved canvas fit on every model
+//! visibly wrecked a pose that had been right — so it is reported here as a
+//! smoke test rather than as evidence. On six models from one source every
+//! drawable poses inside its own canvas, and no chain produces anything
+//! unusable, so [`Pose::unstable`] is empty on all six.
 //!
 //! The sixth model, whose drawables measured up to four and a half canvases
 //! across, turned out not to be a chain defect either. Its root deformer is
@@ -95,48 +100,67 @@
 //! against a canvas of 3792 pixels per unit — that deformer is the
 //! pixels-to-units bridge, exactly as the transform predicts.
 //!
-//! # What rendering showed
+//! # The base angle, and why aggregates could not find it
 //!
-//! Rendered at default parameters, the models come out as coherent scenes: a
-//! reclining figure under a pine branch in one, a character on a swing in
-//! another. Each drawable is well formed and correctly textured, and the parts
-//! sit where a scene needs them.
+//! A rotation deformer carries a constant angle of its own, beside the angle
+//! its keyforms blend to; the frame's real angle is the two added. Leaving it
+//! out poses every model subtly wrong and one of six catastrophically — its
+//! character came out a quarter turn over and outside her own canvas while the
+//! scenery beside her, which hangs off the model root rather than off a
+//! deformer, stayed exactly where it belonged.
 //!
-//! One measurement is worth more than the impression. Sweeping `ParamEyeBallX`
-//! and `ParamEyeBallY` and taking the direction each moves the pupils gives two
-//! axes that come out **perpendicular and right-handed** in every model, with
-//! the responding drawables in total agreement. A chain that transposed a grid,
-//! mirrored a warp or sheared a rotation could not do that. Their absolute
-//! angle varies between models — 0, -60 and -95 degrees — which is head tilt in
-//! the artwork rather than error, and is why the assertion is on the pair
-//! rather than on either one alone.
+//! That split is what makes the defect findable at all, and every aggregate
+//! measure missed it. Drawables came out the right *size* — the map from a
+//! mesh's texture coordinates to its posed positions had the same scale in the
+//! broken model as in the sound ones — and they landed in a plausible frame,
+//! so both of the criteria this module had been trusting passed. What settled
+//! it was drawing the model with its own texture and looking: a figure lying
+//! sideways in mid-air beside an upright dressing table is not a pose any
+//! artist composed.
 //!
-//! Two things about that are worth more than the picture itself. A model and
-//! its own low-detail variant -- separately authored rigs, 101 drawables
-//! against 601, 151 parameters against 849 -- render as the *same* scene. A
-//! wrong chain would have to distort both identically to do that. And the
-//! elements that read as scattered at first turned out to be scenery: a pine
-//! branch hanging apart from the figure is the rig, not a fault.
+//! Two criteria were tried on the way and are recorded here because they do
+//! *not* work. Fitting a similarity from a mesh's uvs to its posed positions
+//! and reading off the **angle** says nothing: across all six models those
+//! angles have a mean resultant length of 0.08 to 0.46, so they are barely
+//! concentrated at all — Cubism packs art meshes into the atlas at whatever
+//! rotation fits. And **canvas fit** is far weaker than it looks: a wrong rule
+//! tried here brought every model inside its canvas while visibly wrecking the
+//! pose of a model that had been correct.
+//!
+//! # Keyform ordering
+//!
+//! An element's keyforms form a grid with one axis per parameter, and the
+//! **first** axis varies fastest.
+//!
+//! Established by fitting each element's keyform values with an additive
+//! model, `v[i][j] ~ mu + r_i + c_j`, and comparing the residual between the
+//! competing reshapes. A rig's keyform grid is close to additively separable —
+//! each parameter contributes its own offset — and the comparison is fair
+//! because an `a x b` additive model and a `b x a` one have the same number of
+//! free parameters over the same number of samples. That is what an earlier
+//! smoothness argument got wrong: it counted neighbour pairs, and unequal axes
+//! give the two reshapes different numbers of them.
+//!
+//! Across six models, 122 of the 128 decidable two-axis grids and all six
+//! decidable three-axis grids come out first-axis-fastest, with a mean margin
+//! of 0.38 against 0.06 for the exceptions. Grids whose axes are all the same
+//! length cannot decide it either way — the two reshapes are transposes and
+//! the fit is identical — so only unequal axes count.
 //!
 //! # What is still unverified
 //!
-//! **No reference render has been compared against.** Landing in the right
-//! frame is strong evidence the chain composes correctly, but it cannot show
-//! that a particular warp bends the way Live2D bends it, or that keyform
-//! blending weights are right between keys rather than only on them.
+//! **No reference runtime has been compared against.** The models now render
+//! as coherent scenes, which is much stronger than landing in the right frame,
+//! but a picture that looks right cannot show that a particular warp bends the
+//! way Live2D bends it, or that blending weights are right *between* keys
+//! rather than only on them.
 //!
-//! The assumptions that a render would settle, and their symptoms:
-//!
-//! 1. **Keyform ordering.** An element's keyforms form a grid with one axis per
-//!    parameter, and this takes the last axis as varying fastest. Reversing it
-//!    was tried and is worse: on the six models it drops 2130 drawables inside
-//!    their canvas to 1990, so the current reading is not merely untested. It
-//!    is not *confirmed* either — a smoothness argument over the keyform grid
-//!    appeared to favour the reverse until it turned out to be confounded,
-//!    because unequal axis lengths give the two reshapes different numbers of
-//!    neighbour pairs and so incomparable totals.
-//! 2. **Rotation composition.** Applied as
-//!    `origin + rotate(angle) * scale * p / unit`.
+//! **Rotation composition** is applied as
+//! `origin + rotate(base + angle) * scale * p / unit`. The unit conversion is
+//! the least pinned part: it takes a warp's posed bounding box per axis, which
+//! is right for an axis-aligned lattice and approximate for a turned one.
+//! Reading the setup grid instead, or forcing the rate isotropic, changes no
+//! model measurably, so nothing available here distinguishes them.
 
 use crate::moc3::{Deformer, DeformerKind, KeyformBinding, Moc3, RotationKeyform};
 
@@ -227,6 +251,11 @@ impl Moc3 {
                     out.scale += k.scale * weight;
                     out.opacity += k.opacity * weight;
                 }
+                // The keyforms are measured from the deformer's base angle, so
+                // the frame's real angle is the two together. The base is a
+                // constant of the deformer, not of a keyform, so it is added
+                // once rather than blended.
+                out.angle += r.base_angle;
                 out
             })
             .collect();
@@ -323,10 +352,10 @@ impl Moc3 {
             sizes.push(pb.keys.len());
         }
 
-        // The last axis varies fastest, so its stride is one.
+        // The first axis varies fastest, so its stride is one.
         let mut strides = vec![1usize; sizes.len()];
-        for i in (0..sizes.len().saturating_sub(1)).rev() {
-            strides[i] = strides[i + 1] * sizes[i + 1];
+        for i in 1..sizes.len() {
+            strides[i] = strides[i - 1] * sizes[i - 1];
         }
 
         let corners = 1usize << axes.len().min(16);
@@ -666,6 +695,64 @@ mod tests {
     fn a_single_key_axis_has_nowhere_to_interpolate_to() {
         let at = locate(&keys(&[5.0]), 99.0);
         assert_eq!((at.lower, at.fraction), (0, 0.0));
+    }
+
+    /// The two-axis fixture, posed at exact key values, with the drawable
+    /// parented straight to the model root so nothing but the keyform blend
+    /// stands between the stored numbers and the result.
+    ///
+    /// Its axes are a two-key one first and a three-key one second, and its
+    /// keyform `k` reaches `k + 1` along each side of the triangle, so the
+    /// vertex that comes back names the keyform the blend chose.
+    fn keyform_reach(first: f32, second: f32) -> f32 {
+        let bytes = crate::moc3::tests::Builder::new().two_axis().drawable_parents(&[u32::MAX]).build();
+        let moc = crate::Moc3::parse(&bytes).expect("should parse");
+        let points = moc.pose(&[first, second]).drawables.into_iter().next().expect("one drawable");
+        points[1].0
+    }
+
+    #[test]
+    fn the_first_axis_of_a_keyform_grid_is_the_one_that_varies_fastest() {
+        // Axis lengths 2 and 3, so index = i0 + i1 * 2 with the first axis
+        // fastest, and i0 * 3 + i1 with the last. Reach is the keyform index
+        // plus one, so the two readings are distinguishable at every corner
+        // where the indices differ.
+        assert_eq!(keyform_reach(-30.0, 0.0), 1.0, "keyform 0 is the near corner either way");
+        // i0 = 1, i1 = 0: first-fastest picks keyform 1, last-fastest 3.
+        assert_eq!(keyform_reach(30.0, 0.0), 2.0);
+        // i0 = 0, i1 = 2: first-fastest picks keyform 4, last-fastest 2.
+        assert_eq!(keyform_reach(-30.0, 1.2), 5.0);
+        // i0 = 1, i1 = 2: the far corner, which both readings agree on.
+        assert_eq!(keyform_reach(30.0, 1.2), 6.0);
+    }
+
+    #[test]
+    fn a_rotation_deformer_turns_by_its_base_angle_as_well_as_its_keyforms() {
+        // The fixture's rotation deformer sits at the root with an identity
+        // frame, so its base angle is the only rotation in the chain and the
+        // quad it carries has to come back turned by exactly that much.
+        let turned = |degrees: f32| {
+            let bytes = crate::moc3::tests::Builder::new().rotation_base_angle(degrees).build();
+            let moc = crate::Moc3::parse(&bytes).expect("should parse");
+            moc.pose(&[0.0]).drawables.into_iter().next().expect("one drawable")
+        };
+        // Without one, the fixture poses as every other test here expects.
+        assert_eq!(turned(0.0), up(&[(0.0, 0.0), (10.0, 0.0), (0.0, 20.0)]));
+        // A quarter turn in the file's downward-y space sends +x to +y.
+        let quarter = turned(90.0);
+        assert!((quarter[1].0 - 0.0).abs() < 1e-4, "{quarter:?}");
+        assert!((quarter[1].1 + 10.0).abs() < 1e-4, "{quarter:?}");
+        assert!((quarter[2].0 + 20.0).abs() < 1e-4, "{quarter:?}");
+        assert!((quarter[2].1 - 0.0).abs() < 1e-3, "{quarter:?}");
+    }
+
+    #[test]
+    fn a_model_that_carries_no_base_angle_section_poses_as_it_always_did() {
+        // The section is read optionally, so a layout without it must leave
+        // every frame exactly where it was rather than refusing the model.
+        let moc = crate::Moc3::parse(&crate::moc3::tests::Builder::new().build()).expect("should parse");
+        assert!(moc.rotation_deformers.iter().all(|r| r.base_angle == 0.0));
+        assert_eq!(moc.pose(&[0.0]).drawables, vec![posed(0.0)]);
     }
 
     #[test]

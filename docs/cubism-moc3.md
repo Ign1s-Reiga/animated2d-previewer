@@ -62,6 +62,7 @@ used by the parser:
 | 25 | rotation keyform binding | | 72 | parameter binding refs |
 | 26 | rotation keyform begin | | 73 | keyform binding begin |
 | 27 | rotation keyform count | | 74 | keyform binding count |
+| 28 | rotation **base angle** | | | |
 | 33 | drawable ids | | 75 | parameter key begin |
 | 34 | drawable keyform binding | | 76 | parameter key count |
 | 35 | drawable keyform begin | | 77 | parameter keys |
@@ -181,10 +182,29 @@ adjacent keys on each axis, then blend the surrounding keyforms. Values outside
 the key range clamp rather than extrapolate, since a parameter is already
 clamped to its own range and the key list covers it.
 
-**Keyform ordering is last-axis-fastest.** With axes `[A, B]`, keyform index is
-`i_A * len(B) + i_B`. Confirmed on a two-axis model whose two orderings select
-keyforms differing by a factor of four in scale: the last-axis-fastest reading
-is the one that renders correctly.
+**Keyform ordering is first-axis-fastest.** With axes `[A, B]`, keyform index is
+`i_A + i_B * len(A)`.
+
+*What established it:* an additive fit over each element's keyform values. A
+rig's keyform grid is close to additively separable — each parameter
+contributes its own offset — so fitting `v[i][j] ~ mu + r_i + c_j` and reading
+off the residual says which reshape is the real grid. The comparison is fair in
+a way an earlier smoothness argument was not: an `a x b` additive model and a
+`b x a` one have the *same* number of free parameters over the *same* number of
+samples, while counting neighbour pairs gives unequal axes incomparable totals.
+
+Across the six models, 122 of the 128 decidable two-axis grids and all six
+decidable three-axis grids come out first-axis-fastest, by a mean margin of
+0.38 against 0.06 for the six exceptions. Grids whose axes are all the same
+length decide nothing — the two reshapes are transposes of one another and the
+fit is identical — which is why the earlier reading survived: it was checked on
+a model where the informative case was never isolated.
+
+One element settles it on its own without any statistics. A root rotation
+deformer bound to a four-key axis and a five-key axis carries twenty keyforms
+whose origins change with a period of **four**, not five, and whose x sweeps
+monotonically within each group of four. The fastest axis has four keys, and
+four is the length of the first axis.
 
 ### The deformer chain
 
@@ -211,7 +231,25 @@ posing a point is a bilinear lookup. Outside the square the edge cells are
 shape instead of collapsing onto the border.
 
 A **rotation deformer** is a rigid frame: origin, angle in degrees, uniform
-scale, opacity. Posing a point is `origin + R(angle) · (point · scale)`.
+scale, opacity. It also carries a **base angle** — section 28, one float per
+rotation deformer, constant rather than per keyform — and the frame's real
+angle is the base plus whatever the keyforms blend to. Posing a point is
+`origin + R(base + angle) · (point · scale)`.
+
+*What established the base angle:* rendering. Without it, one model of six
+posed its character a quarter turn over and outside her own canvas while the
+scenery beside her — parented to the model root rather than to a deformer, and
+so untouched by the chain — stayed exactly where it belonged. That split is
+what made it findable: two halves of one file disagreeing about where the model
+is. Adding section 28 to the blended angle puts her upright, seated at the
+furniture the scenery draws, and does the same for the other five: it corrects
+poses in all of them, including ones that had looked right.
+
+The section is one float per rotation deformer, padded, in degrees, spanning
+±360, and non-zero on 26 to 215 of the deformers in each of the six models — it
+is ordinary data, not a rare special case. Reading it is optional: a layout
+without it leaves every base at zero, which is exactly how the chain behaved
+before the field was identified.
 
 Constraints are applied in the order the chain is walked, from the drawable
 outward to the root.
@@ -353,13 +391,35 @@ character can say.
 
 ## 7. How correctness is judged without a reference runtime
 
-No reference render has been compared against, so the chain is judged by
-properties that must hold for any correct evaluation.
+No reference *runtime* has been compared against. What the chain is judged by
+now is **drawing the model with its own texture and looking at it**, plus a
+handful of properties that must hold for any correct evaluation.
 
-**It lands in the right frame.** Across six models, 2130 of 2131 drawables pose
-inside their own canvas, and the exception is the zoom case of §5. The chain is
-deep enough that a wrong composition does not land anywhere plausible — an
-earlier version was out by four orders of magnitude.
+**Draw it and look.** This is the strongest criterion available and the only
+one that has ever caught a whole-model rotation. Everything below is an
+aggregate, and every aggregate here has at some point passed a pose that was
+visibly wrong. Rendering three characters from one source shows each figure
+whole, correctly textured, and placed against its own scenery inside its own
+canvas.
+
+**It lands in the right frame.** Across six models every drawable poses inside
+its own canvas, and the extents sit comfortably within it rather than merely
+inside a tolerance. Treat this as a smoke test, *not* as evidence: the base
+angle of §4 was missing while this criterion read 1598 of 1805 — and worse, a
+candidate rule tried during that investigation brought every model inside its
+canvas while visibly wrecking a pose that had been correct. A rule can improve
+canvas fit and still be wrong.
+
+**Masks overlap what they clip.** A drawable is clipped to its masks, and
+Cubism does not ship masks that clip nothing, so a mask whose posed bounds miss
+the drawable's is evidence the two landed wrongly *relative to each other* —
+which no per-drawable measure can see. This is the aggregate that came closest
+to finding the base angle: with it missing, one model had 31 of 46 mask pairs
+disjoint against 1 of 10 and 4 of 35 elsewhere. All six now sit at zero except
+for twenty pairs on one model, all of them four hand-detail meshes masked to
+parts the hand only reaches part-way through an animation. The rest pose is not
+where every mask has to bite, so a non-overlapping pair is a lead rather than a
+verdict.
 
 **Two independently authored rigs agree.** A model and its own low-detail
 variant — 601 drawables against 101, 849 parameters against 151 — render as the
@@ -383,6 +443,15 @@ Note what this does **not** show. A determinant is invariant under rotation, so
 this can never say a model is the right way up — only that it is not mirrored.
 Treating it as an orientation check is precisely the mistake that was made.
 
+The *angle* of that same similarity is worth nothing, and was tried. Across all
+six models the per-drawable uv-to-position angles have a mean resultant length
+of only 0.08 to 0.46, so they are barely concentrated at all: Cubism packs art
+meshes into the atlas at whatever rotation fits, and there is no shared
+orientation to measure against. A linear median over those angles reads near
+zero and means nothing, because the values wrap — which is how the missing base
+angle of §4 survived a check that appeared to confirm every subtree was
+unrotated.
+
 An earlier version of this document listed a fifth criterion — that sweeping
 `ParamEyeBallX` and `ParamEyeBallY` gives two perpendicular, right-handed axes —
 and it was wrong twice over. Those parameters are carried through the very chain
@@ -397,9 +466,22 @@ These are `crates/a2d-cli/tests/cubism_orientation.rs`, gated on
 
 ## 8. What is still unverified
 
-- **No reference render.** Landing in the right frame shows the chain composes;
-  it cannot show that a particular warp bends the way Live2D bends it, or that
+- **No reference runtime.** The models now render as coherent scenes, which is
+  much stronger than landing in the right frame, but a picture that looks right
+  cannot show that a particular warp bends the way Live2D bends it, or that
   blending weights are right *between* keys rather than only on them.
+- **No render in the repository.** The renders that found the base angle of §4
+  were made by a throwaway rasteriser: the importer cannot yet reconstruct a
+  Cubism package, so `preview` has no path from a bundle to a picture, and the
+  one criterion strong enough to catch a wrong pose is the one that cannot be
+  run from the CLI. Everything the parser needs is already there — posed
+  geometry, uvs, the paint sequence, and a decoded `Texture2D` — so this is
+  wiring rather than discovery, and it is the highest-value thing left.
+- **The unit conversion between a warp and a rotation under it.** It takes the
+  warp's posed bounding box per axis, which is exact for an axis-aligned
+  lattice and approximate for a turned one. Reading the setup grid instead, or
+  forcing the rate isotropic, changes no model measurably, so nothing available
+  here distinguishes them.
 - **Motions.** The bundles' animations are Unity `AnimationClip`s in the
   compressed muscle-clip form, not `motion3.json`. They are not decoded, so a
   model poses and draws but does not play its own animation.

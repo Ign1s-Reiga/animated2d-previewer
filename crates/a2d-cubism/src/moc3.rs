@@ -148,6 +148,9 @@ mod section {
     pub const ROTATION_KEYFORM_BINDING: usize = 25;
     pub const ROTATION_KEYFORM_BEGIN: usize = 26;
     pub const ROTATION_KEYFORM_COUNT: usize = 27;
+    /// One constant angle per rotation deformer, in degrees, added to whatever
+    /// its keyforms blend to. See [`RotationDeformer::base_angle`].
+    pub const ROTATION_BASE_ANGLE: usize = 28;
 
     /// The drawables in the order they are painted, back to front.
     ///
@@ -373,6 +376,13 @@ pub struct RotationDeformer {
     pub keyform_binding: u32,
     pub keyform_begin: u32,
     pub keyform_count: u32,
+    /// A constant angle, in degrees, that the keyforms are measured *from*.
+    ///
+    /// The frame's actual angle is this plus whatever the keyforms blend to.
+    /// It is not a formality: it is non-zero on 26 to 215 of the rotation
+    /// deformers in every real model checked, and leaving it out poses one of
+    /// them with the character a quarter turn over and outside her own canvas.
+    pub base_angle: f32,
 }
 
 /// One rotation keyform: where the frame sits and how it is turned.
@@ -1128,6 +1138,12 @@ fn read_rotation_deformers(
     let binding = u32s(section::ROTATION_KEYFORM_BINDING, "rotation keyform binding")?;
     let begin = u32s(section::ROTATION_KEYFORM_BEGIN, "rotation keyform begin")?;
     let count_of = u32s(section::ROTATION_KEYFORM_COUNT, "rotation keyform count")?;
+    // A model whose layout predates this section is read without it, which
+    // leaves every base angle at zero -- exactly how the chain behaved before
+    // the field was identified. A non-finite entry is treated the same way
+    // rather than turning the whole frame into a NaN.
+    let base_angle =
+        read_floats(bytes, sections, section::ROTATION_BASE_ANGLE, n as u32, "rotation base angle").unwrap_or_default();
 
     let mut deformers = Vec::with_capacity(n);
     let mut expect = 0u64;
@@ -1144,6 +1160,7 @@ fn read_rotation_deformers(
             keyform_binding: binding[i],
             keyform_begin: begin[i],
             keyform_count: count_of[i],
+            base_angle: base_angle.get(i).copied().filter(|a| a.is_finite()).unwrap_or(0.0),
         });
     }
     if expect != keyform_count as u64 {
@@ -1579,6 +1596,12 @@ pub(crate) mod tests {
         masked: bool,
         /// Parent deformer of each drawable; `u32::MAX` means the model root.
         drawable_parents: Option<Vec<u32>>,
+        /// Constant angle of the rotation deformer, which its keyforms are
+        /// measured from.
+        rotation_base_angle: f32,
+        /// Drives every element from two parameters rather than one, so the
+        /// keyform grid has an axis order to get right.
+        two_axis: bool,
     }
 
     impl Builder {
@@ -1593,7 +1616,22 @@ pub(crate) mod tests {
                 opacities: None,
                 masked: false,
                 drawable_parents: None,
+                rotation_base_angle: 0.0,
+                two_axis: false,
             }
+        }
+
+        /// Gives the rotation deformer a constant angle to measure from.
+        pub(crate) fn rotation_base_angle(mut self, degrees: f32) -> Self {
+            self.rotation_base_angle = degrees;
+            self
+        }
+
+        /// Drives every element from a two-key axis and a three-key one, in
+        /// that order, so a wrong stride lands on a different keyform.
+        pub(crate) fn two_axis(mut self) -> Self {
+            self.two_axis = true;
+            self
         }
 
         /// Clips every drawable after the first to the first, and gives them
@@ -1712,28 +1750,45 @@ pub(crate) mod tests {
             // --- bindings -------------------------------------------------
             // One parameter binding on the first parameter, keyed at three
             // values, so every element has a three-keyform grid to blend over.
-            let keys: [f32; 3] = [-30.0, 0.0, 30.0];
-            let param_bindings = 1usize;
-            // Per parameter: the range of bindings it drives. Only the first
-            // parameter drives anything; the rest are marked absent.
+            //
+            // The two-axis fixture puts a *two*-key axis first and a
+            // three-key one second. The lengths differ on purpose: with equal
+            // axes the two stride rules are transposes of each other and no
+            // test could tell them apart.
+            let axes: Vec<Vec<f32>> =
+                if self.two_axis { vec![vec![-30.0, 30.0], vec![0.0, 0.6, 1.2]] } else { vec![vec![-30.0, 0.0, 30.0]] };
+            let param_bindings = axes.len();
+            let all_keys: Vec<f32> = axes.iter().flatten().copied().collect();
+            // Per parameter: the range of bindings it drives. Parameter `i`
+            // drives axis `i`; any parameter past that is marked absent.
             let mut owner_begin = vec![u32::MAX; self.parameters.len()];
             let mut owner_count = vec![0u32; self.parameters.len()];
-            owner_begin[0] = 0;
-            owner_count[0] = param_bindings as u32;
+            for (i, slot) in owner_begin.iter_mut().enumerate().take(param_bindings) {
+                *slot = i as u32;
+                owner_count[i] = 1;
+            }
             offsets[section::PARAMETER_BINDING_BEGIN] = place(&mut body, &u32_array(&owner_begin));
             offsets[section::PARAMETER_BINDING_COUNT] = place(&mut body, &u32_array(&owner_count));
 
-            offsets[section::PARAMETER_KEY_BEGIN] = place(&mut body, &u32_array(&[0]));
-            offsets[section::PARAMETER_KEY_COUNT] = place(&mut body, &u32_array(&[keys.len() as u32]));
-            let key_bytes: Vec<u8> = keys.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut key_begin = Vec::with_capacity(param_bindings);
+            let mut at_key = 0u32;
+            for axis in &axes {
+                key_begin.push(at_key);
+                at_key += axis.len() as u32;
+            }
+            offsets[section::PARAMETER_KEY_BEGIN] = place(&mut body, &u32_array(&key_begin));
+            let key_count: Vec<u32> = axes.iter().map(|a| a.len() as u32).collect();
+            offsets[section::PARAMETER_KEY_COUNT] = place(&mut body, &u32_array(&key_count));
+            let key_bytes: Vec<u8> = all_keys.iter().flat_map(|v| v.to_le_bytes()).collect();
             offsets[section::PARAMETER_KEYS] = place(&mut body, &key_bytes);
 
-            // One keyform binding, one axis, pointing at that parameter binding.
+            // One keyform binding naming those parameter bindings, in order.
             offsets[section::KEYFORM_BINDING_BEGIN] = place(&mut body, &u32_array(&[0]));
-            offsets[section::KEYFORM_BINDING_COUNT] = place(&mut body, &u32_array(&[1]));
-            offsets[section::PARAMETER_BINDING_REFS] = place(&mut body, &u32_array(&[0]));
+            offsets[section::KEYFORM_BINDING_COUNT] = place(&mut body, &u32_array(&[param_bindings as u32]));
+            let refs: Vec<u32> = (0..param_bindings as u32).collect();
+            offsets[section::PARAMETER_BINDING_REFS] = place(&mut body, &u32_array(&refs));
 
-            let per_element = keys.len();
+            let per_element: usize = axes.iter().map(|a| a.len()).product();
 
             // --- drawables ------------------------------------------------
             let d_begin: Vec<u32> = (0..d).map(|i| (i * per_element) as u32).collect();
@@ -1780,11 +1835,14 @@ pub(crate) mod tests {
             offsets[section::ROTATION_KEYFORM_BEGIN] = place(&mut body, &u32_array(&[0]));
             offsets[section::ROTATION_KEYFORM_COUNT] = place(&mut body, &u32_array(&[per_element as u32]));
             let f_array = |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
-            offsets[section::ROTATION_KEYFORM_OPACITY] = place(&mut body, &f_array(&[1.0; 3]));
-            offsets[section::ROTATION_KEYFORM_ANGLE] = place(&mut body, &f_array(&[0.0; 3]));
-            offsets[section::ROTATION_KEYFORM_ORIGIN_X] = place(&mut body, &f_array(&[0.0; 3]));
-            offsets[section::ROTATION_KEYFORM_ORIGIN_Y] = place(&mut body, &f_array(&[0.0; 3]));
-            offsets[section::ROTATION_KEYFORM_SCALE] = place(&mut body, &f_array(&[1.0; 3]));
+            offsets[section::ROTATION_KEYFORM_OPACITY] = place(&mut body, &f_array(&vec![1.0; per_element]));
+            offsets[section::ROTATION_KEYFORM_ANGLE] = place(&mut body, &f_array(&vec![0.0; per_element]));
+            offsets[section::ROTATION_KEYFORM_ORIGIN_X] = place(&mut body, &f_array(&vec![0.0; per_element]));
+            offsets[section::ROTATION_KEYFORM_ORIGIN_Y] = place(&mut body, &f_array(&vec![0.0; per_element]));
+            offsets[section::ROTATION_KEYFORM_SCALE] = place(&mut body, &f_array(&vec![1.0; per_element]));
+            // One base angle per rotation deformer, which its keyforms are
+            // measured from.
+            offsets[section::ROTATION_BASE_ANGLE] = place(&mut body, &f_array(&[self.rotation_base_angle]));
 
             // Deformer 0 is the rotation at the root, deformer 1 the warp.
             offsets[section::DEFORMER_PARENT] = place(&mut body, &u32_array(&[u32::MAX, 0]));
@@ -1822,10 +1880,14 @@ pub(crate) mod tests {
                     pool[k * warp_stride + pt * 2 + 1] = row * 20.0 / div_a as f32 * scale;
                 }
             }
-            // Drawable vertices sit in the warp's unit square.
+            // Drawable vertices sit in the warp's unit square. In the two-axis
+            // fixture each keyform of a drawable is a different size, so a
+            // test can name which one a pose selected -- which is the whole
+            // point of that fixture.
             for k in 0..draw_keyforms {
                 let base = warp_floats + k * draw_stride;
-                pool[base..base + 6].copy_from_slice(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+                let reach = if self.two_axis { (k % per_element) as f32 + 1.0 } else { 1.0 };
+                pool[base..base + 6].copy_from_slice(&[0.0, 0.0, reach, 0.0, 0.0, reach]);
             }
             let pool_bytes: Vec<u8> = pool.iter().flat_map(|v| v.to_le_bytes()).collect();
             offsets[section::KEYFORM_POSITIONS] = place(&mut body, &pool_bytes);
@@ -1850,9 +1912,9 @@ pub(crate) mod tests {
             counts[count::DRAWABLE_KEYFORMS] = draw_keyforms as u32;
             counts[count::KEYFORM_POSITION_FLOATS] = (warp_floats + draw_floats) as u32;
             counts[count::PARAMETER_BINDINGS] = param_bindings as u32;
-            counts[count::PARAMETER_KEYS] = keys.len() as u32;
+            counts[count::PARAMETER_KEYS] = all_keys.len() as u32;
             counts[count::KEYFORM_BINDINGS] = 1;
-            counts[count::PARAMETER_BINDING_REFS] = 1;
+            counts[count::PARAMETER_BINDING_REFS] = param_bindings as u32;
             counts[count::UV_FLOATS] = (d * verts_each * 2) as u32;
             counts[count::INDICES] = (d * idx_each) as u32;
 

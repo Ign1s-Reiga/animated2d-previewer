@@ -160,3 +160,58 @@ fn an_unzoomed_model_sits_inside_its_own_canvas() {
         hi.y - lo.y
     );
 }
+
+/// Masks must overlap what they clip.
+///
+/// This is the only aggregate here that sees *relative* placement. Every other
+/// check is per drawable, so a chain that puts each mesh at the right size in a
+/// plausible frame passes them all while assembling the parts wrongly — which
+/// is exactly what a missing rotation base angle did, and what this catches:
+/// with the base angle left out, one model had 31 of its 46 mask pairs
+/// disjoint.
+///
+/// The bar is deliberately not zero. A mask is set up for a whole animation,
+/// not for the rest pose, so a hand-detail mesh clipped to a leg the hand only
+/// reaches part-way through a motion is legitimately disjoint here.
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Unity bundle"]
+fn masks_overlap_the_drawables_they_clip() {
+    let Some(moc) = model() else { return };
+    let pose = moc.pose(&[]);
+
+    let bounds = |points: &[(f32, f32)]| -> Option<(f32, f32, f32, f32)> {
+        let mut b = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (x, y) in points {
+            b.0 = b.0.min(*x);
+            b.1 = b.1.min(*y);
+            b.2 = b.2.max(*x);
+            b.3 = b.3.max(*y);
+        }
+        (b.0 <= b.2).then_some(b)
+    };
+
+    let (mut overlapping, mut total, mut worst) = (0usize, 0usize, Vec::new());
+    for (index, drawable) in moc.drawables.iter().enumerate() {
+        let Some(mine) = pose.drawables.get(index).and_then(|p| bounds(p)) else { continue };
+        for mask in &drawable.masks {
+            let Some(theirs) = pose.drawables.get(*mask as usize).and_then(|p| bounds(p)) else { continue };
+            total += 1;
+            let width = (mine.2.min(theirs.2) - mine.0.max(theirs.0)).max(0.0);
+            let height = (mine.3.min(theirs.3) - mine.1.max(theirs.1)).max(0.0);
+            if width * height > 0.0 {
+                overlapping += 1;
+            } else {
+                worst.push(format!("{:?} clipped to {:?}", drawable.id, moc.drawable_ids[*mask as usize]));
+            }
+        }
+    }
+
+    if total == 0 {
+        return;
+    }
+    assert!(
+        overlapping * 2 > total,
+        "only {overlapping} of {total} masks overlap what they clip, which says the parts were \
+         assembled wrongly relative to each other: {worst:?}"
+    );
+}
