@@ -139,7 +139,7 @@ fn a_tint_multiplies_the_texture() {
 }
 
 #[test]
-fn half_alpha_blends_towards_the_background() {
+fn half_alpha_over_nothing_keeps_its_colour_and_halves_its_alpha() {
     let Some(gpu) = gpu() else { return };
     let (mut renderer, target) = setup(&gpu);
 
@@ -150,6 +150,27 @@ fn half_alpha_blends_towards_the_background() {
     let p = pixel(&image, 32, 32);
     // Alpha is stored linearly, so half really is about half.
     assert!((120..=136).contains(&p[3]), "alpha should be about half, got {}", p[3]);
+    // Read-back is straight alpha, so the colour is the one that was drawn --
+    // white -- rather than the halved value the frame holds premultiplied.
+    assert!(p[0] >= 250, "colour should come back white, got {}", p[0]);
+}
+
+#[test]
+fn half_alpha_blends_towards_the_background() {
+    let Some(gpu) = gpu() else { return };
+    let (mut renderer, target) = setup(&gpu);
+
+    // Over an opaque background there is something to blend *with*, so the
+    // result is a genuine mid-tone rather than a partly transparent white.
+    let mut list = RenderList::new();
+    list.push_mesh(quad(Vec2::ZERO, Vec2::new(64.0, 64.0), Rgba::new(1.0, 1.0, 1.0, 0.5), BlendMode::Normal));
+    renderer
+        .render(target.view(), target.format(), settings().with_clear_color(Rgba::new(0.0, 0.0, 0.0, 1.0)), &list)
+        .expect("render should succeed");
+    let image = target.read_pixels(&gpu).expect("read-back should succeed");
+
+    let p = pixel(&image, 32, 32);
+    assert_eq!(p[3], 255, "an opaque background stays opaque");
     // Colour is sRGB-encoded, so linear 0.5 lands near 188 rather than 128.
     assert!(p[0] > 150 && p[0] < 220, "colour should be a blended mid-tone, got {}", p[0]);
 }
@@ -160,7 +181,7 @@ fn additive_blending_accumulates_and_leaves_the_background_transparent() {
     let (mut renderer, target) = setup(&gpu);
 
     // Two overlapping half-brightness additive quads should reach full white
-    // where they overlap, and must not make the background opaque.
+    // where they overlap.
     let dim = Rgba::new(0.5, 0.5, 0.5, 1.0);
     let mut list = RenderList::new();
     list.push_mesh(quad(Vec2::ZERO, Vec2::new(64.0, 64.0), dim, BlendMode::Additive));
@@ -169,10 +190,47 @@ fn additive_blending_accumulates_and_leaves_the_background_transparent() {
     list.push_mesh(second);
     let image = render(&gpu, &mut renderer, &target, &list);
 
+    // Additive adds no coverage of its own, so read-back carries the light it
+    // contributed in the alpha channel -- the colour is already saturated where
+    // it lands at all. Twice the light, twice the alpha.
     let once = pixel(&image, 48, 32);
     let twice = pixel(&image, 8, 32);
-    assert!(twice[0] > once[0], "the overlap should be brighter: {twice:?} vs {once:?}");
-    assert_eq!(twice[3], 0, "additive must not drive destination alpha");
+    assert!(twice[3] > once[3], "the overlap should be brighter: {twice:?} vs {once:?}");
+    assert!(once[3] > 0, "a single additive draw must still be visible, got {once:?}");
+}
+
+/// A rig can be nothing but additive slots — a glow or an effect layer the
+/// source composited over something else. Additive deliberately writes no
+/// destination alpha, so such a rig fills the frame with colour the alpha
+/// channel says is not there. Read-back has to resolve that, or the whole model
+/// exports as a blank image.
+#[test]
+fn a_wholly_additive_model_does_not_read_back_blank() {
+    let Some(gpu) = gpu() else { return };
+    let (mut renderer, target) = setup(&gpu);
+
+    let mut list = RenderList::new();
+    list.push_mesh(quad(Vec2::ZERO, Vec2::new(32.0, 64.0), Rgba::WHITE, BlendMode::Additive));
+    let image = render(&gpu, &mut renderer, &target, &list);
+
+    assert_eq!(pixel(&image, 8, 32), [255, 255, 255, 255], "inside the glow");
+    assert_eq!(pixel(&image, 56, 32), [0, 0, 0, 0], "outside it stays transparent");
+}
+
+/// Black contributes nothing to an additive draw however opaque the source is,
+/// so it must not turn into an occluder. An effect texture whose alpha channel
+/// is a solid silhouette would otherwise export a dark halo around its glow.
+#[test]
+fn additive_black_does_not_become_an_occluder() {
+    let Some(gpu) = gpu() else { return };
+    let (mut renderer, target) = setup(&gpu);
+
+    let mut list = RenderList::new();
+    let black = Rgba::new(0.0, 0.0, 0.0, 1.0);
+    list.push_mesh(quad(Vec2::ZERO, Vec2::new(32.0, 64.0), black, BlendMode::Additive));
+    let image = render(&gpu, &mut renderer, &target, &list);
+
+    assert_eq!(pixel(&image, 8, 32), [0, 0, 0, 0], "black light must leave the frame clear");
 }
 
 #[test]
