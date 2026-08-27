@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use a2d_core::{AnimatedModel, DecodeError, LoadReport, RenderList, Rgba, RuntimeError};
+use a2d_cubism::{CubismEmit, CubismEval};
 use a2d_desktop::{LoadedModel, Viewer, ViewerError};
 use a2d_import::games::{self, Importer};
 use a2d_import::generic;
@@ -187,6 +188,18 @@ pub fn inspect(out: &mut dyn std::io::Write, input: &Path, game: Option<&str>) -
 /// `animated2d import <input> -o <output>`
 pub fn import(out: &mut dyn std::io::Write, input: &Path, output: &Path, game: Option<&str>) -> Result<(), CliError> {
     let importer = resolve_importer(input, game)?;
+
+    // A Cubism model arrives as one bundle holding one character, so it needs
+    // none of the pairing that discovery does for loose Spine files.
+    if importer == Importer::UnityCubism {
+        let bytes = unity_bundle_bytes(input)
+            .ok_or_else(|| DecodeError::UnsupportedFormat(format!("{} is not a Unity bundle", input.display())))?;
+        let mut report = LoadReport::new();
+        let package = a2d_import::import_bundle(&bytes, &mut report)?;
+        package.write_to(output)?;
+        return describe_import(out, &package.manifest.display_name.clone(), output, &package, &report);
+    }
+
     let sets = games::discover(importer, input)?;
 
     if sets.len() > 1 {
@@ -198,8 +211,18 @@ pub fn import(out: &mut dyn std::io::Write, input: &Path, output: &Path, game: O
 
     let (package, report) = games::import(importer, set)?;
     package.write_to(output)?;
+    describe_import(out, &set.name, output, &package, &report)
+}
 
-    writeln!(out, "Imported {} -> {}", set.name, output.display())?;
+/// The shape every `import` prints, whichever importer produced the package.
+fn describe_import(
+    out: &mut dyn std::io::Write,
+    name: &str,
+    output: &Path,
+    package: &Package,
+    report: &LoadReport,
+) -> Result<(), CliError> {
+    writeln!(out, "Imported {name} -> {}", output.display())?;
     writeln!(out, "  model type:    {}", package.manifest.model_type.as_str())?;
     writeln!(out, "  source format: {}", package.manifest.source_format)?;
     writeln!(out, "  source game:   {}", package.manifest.source_game)?;
@@ -208,7 +231,7 @@ pub fn import(out: &mut dyn std::io::Write, input: &Path, output: &Path, game: O
     if let Some(default) = &package.manifest.default_animation {
         writeln!(out, "  default:       {default}")?;
     }
-    print_report(out, &report)?;
+    print_report(out, report)?;
     Ok(())
 }
 
@@ -443,8 +466,49 @@ Presented {} frames in {:.1}s ({:.0} fps).",
 
 fn render_cubism_bundle(out: &mut dyn std::io::Write, bytes: &[u8], frames_dir: &Path) -> Result<(), CliError> {
     let mut report = LoadReport::new();
-    let (_, model, textures) = cubism_from_bundle(bytes, &mut report)?;
+    let (_, moc, textures) = cubism_from_bundle(bytes, &mut report)?;
+    let pages: Vec<(String, Rgba8Image)> = textures
+        .into_iter()
+        .map(|t| (t.name, Rgba8Image { width: t.width, height: t.height, pixels: t.rgba }))
+        .collect();
+    render_cubism_pose(out, &moc.model, &pages, frames_dir, &report)
+}
 
+/// Renders a Cubism package's model to a single posed frame.
+///
+/// A package carries no motions -- Unity turned them into `AnimationClip`s and
+/// nothing decodes those yet -- so there is one frame to render rather than the
+/// timestamps a Spine package gets. Loading it here rather than in
+/// `a2d-desktop` is not a shortcut: the host may not depend on a decoder
+/// (spec §3), and building the model is what the shared interface is for.
+fn render_cubism_package(
+    out: &mut dyn std::io::Write,
+    package: &Package,
+    frames_dir: &Path,
+    report: &LoadReport,
+) -> Result<(), CliError> {
+    let model = package
+        .model
+        .as_cubism()
+        .ok_or_else(|| DecodeError::UnsupportedFormat("the package does not hold a Cubism model".into()))?;
+    let mut pages = Vec::new();
+    for entry in &package.manifest.textures {
+        match package.textures.iter().find(|t| t.file == entry.file) {
+            Some(file) => pages.push((entry.file.clone(), a2d_render::decode_png(&file.bytes, &entry.file)?)),
+            None => writeln!(out, "  note: texture {} is listed but absent", entry.file)?,
+        }
+    }
+    render_cubism_pose(out, model, &pages, frames_dir, report)
+}
+
+/// The rendering both Cubism paths share, once a model and its pages exist.
+fn render_cubism_pose(
+    out: &mut dyn std::io::Write,
+    model: &a2d_cubism::CubismIr,
+    pages: &[(String, Rgba8Image)],
+    frames_dir: &Path,
+    report: &LoadReport,
+) -> Result<(), CliError> {
     let pose = model.pose(&[]);
     writeln!(out, "Model:     {} drawables, {} parameters", model.drawables.len(), model.parameters.len())?;
     if !pose.is_stable() {
@@ -458,12 +522,11 @@ fn render_cubism_bundle(out: &mut dyn std::io::Write, bytes: &[u8], frames_dir: 
     let gpu = GpuContext::headless()?;
     writeln!(out, "GPU:       {} ({})", gpu.adapter_name, gpu.backend)?;
     let mut renderer = Renderer::new(gpu.clone());
-    match textures.first() {
-        Some(t) => {
-            writeln!(out, "Texture:   {} {}x{} {:?}", t.name, t.width, t.height, t.format)?;
-            let image = Rgba8Image { width: t.width, height: t.height, pixels: t.rgba.clone() };
+    match pages.first() {
+        Some((name, image)) => {
+            writeln!(out, "Texture:   {name} {}x{}", image.width, image.height)?;
             // Cubism atlases are straight alpha, not premultiplied.
-            let id = renderer.textures_mut().upload(&gpu, &t.name, &image, false, Default::default())?;
+            let id = renderer.textures_mut().upload(&gpu, name, image, false, Default::default())?;
             debug_assert_eq!(id, a2d_core::TextureId(0), "the first upload takes slot zero");
         }
         None => {
@@ -503,7 +566,7 @@ fn render_cubism_bundle(out: &mut dyn std::io::Write, bytes: &[u8], frames_dir: 
     writeln!(out, "Wrote:     {}", path.display())?;
     writeln!(out, "Draws:     {} calls, {} triangles", stats.draw_calls, stats.triangles)?;
     writeln!(out, "Coverage:  {:.1}% of the frame", covered as f64 * 100.0 / (EXPORT_SIZE * EXPORT_SIZE) as f64)?;
-    print_report(out, &report)?;
+    print_report(out, report)?;
     Ok(())
 }
 
@@ -530,6 +593,21 @@ pub fn preview(
             Some(frames) => render_cubism_bundle(out, &bytes, frames),
             None => open_cubism_viewer(out, package_dir, &bytes, exit_after),
         };
+    }
+
+    if let Ok(package) = Package::read_from(package_dir) {
+        if package.manifest.model_type == a2d_pack::ModelType::Cubism {
+            writeln!(out, "Package:   {}", package_dir.display())?;
+            let report = LoadReport::new();
+            return match frames_dir {
+                Some(dir) => render_cubism_package(out, &package, dir, &report),
+                None => Err(DecodeError::UnsupportedFormat(
+                    "a Cubism package has no motions yet, so there is nothing to play;                      render a pose with -o instead"
+                        .into(),
+                )
+                .into()),
+            };
+        }
     }
 
     match frames_dir {

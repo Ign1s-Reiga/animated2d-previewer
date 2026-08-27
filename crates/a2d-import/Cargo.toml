@@ -13,3 +13,6 @@ a2d-unity.workspace = true
 a2d-spine.workspace = true
 a2d-cubism.workspace = true
 a2d-pack.workspace = true
+# Unity stores texture pages block-compressed; a package stores them as PNG, so
+# reconstruction has to encode one. Same decoder the renderer already uses.
+png = "0.18"

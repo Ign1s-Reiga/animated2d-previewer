@@ -25,6 +25,9 @@
 //! path it was authored under.
 
 use a2d_core::{DecodeError, Degradation, LoadReport};
+use a2d_pack::manifest::TextureEntry as PackTextureEntry;
+use a2d_pack::package::TextureFile;
+use a2d_pack::Package;
 use a2d_unity::{Bundle, ClassId, Inventory, ObjectInfo, SerializedFile};
 
 /// The `.moc3` payload plus how it was found.
@@ -258,6 +261,112 @@ fn read_i32(data: &[u8], at: usize) -> Result<i32, DecodeError> {
         .ok_or_else(|| DecodeError::corrupt(format!("wanted four bytes at {at}, the object holds {}", data.len())))?;
     let b: [u8; 4] = slice.try_into().unwrap_or([0; 4]);
     Ok(i32::from_le_bytes(b))
+}
+
+/// Reconstructs a loadable package from a bundle.
+///
+/// This is the whole of spec §8's "asset discovery and reconstruction" for
+/// `unity_cubism`: find the model, decode it, decode its texture pages, and
+/// write both into the shape the viewer loads. Nothing downstream learns that
+/// any of it came out of Unity.
+///
+/// What it deliberately does *not* do is recover motions. Unity turned those
+/// into compressed `AnimationClip`s, which are not decoded, so the package
+/// lists no animations and says so through the report rather than shipping an
+/// empty list that reads as "this model has none".
+pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, DecodeError> {
+    let inventory = inspect_bundle(bytes, report)?;
+    let moc = inventory.moc.ok_or_else(|| DecodeError::Reconstruction {
+        game: "unity_cubism".into(),
+        message: "the bundle holds no CubismMoc, so there is no model to reconstruct".into(),
+    })?;
+
+    let parsed = a2d_cubism::Moc3::parse(&moc.bytes)?;
+    let source_format = format!("cubism-moc3-v{}", parsed.version);
+    if !parsed.is_verified_version() {
+        report.warn(Degradation::Note(format!(
+            "{source_format} is newer than any layout checked against a real model;              it is read on the same layout rather than refused"
+        )));
+    }
+    let model: a2d_core::ir::cubism::CubismIr = parsed.into();
+
+    let mut package = Package::from_cubism(model, moc.name.clone(), source_format);
+    // Informational only: the importer is the last layer allowed to know this,
+    // and nothing downstream branches on it (spec §2).
+    package.manifest.source_game = crate::games::Importer::UnityCubism.as_str().to_string();
+
+    // Texture pages. Unity stores these block-compressed, so they are decoded
+    // and re-encoded as PNG: a package holds pages the viewer can read without
+    // knowing anything about Unity's formats.
+    let bundle = Bundle::parse(bytes)?;
+    let node = bundle.nodes.iter().find(|n| n.is_serialized()).ok_or_else(|| DecodeError::Reconstruction {
+        game: "unity_cubism".into(),
+        message: "the bundle holds no serialized file".into(),
+    })?;
+    let file = SerializedFile::parse(bundle.node_data(node)?)?;
+    for (index, texture) in a2d_unity::read_textures(&file)?.into_iter().enumerate() {
+        let name = format!("{}.png", sanitize(&texture.name, index));
+        let png = encode_png(texture.width, texture.height, &texture.rgba, &name)?;
+        package.manifest.textures.push(PackTextureEntry {
+            file: name.clone(),
+            size: Some([texture.width, texture.height]),
+            // Cubism atlases are straight alpha, not premultiplied.
+            premultiplied_alpha: false,
+        });
+        package.textures.push(TextureFile { file: name, bytes: png });
+    }
+    if package.textures.is_empty() {
+        report.warn(Degradation::MissingReference { kind: "texture".into(), name: "any Texture2D".into() });
+    }
+
+    if !inventory.motions.is_empty() {
+        report.warn(Degradation::Note(format!(
+            "{} motion(s) are Unity AnimationClips and are not decoded, so the package plays none",
+            inventory.motions.len()
+        )));
+    }
+    Ok(package)
+}
+
+/// A file name that is safe to write and stable across runs.
+///
+/// Unity object names are arbitrary strings; a package's file names end up on
+/// disk, so anything outside a conservative set is replaced rather than
+/// escaped. An empty result falls back to the page's index so two pages never
+/// collide on one name.
+fn sanitize(name: &str, index: usize) -> String {
+    let cleaned: String =
+        name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        format!("texture_{index:02}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Encodes decoded pixels as a PNG.
+fn encode_png(width: u32, height: u32, rgba: &[u8], label: &str) -> Result<Vec<u8>, DecodeError> {
+    let expected = width as usize * height as usize * 4;
+    if rgba.len() != expected {
+        return Err(DecodeError::corrupt(format!(
+            "texture {label} is {width}x{height} but carries {} bytes, not {expected}",
+            rgba.len()
+        )));
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| DecodeError::corrupt(format!("could not start PNG for {label}: {e}")))?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|e| DecodeError::corrupt(format!("could not encode PNG for {label}: {e}")))?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

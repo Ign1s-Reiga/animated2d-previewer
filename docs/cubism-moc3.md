@@ -11,6 +11,11 @@ section below says what would have failed had the reading been wrong.
 
 The implementation is `crates/a2d-cubism/`: `moc3.rs` reads the container,
 `eval.rs` poses a model, `emit.rs` turns a pose into renderer-neutral meshes.
+The model those work on is `a2d-core`'s `ir::cubism::CubismIr`, which lives
+there rather than beside the reader because a package stores it and `a2d-pack`
+may not depend on a format crate. `a2d-pack`'s `cubism_io.rs` writes it into
+`model.bin`, and `a2d-import`'s `unity_cubism` reconstructs both from a
+bundle.
 
 ---
 
@@ -464,19 +469,30 @@ weakened: one that fails on correct data is worse than none.
 These are `crates/a2d-cli/tests/cubism_orientation.rs`, gated on
 `A2D_FIXTURE_CUBISM` because extracted assets are never committed (§11).
 
+### Drawing one, from the CLI
+
+```bash
+animated2d preview <bundle-or-package> -o frames/   # writes frames/pose.png
+animated2d import  <bundle> -o character.a2dpack    # bundle -> package
+```
+
+`preview` takes a bundle directly *and* a package; both routes render the same
+pose through the same code, which is what says a package is a faithful record
+of the model rather than a re-interpretation of it. A real-asset test asserts
+exactly that: the same bundle, posed from the MOC3 and posed from the package
+written to disk, matches vertex for vertex.
+
+A Cubism package has no motions to play, so `preview` without `-o` refuses and
+says why rather than opening an empty viewer.
+
 ## 8. What is still unverified
 
 - **No reference runtime.** The models now render as coherent scenes, which is
   much stronger than landing in the right frame, but a picture that looks right
   cannot show that a particular warp bends the way Live2D bends it, or that
   blending weights are right *between* keys rather than only on them.
-- **No render in the repository.** The renders that found the base angle of §4
-  were made by a throwaway rasteriser: the importer cannot yet reconstruct a
-  Cubism package, so `preview` has no path from a bundle to a picture, and the
-  one criterion strong enough to catch a wrong pose is the one that cannot be
-  run from the CLI. Everything the parser needs is already there — posed
-  geometry, uvs, the paint sequence, and a decoded `Texture2D` — so this is
-  wiring rather than discovery, and it is the highest-value thing left.
+- **Motions.** A package carries none, so a Cubism model poses and draws but
+  does not move. See below.
 - **The unit conversion between a warp and a rotation under it.** It takes the
   warp's posed bounding box per axis, which is exact for an axis-aligned
   lattice and approximate for a turned one. Reading the setup grid instead, or

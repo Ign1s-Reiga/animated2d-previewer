@@ -6,5 +6,6 @@
 //! [`RenderMesh`](crate::render::RenderMesh).
 
 pub mod atlas;
+pub mod cubism;
 pub mod ids;
 pub mod spine;

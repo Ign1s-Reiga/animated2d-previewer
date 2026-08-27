@@ -23,8 +23,9 @@ use a2d_core::{
     Aabb, AnimatedModel, AnimationInfo, ExpressionInfo, HitAreaId, PlayOptions, RenderList, RuntimeError, TextureId,
 };
 
-use crate::eval::Pose;
-use crate::moc3::Moc3;
+use crate::emit::CubismEmit;
+use crate::eval::{CubismEval, Pose};
+use crate::moc3::CubismIr;
 
 /// Cubism's conventional parameter names, and how the idle moves each.
 ///
@@ -42,7 +43,9 @@ const IDLE: &[(&str, f32, f32)] = &[
 
 /// A Cubism model, posed and drawable.
 pub struct GenericCubismModel {
-    moc: Moc3,
+    /// The normalized model. A MOC3 is one way to obtain it and a package is
+    /// another, and nothing here can tell which it was.
+    moc: CubismIr,
     name: String,
     /// One value per parameter, in the model's own order.
     values: Vec<f32>,
@@ -58,7 +61,8 @@ pub struct GenericCubismModel {
 
 impl GenericCubismModel {
     /// Wraps a parsed model.
-    pub fn load(moc: Moc3, display_name: impl Into<String>) -> GenericCubismModel {
+    pub fn load(moc: impl Into<CubismIr>, display_name: impl Into<String>) -> GenericCubismModel {
+        let moc = moc.into();
         let values: Vec<f32> = moc.parameters.iter().map(|p| p.default).collect();
 
         // Resolve the idle against this model's own parameters, once.
@@ -86,7 +90,7 @@ impl GenericCubismModel {
         }
     }
 
-    pub fn moc(&self) -> &Moc3 {
+    pub fn moc(&self) -> &CubismIr {
         &self.moc
     }
 
@@ -196,6 +200,7 @@ impl AnimatedModel for GenericCubismModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Moc3;
 
     fn model() -> GenericCubismModel {
         let bytes = crate::moc3::tests::Builder::new().build();

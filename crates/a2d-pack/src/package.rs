@@ -12,12 +12,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use a2d_core::ir::cubism::CubismIr;
 use a2d_core::ir::spine::SpineIr;
 use a2d_core::{DecodeError, LoadReport};
 
 use crate::bin_io::{Reader, Writer};
 use crate::manifest::{AnimationEntry, Manifest, ModelType, TextureEntry, FORMAT_VERSION};
-use crate::spine_io;
+use crate::{cubism_io, spine_io};
 
 /// `model.bin` magic. Present so a stray file is diagnosed rather than parsed.
 pub const MODEL_MAGIC: &[u8; 4] = b"A2DM";
@@ -36,18 +37,28 @@ pub struct TextureFile {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PackageModel {
     Spine(SpineIr),
+    Cubism(CubismIr),
 }
 
 impl PackageModel {
     pub fn model_type(&self) -> ModelType {
         match self {
             PackageModel::Spine(_) => ModelType::Spine,
+            PackageModel::Cubism(_) => ModelType::Cubism,
         }
     }
 
     pub fn as_spine(&self) -> Option<&SpineIr> {
         match self {
             PackageModel::Spine(ir) => Some(ir),
+            _ => None,
+        }
+    }
+
+    pub fn as_cubism(&self) -> Option<&CubismIr> {
+        match self {
+            PackageModel::Cubism(ir) => Some(ir),
+            _ => None,
         }
     }
 }
@@ -82,6 +93,18 @@ impl Package {
         Package { manifest, model: PackageModel::Spine(ir), textures: Vec::new() }
     }
 
+    /// Builds a package from a decoded Cubism model.
+    ///
+    /// A Cubism model carries no animations of its own -- its motions live
+    /// outside the MOC3 and are not decoded yet -- so the manifest lists none
+    /// and names no default. That is the honest state rather than an empty
+    /// placeholder: `inspect` and `validate` both report it.
+    pub fn from_cubism(ir: CubismIr, display_name: impl Into<String>, source_format: impl Into<String>) -> Package {
+        let mut manifest = Manifest::new(ModelType::Cubism, display_name);
+        manifest.source_format = source_format.into();
+        Package { manifest, model: PackageModel::Cubism(ir), textures: Vec::new() }
+    }
+
     /// Encodes `model.bin`.
     pub fn encode_model(&self) -> Vec<u8> {
         let mut w = Writer::with_capacity(64 * 1024);
@@ -91,6 +114,10 @@ impl Package {
             PackageModel::Spine(ir) => {
                 w.u8(0);
                 spine_io::write(&mut w, ir);
+            }
+            PackageModel::Cubism(ir) => {
+                w.u8(1);
+                cubism_io::write(&mut w, ir);
             }
         }
         w.into_bytes()
@@ -110,6 +137,7 @@ impl Package {
         }
         let model = match r.u8()? {
             0 => PackageModel::Spine(spine_io::read(&mut r)?),
+            1 => PackageModel::Cubism(cubism_io::read(&mut r)?),
             other => {
                 return Err(DecodeError::UnsupportedFormat(format!("unknown model kind tag {other} in model.bin")))
             }
@@ -196,6 +224,7 @@ impl Package {
         }
         match &self.model {
             PackageModel::Spine(ir) => crate::validate::validate_spine(ir, &self.textures, &mut report),
+            PackageModel::Cubism(ir) => crate::validate::validate_cubism(ir, &self.textures, &mut report),
         }
         report
     }
@@ -591,7 +620,7 @@ mod tests {
         // This is the property golden tests rely on.
         let first = Package::from_spine(rich_ir(), "Hero").encode_model();
         let decoded = Package::decode_model(&first).unwrap();
-        let PackageModel::Spine(ir) = decoded;
+        let PackageModel::Spine(ir) = decoded else { panic!("a Spine package must decode as one") };
         let second = Package::from_spine(ir, "Hero").encode_model();
         assert_eq!(first, second);
     }

@@ -60,6 +60,7 @@ dependencies = [
  "a2d-pack",
  "a2d-spine",
  "a2d-unity",
+ "png",
 ]
 
 [[package]]

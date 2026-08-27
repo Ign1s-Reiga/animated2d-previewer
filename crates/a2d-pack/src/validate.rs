@@ -3,6 +3,7 @@
 //! Validation never fails the load. It reports, so a partially-broken package
 //! can still be opened and looked at while the gap is diagnosed.
 
+use a2d_core::ir::cubism::CubismIr;
 use a2d_core::ir::spine::{AttachmentKind, ConstraintKind, SpineIr, Timeline};
 use a2d_core::{Degradation, LoadReport};
 
@@ -205,6 +206,44 @@ fn check_timelines(ir: &SpineIr, report: &mut LoadReport) {
                 detail: "animation has no timelines".into(),
             });
         }
+    }
+}
+
+/// Checks a Cubism model the way [`validate_spine`] checks a skeleton.
+///
+/// The structural indices are already range-checked when `model.bin` is read,
+/// so what is left here is what a package can be *coherently* missing: a
+/// texture page with no file, a model with nothing to draw, and the tracks a
+/// drawable needs to be posed at all.
+pub fn validate_cubism(ir: &CubismIr, textures: &[TextureFile], report: &mut LoadReport) {
+    for entry in ir.drawables.iter().map(|d| d.texture).collect::<std::collections::BTreeSet<_>>() {
+        if textures.get(entry as usize).is_none() {
+            report.warn(Degradation::MissingReference { kind: "texture page".into(), name: format!("page {entry}") });
+        }
+    }
+    if ir.drawables.is_empty() {
+        report.warn(Degradation::Note("the model has no drawables, so nothing will be seen".into()));
+    }
+    if ir.parameters.is_empty() {
+        report.warn(Degradation::Note("the model has no parameters, so it cannot be animated".into()));
+    }
+
+    // A keyform pool that cannot cover its own drawables poses nothing: the
+    // blend falls back to zeroed coordinates and the mesh collapses.
+    for d in &ir.drawables {
+        let needed = d.keyform_begin as usize + d.keyform_count as usize;
+        if needed > ir.keyforms.drawable_offsets.len() {
+            report.warn(Degradation::MissingReference { kind: "drawable keyforms".into(), name: d.id.clone() });
+        }
+    }
+
+    // Cubism hides a part by taking it to zero opacity, so a model with no
+    // opacity track draws everything -- including what should be hidden.
+    if ir.drawable_keyform_opacities.is_empty() {
+        report.warn(Degradation::Note("no drawable opacity track; every drawable will be painted opaque".into()));
+    }
+    if ir.draw_order.is_empty() {
+        report.warn(Degradation::Note("no paint sequence; drawables will be painted in model order".into()));
     }
 }
 

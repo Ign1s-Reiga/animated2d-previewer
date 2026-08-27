@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bin_io;
+pub mod cubism_io;
 pub mod manifest;
 pub mod package;
 pub mod spine_io;

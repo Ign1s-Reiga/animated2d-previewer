@@ -162,7 +162,7 @@
 //! Reading the setup grid instead, or forcing the rate isotropic, changes no
 //! model measurably, so nothing available here distinguishes them.
 
-use crate::moc3::{Deformer, DeformerKind, KeyformBinding, Moc3, RotationKeyform};
+use crate::moc3::{CubismIr, Deformer, DeformerKind, KeyformBinding, RotationKeyform};
 
 /// A posed model: where every drawable's vertices ended up.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -207,13 +207,52 @@ struct AxisPosition {
     fraction: f32,
 }
 
-impl Moc3 {
+/// Posing, on the normalized model.
+///
+/// A trait rather than inherent methods, because [`CubismIr`] belongs to
+/// `a2d-core` -- a package stores it, and `a2d-pack` may not depend on a
+/// format crate -- while the evaluation belongs here, beside the decoder the
+/// model was derived from. The orphan rule reserves inherent impls for the
+/// crate that defines a type, so this is what "methods on the IR" has to look
+/// like. [`Moc3`] derefs to the model, so `moc.pose(..)` still reads the same.
+pub trait CubismEval {
     /// Poses the model at the given parameter values.
     ///
     /// `values` is indexed by parameter, in the model's own order; anything
     /// short is filled from the parameters' defaults, and every value is
     /// clamped into its parameter's range before use.
-    pub fn pose(&self, values: &[f32]) -> Pose {
+    fn pose(&self, values: &[f32]) -> Pose;
+
+    /// The deformer chain above an element, root last.
+    fn deformer_chain(&self, from: u32) -> Vec<&Deformer>;
+}
+
+/// The parts of posing that are not API.
+///
+/// Kept off [`CubismEval`] so that having the model does not mean publishing
+/// how it is walked; a trait only because the helpers call each other through
+/// `self` and the type is foreign.
+trait EvalInternals {
+    fn resolve_values(&self, values: &[f32]) -> Vec<f32>;
+    fn weights_for(&self, binding: u32, values: &[f32]) -> Vec<(usize, f32)>;
+    fn carry_up(
+        &self,
+        from: Option<u32>,
+        points: &mut [(f32, f32)],
+        warps: &[Vec<(f32, f32)>],
+        rotations: &[RotationKeyform],
+        units: &[(f32, f32)],
+    );
+    fn warp_units(&self, grids: &[Vec<(f32, f32)>]) -> Vec<(f32, f32)>;
+}
+
+impl CubismEval for CubismIr {
+    /// Poses the model at the given parameter values.
+    ///
+    /// `values` is indexed by parameter, in the model's own order; anything
+    /// short is filled from the parameters' defaults, and every value is
+    /// clamped into its parameter's range before use.
+    fn pose(&self, values: &[f32]) -> Pose {
         let resolved = self.resolve_values(values);
 
         // Each element's keyforms are blended first, then the tree is walked,
@@ -316,7 +355,23 @@ impl Moc3 {
 
         Pose { drawables, opacities, draw_orders, unstable }
     }
+    /// The deformer chain above an element, root last.
+    fn deformer_chain(&self, from: u32) -> Vec<&Deformer> {
+        let mut out = Vec::new();
+        let mut at = Some(from);
+        while let Some(index) = at {
+            let Some(deformer) = self.deformers.get(index as usize) else { break };
+            out.push(deformer);
+            at = deformer.parent;
+            if out.len() > self.deformers.len() {
+                break;
+            }
+        }
+        out
+    }
+}
 
+impl EvalInternals for CubismIr {
     /// Parameter values, defaulted and clamped.
     fn resolve_values(&self, values: &[f32]) -> Vec<f32> {
         self.parameters
@@ -505,21 +560,6 @@ impl Moc3 {
                 carry = (ew * carry.0, eh * carry.1);
                 out[w] = carry;
                 done[w] = true;
-            }
-        }
-        out
-    }
-
-    /// The deformer chain above an element, root last.
-    pub fn deformer_chain(&self, from: u32) -> Vec<&Deformer> {
-        let mut out = Vec::new();
-        let mut at = Some(from);
-        while let Some(index) = at {
-            let Some(deformer) = self.deformers.get(index as usize) else { break };
-            out.push(deformer);
-            at = deformer.parent;
-            if out.len() > self.deformers.len() {
-                break;
             }
         }
         out

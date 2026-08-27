@@ -7,9 +7,21 @@
 use a2d_core::{MaskId, RenderList, Rgba, TextureId, Vec2};
 
 use crate::eval::Pose;
-use crate::moc3::Moc3;
+use crate::moc3::CubismIr;
 
-impl Moc3 {
+/// Turning a pose into renderer-neutral meshes.
+///
+/// A trait for the same reason as [`CubismEval`](crate::CubismEval): the model
+/// is defined in `a2d-core` so that a package can store it.
+pub trait CubismEmit {
+    /// Appends one mesh per visible drawable, in paint order.
+    fn emit(&self, pose: &Pose, texture: TextureId, out: &mut RenderList);
+
+    /// The posed geometry's bounds, or `None` when nothing was posed.
+    fn bounds(&self, pose: &Pose) -> Option<(Vec2, Vec2)>;
+}
+
+impl CubismEmit for CubismIr {
     /// Appends a posed model to `out`.
     ///
     /// `texture` is the page every drawable samples. Cubism models in these
@@ -19,7 +31,7 @@ impl Moc3 {
     ///
     /// Coordinates come out in canvas units — the space the canvas size is
     /// expressed in once divided by its pixels per unit — with `y` upwards.
-    pub fn emit(&self, pose: &Pose, texture: TextureId, out: &mut RenderList) {
+    fn emit(&self, pose: &Pose, texture: TextureId, out: &mut RenderList) {
         // The model carries the resolved back-to-front sequence outright, so
         // there is nothing to sort: slot k names the drawable drawn k-th.
         //
@@ -116,7 +128,7 @@ impl Moc3 {
     }
 
     /// Where the posed model sits, in canvas units.
-    pub fn bounds(&self, pose: &Pose) -> Option<(Vec2, Vec2)> {
+    fn bounds(&self, pose: &Pose) -> Option<(Vec2, Vec2)> {
         let mut lo = Vec2::new(f32::MAX, f32::MAX);
         let mut hi = Vec2::new(f32::MIN, f32::MIN);
         let mut any = false;
@@ -137,6 +149,7 @@ impl Moc3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CubismEval, Moc3};
 
     #[test]
     fn meshes_are_painted_in_the_sequence_the_model_names() {

@@ -17,7 +17,7 @@
 //! everything, so the test belongs here.
 
 use a2d_core::LoadReport;
-use a2d_cubism::Moc3;
+use a2d_cubism::{CubismEval, Moc3};
 
 /// Pulls the MOC3 payload out of the bundle the fixture points at.
 fn payload() -> Option<Vec<u8>> {
@@ -294,4 +294,49 @@ fn posing_a_real_model_lands_somewhere_the_canvas_can_hold() {
         "only {inside} of {} drawables posed inside the canvas; the deformer chain has regressed",
         pose.drawables.len()
     );
+}
+
+/// The whole reconstruction, on a real bundle: bundle to package, package to
+/// disk, disk back to a model that poses identically.
+///
+/// The point is the *identity*. A package stores the normalized model rather
+/// than the MOC3 (spec §9), so this is what says the two are the same model
+/// and not merely two models that both load: same drawable count, same
+/// parameters, and the same posed geometry vertex for vertex.
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
+fn a_bundle_reconstructs_into_a_package_that_poses_identically() {
+    let Some(path) = std::env::var("A2D_FIXTURE_CUBISM").ok() else { return };
+    let bytes = std::fs::read(&path).expect("the fixture should be readable");
+
+    let mut report = LoadReport::new();
+    let package = a2d_import::import_bundle(&bytes, &mut report).expect("the bundle should reconstruct");
+    assert_eq!(package.manifest.model_type, a2d_pack::ModelType::Cubism);
+    assert!(!package.textures.is_empty(), "a model with no texture page cannot be drawn");
+    for texture in &package.textures {
+        assert!(texture.bytes.starts_with(b"\x89PNG"), "{} is not a PNG", texture.file);
+    }
+
+    // Through the filesystem, not just through memory: a package that only
+    // round-trips in process would still be unusable.
+    let dir = std::env::temp_dir().join("a2d-cubism-package-round-trip");
+    let _ = std::fs::remove_dir_all(&dir);
+    package.write_to(&dir).expect("the package should write");
+    let reloaded = a2d_pack::Package::read_from(&dir).expect("the package should read back");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let original = a2d_cubism::Moc3::parse(
+        &a2d_import::inspect_bundle(&bytes, &mut LoadReport::new()).expect("inventory").moc.expect("moc").bytes,
+    )
+    .expect("the MOC3 should parse");
+    let stored = reloaded.model.as_cubism().expect("the package should hold a Cubism model");
+
+    assert_eq!(stored.drawables.len(), original.drawables.len());
+    assert_eq!(stored.parameters.len(), original.parameters.len());
+    assert_eq!(stored.deformers.len(), original.deformers.len());
+
+    let from_bundle = original.pose(&[]);
+    let from_package = stored.pose(&[]);
+    assert_eq!(from_package.drawables, from_bundle.drawables, "the package must pose to the same geometry");
+    assert_eq!(from_package.opacities, from_bundle.opacities);
 }

@@ -54,7 +54,7 @@
 //! assets are never committed (§11).
 
 use a2d_core::LoadReport;
-use a2d_cubism::{DeformerKind, Moc3};
+use a2d_cubism::{CubismEmit, CubismEval, DeformerKind, Moc3};
 
 fn model() -> Option<Moc3> {
     let path = std::env::var("A2D_FIXTURE_CUBISM").ok()?;
