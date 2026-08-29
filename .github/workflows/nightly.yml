@@ -58,8 +58,11 @@ jobs:
       - name: System libraries
         run: |
           sudo apt-get update
+          # libxdo is what tray-icon links against. clippy only checks and
+          # never links, so a missing one passes every earlier step and fails
+          # at the first binary that gets built.
           sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libayatana-appindicator3-dev \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
             libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
             libxrandr-dev libxi-dev libgl1-mesa-dev pkg-config
 
@@ -108,8 +111,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # libxdo is what tray-icon links against. clippy only checks and
+          # never links, so a missing one passes every earlier step and fails
+          # at the first binary that gets built.
           sudo apt-get install -y --no-install-recommends \
-            libgtk-3-dev libayatana-appindicator3-dev \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
             libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
             libxrandr-dev libxi-dev libgl1-mesa-dev pkg-config
 
