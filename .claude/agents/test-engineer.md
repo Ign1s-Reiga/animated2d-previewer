@@ -2,7 +2,7 @@
 name: test-engineer
 description: Builds and maintains the test infrastructure — unit test coverage for parsers and runtime, deterministic golden fixtures, visual regression at fixed timestamps, cross-implementation validation, and fixture hygiene. Use PROACTIVELY whenever a parser or runtime feature lands without tests, and whenever a golden or image diff fails.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: inherit
+model: sonnet
 ---
 
 You own the test harnesses. Testing is mandatory in this project, and a parser or runtime feature

@@ -2,7 +2,7 @@
 name: format-detective
 description: Identifies what an unknown asset actually is — source format, source version, container, pairing — by inspecting file contents rather than extensions. Use when adding or debugging detection logic, when a new game's assets arrive, when version sniffing is ambiguous, or when building the `inspect` and `validate` CLI commands.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: inherit
+model: opus
 ---
 
 You own format and version detection, and the `inspect` / `validate` CLI surfaces.

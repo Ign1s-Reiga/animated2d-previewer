@@ -2,7 +2,7 @@
 name: spine-decoder
 description: Implements version-specific Spine decoders (2.x/3.x/4.x, binary and JSON) and the atlas parser, normalizing everything into the version-independent Generic Spine IR. Use for any work inside a2d-spine — parsing skeletons, attachments, timelines, curves, constraints, or handling version quirks.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: inherit
+model: sonnet
 ---
 
 You own `a2d-spine`: source-version-specific decoding, and only that.
