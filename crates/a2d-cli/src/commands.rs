@@ -957,9 +957,10 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<()
         writeln!(out, "    (none)")?;
     }
     for motion in &inventory.motions {
-        // Fade data is what preserves a motion's original identity, so whether
-        // it survived is worth saying per motion rather than as a total.
-        let fade = if motion.has_fade_data { "" } else { "  (no fade data)" };
+        // Whether fade data survives decides how much of a motion's original
+        // authoring is available; inspect does not decode, so it only says what
+        // is present.
+        let fade = if motion.has_fade_data { "  (fade data present)" } else { "  (clip only, no fade data)" };
         writeln!(out, "    {}{fade}", motion.name)?;
     }
 

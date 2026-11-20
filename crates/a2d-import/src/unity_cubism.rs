@@ -20,19 +20,26 @@
 //!   it is what `import_bundle` recovers motions from (see `fade_motion`).
 //! * `CubismFadeMotionList` — the index tying those to their clips.
 //!
-//! The same motions also exist as Unity `AnimationClip`s, which are not decoded
-//! (the fade data carries the curves in a readable form); textures become
-//! `Texture2D`. The bundle's own container table maps each of these back to the
-//! path it was authored under.
+//! The same motions also exist as Unity `AnimationClip`s. Shipping bundles often
+//! hold *only* those, compressed, with no fade data at all; `import_bundle`
+//! decodes such a clip itself (see `clip_motion`) and uses the fade data when
+//! there is some. Textures become `Texture2D`. The bundle's own container table
+//! maps each of these back to the path it was authored under.
 
+mod clip_motion;
 mod fade_motion;
+
+use std::collections::HashSet;
 
 use a2d_core::ir::cubism::Motion;
 use a2d_core::{DecodeError, Degradation, LoadReport};
 use a2d_pack::manifest::TextureEntry as PackTextureEntry;
 use a2d_pack::package::TextureFile;
 use a2d_pack::Package;
-use a2d_unity::{behaviour_body, Bundle, ClassId, Inventory, ObjectInfo, Reader, SerializedFile};
+use a2d_unity::{
+    behaviour_body, behaviour_owner_name, AnimationClip, Bundle, ClassId, Inventory, ObjectInfo, PPtr, Reader,
+    SerializedFile,
+};
 
 /// The `.moc3` payload plus how it was found.
 #[derive(Debug, Clone)]
@@ -52,6 +59,8 @@ pub struct MotionEntry {
     pub name: String,
     pub asset_path: Option<String>,
     /// Whether a matching `CubismFadeMotionData` was found beside the clip.
+    /// When it was, the motion is recovered from that; otherwise from the
+    /// clip's own compressed curves.
     pub has_fade_data: bool,
 }
 
@@ -125,7 +134,7 @@ pub fn inspect_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<CubismInv
         .by_class(ClassId::ANIMATION_CLIP)
         .map(|o| {
             let name = o.name.clone().unwrap_or_else(|| format!("clip#{}", o.path_id));
-            let has_fade_data = fade_sources.iter().any(|p| mentions(p, &name));
+            let has_fade_data = fade_sources.iter().any(|p| names_clip(p, &name));
             MotionEntry { name, asset_path: o.asset_path.clone(), has_fade_data }
         })
         .collect();
@@ -234,13 +243,18 @@ fn motion3_path(file: &SerializedFile, info: &ObjectInfo) -> Option<String> {
     text.contains(".motion3.json").then_some(text)
 }
 
-/// Whether a source path names a given clip, ignoring case.
-///
-/// Unity lower-cases container paths but keeps the authored casing inside the
-/// asset, so `Hero_idle` has to match `.../hero_idle.motion3.json`.
-fn mentions(path: &str, clip: &str) -> bool {
-    let stem = clip.to_ascii_lowercase();
-    path.to_ascii_lowercase().contains(&stem)
+/// The lower-cased file stem of a motion source path, which is what a clip is
+/// matched on: `Assets/x/Hero_idle.motion3.json` is `hero_idle`.
+fn source_stem(path: &str) -> String {
+    fade_motion::motion_stem(path, "").to_ascii_lowercase()
+}
+
+/// Whether a source path names a given clip: an exact, case-insensitive match
+/// of file stems. Unity lower-cases container paths but keeps the authored
+/// casing inside the asset, so `Hero_idle` matches `.../hero_idle.motion3.json`
+/// while `idle` does not match `idle_02.motion3.json`.
+fn names_clip(path: &str, clip: &str) -> bool {
+    source_stem(path) == clip.to_ascii_lowercase()
 }
 
 fn read_i32(data: &[u8], at: usize) -> Result<i32, DecodeError> {
@@ -259,8 +273,8 @@ fn read_i32(data: &[u8], at: usize) -> Result<i32, DecodeError> {
 /// any of it came out of Unity.
 ///
 /// Motions are recovered from the `CubismFadeMotionData` behaviours, which keep
-/// each motion's parameter curves; the matching Unity `AnimationClip`s are not
-/// decoded. A motion that cannot be decoded, or a clip with no fade data, is
+/// each motion's parameter curves, and, for every `AnimationClip` with no
+/// matching fade data, from the clip itself. A motion that cannot be decoded is
 /// reported through `report` and the model still loads.
 pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, DecodeError> {
     let inventory = inspect_bundle(bytes, report)?;
@@ -273,7 +287,7 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
     let source_format = format!("cubism-moc3-v{}", parsed.version);
     if !parsed.is_verified_version() {
         report.warn(Degradation::Note(format!(
-            "{source_format} is newer than any layout checked against a real model;              it is read on the same layout rather than refused"
+            "{source_format} is newer than any layout checked against a real model; it is read on the same layout rather than refused"
         )));
     }
     let mut model: a2d_core::ir::cubism::CubismIr = parsed.into();
@@ -290,14 +304,6 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
     // and playback skips them; saying so here keeps that visible at import.
     for degradation in model.unresolved_motion_targets() {
         report.warn(degradation);
-    }
-    let unmatched: Vec<&str> = inventory.motions.iter().filter(|m| !m.has_fade_data).map(|m| m.name.as_str()).collect();
-    if !unmatched.is_empty() {
-        report.note(format!(
-            "{} AnimationClip(s) have no matching fade motion data and are not recovered: {}",
-            unmatched.len(),
-            unmatched.join(", ")
-        ));
     }
 
     let mut package = Package::from_cubism(model, moc.name.clone(), source_format);
@@ -359,7 +365,98 @@ fn recover_motions(file: &SerializedFile, inventory: &Inventory, report: &mut Lo
             .and_then(|object| behaviour_body(file, object));
         (label, body)
     });
-    motions_from_bodies(items, report)
+    let (mut motions, covered) = motions_from_bodies(items, report);
+    let from_clips = clip_motions(file, inventory, &covered, report);
+    merge_motions(&mut motions, from_clips, report);
+    motions
+}
+
+/// Adds clip-derived motions to the fade-derived ones and puts the whole list
+/// in its final, deterministic order with unique names.
+///
+/// The stable sort keeps bundle order between equal names, so the result is
+/// the same on every run.
+fn merge_motions(motions: &mut Vec<Motion>, from_clips: Vec<Motion>, report: &mut LoadReport) {
+    if from_clips.is_empty() {
+        return;
+    }
+    motions.extend(from_clips);
+    motions.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut names: Vec<String> = motions.iter().map(|m| m.name.clone()).collect();
+    fade_motion::dedupe_names(&mut names, report);
+    for (motion, name) in motions.iter_mut().zip(names) {
+        motion.name = name;
+    }
+}
+
+/// Whether a clip's own name is among the lower-cased stems of fade motions
+/// that decoded.
+fn is_covered(covered: &HashSet<String>, clip: &str) -> bool {
+    covered.contains(&clip.to_ascii_lowercase())
+}
+
+/// Decodes every `AnimationClip` that has no matching fade data.
+///
+/// Parameter names come from the `GameObject` that carries each
+/// `CubismParameter`, because a clip names its targets only by hash. A clip that
+/// fails is reported by name and the others are unaffected.
+fn clip_motions(
+    file: &SerializedFile,
+    inventory: &Inventory,
+    covered: &HashSet<String>,
+    report: &mut LoadReport,
+) -> Vec<Motion> {
+    let pending: Vec<&ObjectInfo> = inventory
+        .by_class(ClassId::ANIMATION_CLIP)
+        .filter(|o| {
+            let name = o.name.clone().unwrap_or_else(|| format!("clip#{}", o.path_id));
+            !is_covered(covered, &name)
+        })
+        .collect();
+    if pending.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ids: Vec<String> = Vec::new();
+    let mut unnamed = 0usize;
+    for info in inventory.by_script("CubismParameter") {
+        let owner = file
+            .find_object(info.path_id)
+            .ok_or_else(|| DecodeError::corrupt("a CubismParameter vanished between passes".to_string()))
+            .and_then(|object| behaviour_owner_name(file, object));
+        match owner {
+            Ok(Some(name)) if !name.is_empty() => ids.push(name),
+            _ => unnamed += 1,
+        }
+    }
+    if unnamed > 0 {
+        report.note(format!(
+            "{unnamed} CubismParameter(s) have no readable owner name, so clip curves aimed at them cannot be matched"
+        ));
+    }
+    let names = match clip_motion::NameTable::new(ids.iter().map(String::as_str)) {
+        Ok(names) => names,
+        Err(error) => {
+            report.note(format!("{} AnimationClip(s) were not recovered: {error}", pending.len()));
+            return Vec::new();
+        }
+    };
+    let script_class =
+        |p: PPtr| p.is_local().then(|| inventory.script(p.path_id)).flatten().map(|s| s.class_name.clone());
+
+    let mut motions = Vec::new();
+    for info in pending {
+        let label = info.name.clone().unwrap_or_else(|| format!("clip#{}", info.path_id));
+        let clip = file
+            .find_object(info.path_id)
+            .ok_or_else(|| DecodeError::corrupt("the AnimationClip vanished between passes".to_string()))
+            .and_then(|object| AnimationClip::parse(file.object_data(object)?));
+        match clip {
+            Ok(clip) => motions.extend(clip_motion::to_motion(&clip, &names, &script_class, report)),
+            Err(error) => report.note(format!("motion {label:?} was not recovered from its AnimationClip: {error}")),
+        }
+    }
+    motions
 }
 
 /// The part of motion recovery that needs no bundle: each item is a label and
@@ -368,7 +465,7 @@ fn recover_motions(file: &SerializedFile, inventory: &Inventory, report: &mut Lo
 fn motions_from_bodies<'a>(
     items: impl IntoIterator<Item = (String, Result<(Reader<'a>, String), DecodeError>)>,
     report: &mut LoadReport,
-) -> Vec<Motion> {
+) -> (Vec<Motion>, HashSet<String>) {
     let mut decoded = Vec::new();
     for (label, body) in items {
         let result = body.and_then(|(body, name)| Ok((name, fade_motion::decode(&body)?)));
@@ -388,7 +485,10 @@ fn motions_from_bodies<'a>(
     let mut motions: Vec<Motion> =
         decoded.iter().zip(names).map(|((_, fade), name)| fade_motion::to_motion(fade, name, report)).collect();
     motions.sort_by(|a, b| a.name.cmp(&b.name));
-    motions
+    // Only motions that actually decoded cover a clip, so a clip whose fade
+    // data is unreadable falls back to its own curves.
+    let covered = decoded.iter().map(|(stem, _)| stem.to_ascii_lowercase()).collect();
+    (motions, covered)
 }
 
 /// A file name that is safe to write and stable across runs.
@@ -439,9 +539,11 @@ mod tests {
     #[test]
     fn a_clip_is_matched_to_its_source_regardless_of_case() {
         let path = "Assets/.../motions/Hero_idle.motion3.json";
-        assert!(mentions(path, "Hero_idle"));
-        assert!(mentions(path, "hero_idle"), "container paths are lower-cased");
-        assert!(!mentions(path, "Hero_smile"));
+        assert!(names_clip(path, "Hero_idle"));
+        assert!(names_clip(path, "hero_idle"), "container paths are lower-cased");
+        assert!(!names_clip(path, "Hero_smile"));
+        assert!(!names_clip("x/idle_02.motion3.json", "idle"), "a prefix is not a match");
+        assert!(!names_clip("x/my_idle.motion3.json", "idle"), "nor is a suffix");
     }
 
     #[test]
@@ -460,7 +562,7 @@ mod tests {
     fn report_warnings_are_recorded_in_the_manifest_in_order() {
         let mut package = cubism_package(Vec::new());
         let mut report = LoadReport::new();
-        report.note("2 AnimationClip(s) have no matching fade motion data");
+        report.note("a note");
         report.warn(Degradation::MissingReference { kind: "texture".into(), name: "any Texture2D".into() });
         record_warnings(&mut package, &report);
         let expected: Vec<String> = report.warnings().iter().map(|w| w.to_string()).collect();
@@ -487,6 +589,46 @@ mod tests {
         assert_eq!(report.len(), 2);
         record_warnings(&mut package, &report);
         assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
+    }
+
+    #[test]
+    fn clips_are_covered_by_decoded_fade_data_only_by_exact_stem_and_the_merge_is_deterministic() {
+        use super::fade_motion::tests::{body, sample};
+        use a2d_unity::Endian;
+
+        let mk = |path: &str| fade_motion::FadeMotion { motion_name: path.into(), ..sample() };
+        let bytes_hero = body(&mk("x/Hero.motion3.json"), true);
+        let bytes_idle2 = body(&mk("x/Idle_02.motion3.json"), false);
+        let junk = vec![9u8; 8];
+        fn rd(b: &[u8]) -> Reader<'_> {
+            Reader::new(b, Endian::Little)
+        }
+        let items = vec![
+            ("hero".to_string(), Ok((rd(&bytes_hero), "hero".to_string()))),
+            ("idle2".to_string(), Ok((rd(&bytes_idle2), "idle2".to_string()))),
+            // Fade data that fails to decode must not hide its clip.
+            ("broken".to_string(), Ok((rd(&junk), "broken".to_string()))),
+        ];
+        let mut report = LoadReport::new();
+        let (mut motions, covered) = motions_from_bodies(items, &mut report);
+        assert_eq!(motions.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["Hero", "Idle_02"]);
+
+        // `idle` is a substring of `idle_02` but is not covered by it.
+        let clips = ["hero", "idle", "idle_02", "broken", "idle"];
+        let uncovered: Vec<&str> = clips.iter().copied().filter(|c| !is_covered(&covered, c)).collect();
+        assert_eq!(uncovered, ["idle", "broken", "idle"]);
+
+        let stub = |name: &str| Motion { name: name.into(), duration: 1.0, ..Motion::default() };
+        let mut merge_report = LoadReport::new();
+        merge_motions(&mut motions, uncovered.iter().map(|n| stub(n)).collect(), &mut merge_report);
+        let names: Vec<&str> = motions.iter().map(|m| m.name.as_str()).collect();
+        // Byte order puts the upper-case fade-derived names first; the clash
+        // between the two `idle` clips is resolved by suffix.
+        assert_eq!(names, ["Hero", "Idle_02", "broken", "idle", "idle_2"]);
+        assert_eq!(merge_report.len(), 1);
+        assert!(merge_report.to_string().contains("renamed"), "{merge_report}");
+        let text = report.to_string();
+        assert!(text.contains("\"broken\"") && text.contains("not recovered"), "{text}");
     }
 
     #[test]
