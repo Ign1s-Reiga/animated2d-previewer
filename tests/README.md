@@ -35,6 +35,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Visual regression | `crates/a2d-cli/tests/visual.rs` | fixed timestamps rendered through the whole stack; determinism and movement |
 | Visual regression (Cubism) | `crates/a2d-cli/tests/visual_cubism.rs` | the same timestamps for the Cubism family, plus hand-computed geometry: keyform blending, a Hermite segment and a stepped segment, asserted on emitted vertices and on rendered pixel centroids |
 | Real-asset | `crates/a2d-unity/tests/real_bundle.rs`, `crates/a2d-cli/tests/{unity_inspect,real_moc3}.rs` | a real Unity bundle parses, every object is addressable, the inventory holds what §12 asks for, and the MOC3 inside it reads with sane identifiers and parameter ranges — `#[ignore]`, gated on `A2D_FIXTURE_CUBISM` |
+| Cubism clip motions | `crates/a2d-cli/tests/real_clip_motions.rs` | every `AnimationClip` in a real bundle parses to the exact byte; a bundle with no fade data yields one motion per clip; every curve targets a parameter the MOC3 has; keys are finite and ordered; the package round-trips and validates — `#[ignore]`, gated on `A2D_FIXTURE_CUBISM` (one bundle file, not a directory) |
 | Unity Spine | `crates/a2d-cli/tests/unity_spine.rs` | a real Unity bundle yields a skeleton and atlas that the existing decoder reads with no Unity-specific handling — `#[ignore]`, gated on `A2D_FIXTURE_SPINE_BUNDLE` |
 | Cubism assembly | `crates/a2d-cli/tests/cubism_orientation.rs` | a posed model is coherent — its pupil axes stay square and right-handed — and fits its canvas once un-zoomed; asserted from Cubism's conventional parameter meanings rather than from a reference image — `#[ignore]`, gated on `A2D_FIXTURE_CUBISM` |
 | Constraint geometry | `crates/a2d-runtime/src/spine/pose.rs` | IK, the four transform-constraint modes, and path constraints against hand-computed geometry — a straight path and a square one have exactly known arc lengths |
@@ -71,7 +72,7 @@ Document each new variable in the table below.
 | `A2D_BASELINE_DIR` | a directory of baseline frames | `a2d-cli --test {visual,visual_cubism}` |
 | `A2D_CONFIG_DIR` | a directory to keep `config.json` in, instead of the per-user one | the viewer; `a2d-cli --test viewer_process` |
 | `A2D_FIXTURE_SPINE_BUNDLE` | a Unity AssetBundle holding a Spine rig | `a2d-cli --test unity_spine` |
-| `A2D_FIXTURE_CUBISM` | a Unity AssetBundle holding a Cubism model | `a2d-unity --test real_bundle`, `a2d-cli --test {unity_inspect,real_moc3,cubism_orientation}` |
+| `A2D_FIXTURE_CUBISM` | a Unity AssetBundle holding a Cubism model | `a2d-unity --test real_bundle`, `a2d-cli --test {unity_inspect,real_moc3,real_clip_motions,cubism_orientation}` |
 
 ## Visual regression
 

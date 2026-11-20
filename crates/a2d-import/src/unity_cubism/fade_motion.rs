@@ -24,7 +24,7 @@ use a2d_core::{DecodeError, LoadReport};
 use a2d_unity::{AnimationCurve, Reader};
 
 /// The Cubism framework's default fade time, used when the source left it unset.
-const DEFAULT_FADE: f32 = 1.0;
+pub(super) const DEFAULT_FADE: f32 = 1.0;
 
 /// A fade motion as serialized, before it becomes IR.
 #[derive(Debug, Clone, PartialEq)]
@@ -252,7 +252,7 @@ pub(super) fn to_motion(fade: &FadeMotion, name: String, report: &mut LoadReport
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use a2d_unity::{Endian, Keyframe};
 
@@ -283,7 +283,7 @@ mod tests {
     /// Writes `fade` in the chosen layout. The body is built from a fresh
     /// buffer, so string padding is relative to it, as in a real object once
     /// the header (a multiple of four) has been consumed.
-    fn body(fade: &FadeMotion, model_fades: bool) -> Vec<u8> {
+    pub(in super::super) fn body(fade: &FadeMotion, model_fades: bool) -> Vec<u8> {
         let mut out = Vec::new();
         put_string(&mut out, &fade.motion_name);
         if model_fades {
@@ -321,7 +321,7 @@ mod tests {
         out
     }
 
-    fn sample() -> FadeMotion {
+    pub(in super::super) fn sample() -> FadeMotion {
         FadeMotion {
             motion_name: "Assets/x/motions/Hero_idle.motion3.json".into(),
             fade_in: 0.3,
@@ -522,7 +522,8 @@ mod tests {
             ("a1".to_string(), Ok((rd(&bytes_a1), "a1".to_string()))),
         ];
         let mut report = LoadReport::new();
-        let motions = motions_from_bodies(items, &mut report);
+        let (motions, covered) = motions_from_bodies(items, &mut report);
+        assert!(covered.contains("alpha") && covered.contains("beta") && !covered.contains("junk"));
 
         let names: Vec<&str> = motions.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["Alpha", "Alpha_2", "Beta"]);
