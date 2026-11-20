@@ -371,69 +371,111 @@ Presented {} frames in {:.1}s ({:.0} fps).",
     Ok(())
 }
 
-/// Pulls the Cubism model and its atlas out of a Unity bundle.
-///
-/// Both the frame export and the window need exactly this, and doing it in one
-/// place is what keeps them showing the same thing.
-fn cubism_from_bundle(
-    bytes: &[u8],
-    report: &mut LoadReport,
-) -> Result<(String, a2d_cubism::Moc3, Vec<a2d_unity::Texture>), CliError> {
-    let inventory = a2d_import::inspect_bundle(bytes, report)?;
-    let moc = inventory
-        .moc
-        .as_ref()
-        .ok_or_else(|| DecodeError::UnsupportedFormat("this bundle holds no Cubism model".into()))?;
-    let model = a2d_cubism::Moc3::parse(&moc.bytes)?;
+/// One decoded texture page: its file name, the image (`None` when it could
+/// not be had) and whether it is premultiplied.
+type CubismPage = (String, Option<Rgba8Image>, bool);
 
-    let bundle = a2d_unity::Bundle::parse(bytes)?;
-    let node = bundle
-        .nodes
-        .iter()
-        .find(|n| n.is_serialized())
-        .ok_or_else(|| DecodeError::UnsupportedFormat("the bundle holds no serialized file".into()))?;
-    let file = a2d_unity::SerializedFile::parse(bundle.node_data(node)?)?;
-    let textures = a2d_unity::read_textures(&file)?;
-    Ok((moc.name.clone(), model, textures))
+/// Decodes the pages a Cubism package lists, one entry per manifest entry.
+///
+/// A page that is missing or does not decode keeps its slot as `None` and is
+/// noted in `report`: skipping it would shift every later page into its place
+/// and draw the wrong art.
+fn cubism_pages(package: &Package, report: &mut LoadReport) -> Vec<CubismPage> {
+    let mut pages = Vec::with_capacity(package.manifest.textures.len());
+    for entry in &package.manifest.textures {
+        let image = match package.textures.iter().find(|t| t.file == entry.file) {
+            Some(file) => match a2d_render::decode_png(&file.bytes, &entry.file) {
+                Ok(image) => Some(image),
+                Err(e) => {
+                    report.note(format!("texture page {:?} could not be decoded: {e}", entry.file));
+                    None
+                }
+            },
+            None => {
+                report.note(format!("texture page {:?} is listed but missing from the package", entry.file));
+                None
+            }
+        };
+        pages.push((entry.file.clone(), image, entry.premultiplied_alpha));
+    }
+    pages
 }
 
-/// Opens a Cubism model from a Unity bundle in the desktop window.
+/// Seeds a report with what the importer recorded, as the Spine route does.
+fn seed_report(package: &Package, report: &mut LoadReport) {
+    for warning in &package.manifest.import_warnings {
+        report.note(format!("recorded at import: {warning}"));
+    }
+}
+
+/// Turns a Cubism package into a viewer-ready model with its texture page.
 ///
-/// `a2d-desktop` cannot read a bundle -- the importers are above it in the
-/// dependency order (spec §3) -- so the model is decoded here and handed over
-/// behind the shared interface, which is the whole point of that interface.
-fn open_cubism_viewer(
+/// Every Cubism path -- a package, or a bundle imported into one -- goes through
+/// here, so the window and the frame export show the same thing, motions
+/// included. `a2d-desktop` cannot build this itself (it may not depend on a
+/// decoder, spec §3), so the model is built here and handed over behind the
+/// shared interface.
+fn cubism_loaded(
     out: &mut dyn std::io::Write,
     path: &Path,
-    bytes: &[u8],
-    flags: ViewerFlags,
-) -> Result<(), CliError> {
-    let mut report = LoadReport::new();
-    let (name, moc, textures) = cubism_from_bundle(bytes, &mut report)?;
-
-    writeln!(out, "Model:     {} drawables, {} parameters", moc.drawables.len(), moc.parameters.len())?;
+    package: &Package,
+    report: &mut LoadReport,
+) -> Result<LoadedModel, CliError> {
+    let ir = package
+        .model
+        .as_cubism()
+        .ok_or_else(|| DecodeError::UnsupportedFormat("the package does not hold a Cubism model".into()))?;
+    writeln!(out, "Model:     {} drawables, {} parameters", ir.drawables.len(), ir.parameters.len())?;
 
     // Every drawable samples page zero; a model needing more would need the per
-    // drawable texture index, which is not decoded yet.
-    let mut pages = Vec::new();
-    match textures.into_iter().next() {
-        Some(t) => {
-            writeln!(out, "Texture:   {} {}x{}", t.name, t.width, t.height)?;
-            let image = Rgba8Image { width: t.width, height: t.height, pixels: t.rgba };
-            // Cubism atlases are straight alpha, not premultiplied.
-            pages.push((t.name, Some(image), false, Default::default()));
+    // drawable texture index, which is not wired through yet.
+    let decoded = cubism_pages(package, report);
+    let page = match decoded.first() {
+        Some((name, Some(image), premultiplied)) => {
+            writeln!(out, "Texture:   {name} {}x{}", image.width, image.height)?;
+            (name.clone(), Some(image.clone()), *premultiplied, Default::default())
+        }
+        Some((name, None, premultiplied)) => {
+            report.note(format!("texture page {name:?} is unavailable; a placeholder is drawn instead"));
+            (name.clone(), None, *premultiplied, Default::default())
         }
         None => {
-            report.note("the bundle holds no texture; a placeholder is drawn instead");
-            pages.push(("missing".to_string(), None, false, Default::default()));
+            report.note("the package lists no texture; a placeholder is drawn instead");
+            ("missing".to_string(), None, false, Default::default())
         }
+    };
+    let extra = decoded.len().saturating_sub(1);
+    if extra > 0 {
+        report.note(format!("{extra} further texture page(s) are not drawn; only page zero is sampled"));
     }
 
-    let model = a2d_cubism::GenericCubismModel::load(moc, name);
+    let model = a2d_cubism::GenericCubismModel::load(ir.clone(), package.manifest.display_name.clone());
     if !model.unstable().is_empty() {
         report.note(format!("{} drawable(s) could not be posed and are drawn undeformed", model.unstable().len()));
     }
-    let loaded = a2d_desktop::LoadedModel::from_parts(path, Box::new(model), pages, &mut report);
+    match a2d_core::preferred_animation(model.animations()) {
+        Some(name) => writeln!(out, "Animation: {name} ({} motion(s))", model.animations().len())?,
+        None => writeln!(out, "Animation: none; the model has no motions")?,
+    }
+    Ok(LoadedModel::from_parts(path, Box::new(model), vec![page], report))
+}
+
+/// Opens a Cubism package in the desktop window, or renders its frames.
+///
+/// `report` carries whatever produced the package (a bundle import, say).
+fn preview_cubism(
+    out: &mut dyn std::io::Write,
+    path: &Path,
+    package: &Package,
+    mut report: LoadReport,
+    frames_dir: Option<&Path>,
+    flags: ViewerFlags,
+) -> Result<(), CliError> {
+    seed_report(package, &mut report);
+    if let Some(dir) = frames_dir {
+        return render_cubism_frames(out, path, package, dir, report);
+    }
+    let loaded = cubism_loaded(out, path, package, &mut report)?;
 
     writeln!(
         out,
@@ -441,7 +483,7 @@ fn open_cubism_viewer(
 Opening {} in the desktop viewer.",
         path.display()
     )?;
-    writeln!(out, "  drag to move, scroll to scale, Space pauses, Esc quits.")?;
+    writeln!(out, "  drag to move, scroll to scale, Space pauses, Tab cycles animations, Esc quits.")?;
     if let Some(after) = flags.exit_after {
         writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;
     }
@@ -464,48 +506,37 @@ Presented {} frames in {:.1}s ({:.0} fps).",
     Ok(())
 }
 
-fn render_cubism_bundle(out: &mut dyn std::io::Write, bytes: &[u8], frames_dir: &Path) -> Result<(), CliError> {
-    let mut report = LoadReport::new();
-    let (_, moc, textures) = cubism_from_bundle(bytes, &mut report)?;
-    let pages: Vec<(String, Rgba8Image)> = textures
-        .into_iter()
-        .map(|t| (t.name, Rgba8Image { width: t.width, height: t.height, pixels: t.rgba }))
-        .collect();
-    render_cubism_pose(out, &moc.model, &pages, frames_dir, &report)
-}
-
-/// Renders a Cubism package's model to a single posed frame.
+/// Renders a Cubism package at the regression timestamps of its default motion.
 ///
-/// This renders one posed frame rather than the timestamps a Spine package
-/// gets: the viewer does not open Cubism packages yet, so a package's motions
-/// are not played from here. Loading it here rather than in
-/// `a2d-desktop` is not a shortcut: the host may not depend on a decoder
-/// (spec §3), and building the model is what the shared interface is for.
-fn render_cubism_package(
+/// A model with no motions has nothing to play, so it keeps a single rest-pose
+/// frame rather than four identical ones.
+fn render_cubism_frames(
     out: &mut dyn std::io::Write,
+    path: &Path,
     package: &Package,
     frames_dir: &Path,
-    report: &LoadReport,
+    mut report: LoadReport,
 ) -> Result<(), CliError> {
-    let model = package
+    let ir = package
         .model
         .as_cubism()
         .ok_or_else(|| DecodeError::UnsupportedFormat("the package does not hold a Cubism model".into()))?;
-    let mut pages = Vec::new();
-    for entry in &package.manifest.textures {
-        match package.textures.iter().find(|t| t.file == entry.file) {
-            Some(file) => pages.push((entry.file.clone(), a2d_render::decode_png(&file.bytes, &entry.file)?)),
-            None => writeln!(out, "  note: texture {} is listed but absent", entry.file)?,
-        }
+    if ir.motions.is_empty() {
+        writeln!(out, "  note: the model has no motions; rendering its rest pose only (pose.png)")?;
+        let pages = cubism_pages(package, &mut report);
+        return render_cubism_pose(out, ir, &pages, frames_dir, &report);
     }
-    render_cubism_pose(out, model, &pages, frames_dir, report)
+    let loaded = cubism_loaded(out, path, package, &mut report)?;
+    // The camera is fitted from the model's canvas (see `GenericCubismModel::bounds`),
+    // so the frames are framed the way the single rest-pose export is.
+    render_frames(out, loaded, frames_dir, report)
 }
 
-/// The rendering both Cubism paths share, once a model and its pages exist.
+/// Renders a Cubism model's rest pose to a single frame, once its pages exist.
 fn render_cubism_pose(
     out: &mut dyn std::io::Write,
     model: &a2d_cubism::CubismIr,
-    pages: &[(String, Rgba8Image)],
+    pages: &[CubismPage],
     frames_dir: &Path,
     report: &LoadReport,
 ) -> Result<(), CliError> {
@@ -523,13 +554,12 @@ fn render_cubism_pose(
     writeln!(out, "GPU:       {} ({})", gpu.adapter_name, gpu.backend)?;
     let mut renderer = Renderer::new(gpu.clone());
     match pages.first() {
-        Some((name, image)) => {
+        Some((name, Some(image), premultiplied)) => {
             writeln!(out, "Texture:   {name} {}x{}", image.width, image.height)?;
-            // Cubism atlases are straight alpha, not premultiplied.
-            let id = renderer.textures_mut().upload(&gpu, name, image, false, Default::default())?;
+            let id = renderer.textures_mut().upload(&gpu, name, image, *premultiplied, Default::default())?;
             debug_assert_eq!(id, a2d_core::TextureId(0), "the first upload takes slot zero");
         }
-        None => {
+        _ => {
             writeln!(out, "Texture:   none; drawing untextured")?;
             renderer.textures_mut().install_fallback(&gpu)?;
         }
@@ -598,23 +628,17 @@ pub fn preview(
             return open_spine_bundle(out, package_dir, spine, report, frames_dir, flags);
         }
 
-        return match frames_dir {
-            Some(frames) => render_cubism_bundle(out, &bytes, frames),
-            None => open_cubism_viewer(out, package_dir, &bytes, flags),
-        };
+        // Through the importer, so the motions recovered from the bundle come
+        // along; the model itself is built from the package, as for any other.
+        let mut report = LoadReport::new();
+        let package = a2d_import::import_bundle(&bytes, &mut report)?;
+        return preview_cubism(out, package_dir, &package, report, frames_dir, flags);
     }
 
     if let Ok(package) = Package::read_from(package_dir) {
         if package.manifest.model_type == a2d_pack::ModelType::Cubism {
             writeln!(out, "Package:   {}", package_dir.display())?;
-            let report = LoadReport::new();
-            return match frames_dir {
-                Some(dir) => render_cubism_package(out, &package, dir, &report),
-                None => Err(DecodeError::UnsupportedFormat(
-                    "the viewer does not open Cubism packages yet; render a pose with -o instead".into(),
-                )
-                .into()),
-            };
+            return preview_cubism(out, package_dir, &package, LoadReport::new(), frames_dir, flags);
         }
     }
 

@@ -161,6 +161,31 @@ fn the_viewer_draws_a_window_and_saves_its_settings_on_the_way_out() {
 }
 
 #[test]
+fn a_cubism_package_opens_in_the_viewer_and_presents_frames() {
+    // Cubism models are built in the CLI and handed to the viewer behind the
+    // shared interface; this proves the whole route runs in a real (hidden)
+    // window, motion included.
+    let dir = temp_dir("cubism");
+    let package = dir.path().join("synthetic.a2dpack");
+    support::cubism_package(true).write_to(&package).expect("the package should write");
+    let config_dir = dir.path().join("config");
+
+    let Some(stdout) = run_or_skip(&package, &config_dir) else { return };
+
+    assert!(
+        stdout.contains("Animation: idle"),
+        "the motion should be found:
+{stdout}"
+    );
+    assert!(stdout.contains("Opening"), "{stdout}");
+    assert!(
+        presented_frames(&stdout) > 0,
+        "the Cubism viewer never presented a frame:
+{stdout}"
+    );
+}
+
+#[test]
 fn a_second_run_restores_what_the_first_one_saved() {
     // Persistence is only worth anything if it survives a restart, which needs
     // two real processes sharing one config directory.
