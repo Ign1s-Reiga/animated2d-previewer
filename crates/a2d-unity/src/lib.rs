@@ -23,16 +23,20 @@
 
 #![forbid(unsafe_code)]
 
+pub mod animation_clip;
 pub mod bundle;
+pub mod crc32;
 pub mod curve;
 pub mod objects;
 pub mod reader;
 pub mod serialized;
 pub mod texture;
 
+pub use animation_clip::{AnimationClip, ClipEvent, DenseClip, GenericBinding, StreamedKey};
 pub use bundle::{Bundle, Compression, Node};
+pub use crc32::{crc32, crc32_str};
 pub use curve::{AnimationCurve, Keyframe};
-pub use objects::{behaviour_body, Inventory, ObjectInfo, ScriptInfo};
+pub use objects::{behaviour_body, behaviour_owner_name, Inventory, ObjectInfo, PPtr, ScriptInfo};
 pub use reader::{Endian, Reader};
 pub use serialized::{ClassId, SerializedFile};
 pub use texture::{read_textures, Texture, TextureFormat};
