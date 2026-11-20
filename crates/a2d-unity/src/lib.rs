@@ -24,13 +24,15 @@
 #![forbid(unsafe_code)]
 
 pub mod bundle;
+pub mod curve;
 pub mod objects;
 pub mod reader;
 pub mod serialized;
 pub mod texture;
 
 pub use bundle::{Bundle, Compression, Node};
-pub use objects::{Inventory, ObjectInfo, ScriptInfo};
+pub use curve::{AnimationCurve, Keyframe};
+pub use objects::{behaviour_body, Inventory, ObjectInfo, ScriptInfo};
 pub use reader::{Endian, Reader};
 pub use serialized::{ClassId, SerializedFile};
 pub use texture::{read_textures, Texture, TextureFormat};

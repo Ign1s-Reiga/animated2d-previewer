@@ -15,20 +15,24 @@
 //! * `CubismModel`, `CubismParameter`, `CubismPart`, `CubismDrawable` — the
 //!   model split across one `GameObject` per element. The drawable and
 //!   parameter names live on those objects, not in the MOC3 wrapper.
-//! * `CubismFadeMotionData` — one per motion, and it keeps the path of the
-//!   `.motion3.json` it was built from, which is the only place the original
-//!   name survives.
+//! * `CubismFadeMotionData` — one per motion. It keeps the path of the
+//!   `.motion3.json` it was built from and the parameter curves themselves, so
+//!   it is what `import_bundle` recovers motions from (see `fade_motion`).
 //! * `CubismFadeMotionList` — the index tying those to their clips.
 //!
-//! Motions themselves become Unity `AnimationClip`s, and textures become
+//! The same motions also exist as Unity `AnimationClip`s, which are not decoded
+//! (the fade data carries the curves in a readable form); textures become
 //! `Texture2D`. The bundle's own container table maps each of these back to the
 //! path it was authored under.
 
+mod fade_motion;
+
+use a2d_core::ir::cubism::Motion;
 use a2d_core::{DecodeError, Degradation, LoadReport};
 use a2d_pack::manifest::TextureEntry as PackTextureEntry;
 use a2d_pack::package::TextureFile;
 use a2d_pack::Package;
-use a2d_unity::{Bundle, ClassId, Inventory, ObjectInfo, SerializedFile};
+use a2d_unity::{behaviour_body, Bundle, ClassId, Inventory, ObjectInfo, Reader, SerializedFile};
 
 /// The `.moc3` payload plus how it was found.
 #[derive(Debug, Clone)]
@@ -221,28 +225,12 @@ fn read_moc(
     }))
 }
 
-/// The `.motion3.json` path a `CubismFadeMotionData` records.
-///
-/// The class stores its source path as the first string after the behaviour
-/// header and name, which is what lets a motion keep its original identity.
+/// The `.motion3.json` path a `CubismFadeMotionData` records: its first field
+/// after the behaviour's own name.
 fn motion3_path(file: &SerializedFile, info: &ObjectInfo) -> Option<String> {
     let object = file.objects.iter().find(|o| o.path_id == info.path_id)?;
-    let data = file.object_data(object).ok()?;
-    let name_len_at = 12 + 4 + 12;
-    let name_len = read_i32(data, name_len_at).ok()?;
-    if !(0..=4096).contains(&name_len) {
-        return None;
-    }
-    let after_name = name_len_at + 4 + name_len as usize;
-    let path_len_at = (after_name + 3) & !3;
-    let path_len = read_i32(data, path_len_at).ok()?;
-    if !(0..=4096).contains(&path_len) {
-        return None;
-    }
-    let start = path_len_at + 4;
-    let end = start.checked_add(path_len as usize)?;
-    let raw = data.get(start..end)?;
-    let text = String::from_utf8_lossy(raw).into_owned();
+    let (mut body, _) = behaviour_body(file, object).ok()?;
+    let text = body.string().ok()?;
     text.contains(".motion3.json").then_some(text)
 }
 
@@ -270,10 +258,10 @@ fn read_i32(data: &[u8], at: usize) -> Result<i32, DecodeError> {
 /// write both into the shape the viewer loads. Nothing downstream learns that
 /// any of it came out of Unity.
 ///
-/// What it deliberately does *not* do is recover motions. Unity turned those
-/// into compressed `AnimationClip`s, which are not decoded, so the package
-/// lists no animations and says so through the report rather than shipping an
-/// empty list that reads as "this model has none".
+/// Motions are recovered from the `CubismFadeMotionData` behaviours, which keep
+/// each motion's parameter curves; the matching Unity `AnimationClip`s are not
+/// decoded. A motion that cannot be decoded, or a clip with no fade data, is
+/// reported through `report` and the model still loads.
 pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, DecodeError> {
     let inventory = inspect_bundle(bytes, report)?;
     let moc = inventory.moc.ok_or_else(|| DecodeError::Reconstruction {
@@ -288,7 +276,29 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
             "{source_format} is newer than any layout checked against a real model;              it is read on the same layout rather than refused"
         )));
     }
-    let model: a2d_core::ir::cubism::CubismIr = parsed.into();
+    let mut model: a2d_core::ir::cubism::CubismIr = parsed.into();
+
+    let bundle = Bundle::parse(bytes)?;
+    let node = bundle.nodes.iter().find(|n| n.is_serialized()).ok_or_else(|| DecodeError::Reconstruction {
+        game: "unity_cubism".into(),
+        message: "the bundle holds no serialized file".into(),
+    })?;
+    let file = SerializedFile::parse(bundle.node_data(node)?)?;
+
+    model.motions = recover_motions(&file, &Inventory::build(&file), report);
+    // Curves aimed at ids the model lacks (model-level opacity, say) are kept
+    // and playback skips them; saying so here keeps that visible at import.
+    for degradation in model.unresolved_motion_targets() {
+        report.warn(degradation);
+    }
+    let unmatched: Vec<&str> = inventory.motions.iter().filter(|m| !m.has_fade_data).map(|m| m.name.as_str()).collect();
+    if !unmatched.is_empty() {
+        report.note(format!(
+            "{} AnimationClip(s) have no matching fade motion data and are not recovered: {}",
+            unmatched.len(),
+            unmatched.join(", ")
+        ));
+    }
 
     let mut package = Package::from_cubism(model, moc.name.clone(), source_format);
     // Informational only: the importer is the last layer allowed to know this,
@@ -298,12 +308,6 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
     // Texture pages. Unity stores these block-compressed, so they are decoded
     // and re-encoded as PNG: a package holds pages the viewer can read without
     // knowing anything about Unity's formats.
-    let bundle = Bundle::parse(bytes)?;
-    let node = bundle.nodes.iter().find(|n| n.is_serialized()).ok_or_else(|| DecodeError::Reconstruction {
-        game: "unity_cubism".into(),
-        message: "the bundle holds no serialized file".into(),
-    })?;
-    let file = SerializedFile::parse(bundle.node_data(node)?)?;
     for (index, texture) in a2d_unity::read_textures(&file)?.into_iter().enumerate() {
         let name = format!("{}.png", sanitize(&texture.name, index));
         let png = encode_png(texture.width, texture.height, &texture.rgba, &name)?;
@@ -319,13 +323,55 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
         report.warn(Degradation::MissingReference { kind: "texture".into(), name: "any Texture2D".into() });
     }
 
-    if !inventory.motions.is_empty() {
-        report.warn(Degradation::Note(format!(
-            "{} motion(s) are Unity AnimationClips and are not decoded, so the package plays none",
-            inventory.motions.len()
-        )));
-    }
     Ok(package)
+}
+
+/// Decodes every `CubismFadeMotionData` into a motion.
+///
+/// One that fails is reported by name and left out; the others are unaffected.
+/// The result is sorted by name, with duplicate names made unique, so the
+/// package serializes the same way on every run.
+fn recover_motions(file: &SerializedFile, inventory: &Inventory, report: &mut LoadReport) -> Vec<Motion> {
+    let items = inventory.by_script("CubismFadeMotionData").map(|info| {
+        let label = info.name.clone().unwrap_or_else(|| format!("fade#{}", info.path_id));
+        let body = file
+            .objects
+            .iter()
+            .find(|o| o.path_id == info.path_id)
+            .ok_or_else(|| DecodeError::corrupt("the fade motion object vanished between passes".to_string()))
+            .and_then(|object| behaviour_body(file, object));
+        (label, body)
+    });
+    motions_from_bodies(items, report)
+}
+
+/// The part of motion recovery that needs no bundle: each item is a label and
+/// either a body reader with its behaviour name, or the error that kept it
+/// from being read.
+fn motions_from_bodies<'a>(
+    items: impl IntoIterator<Item = (String, Result<(Reader<'a>, String), DecodeError>)>,
+    report: &mut LoadReport,
+) -> Vec<Motion> {
+    let mut decoded = Vec::new();
+    for (label, body) in items {
+        let result = body.and_then(|(body, name)| Ok((name, fade_motion::decode(&body)?)));
+        match result {
+            Ok((behaviour_name, fade)) => {
+                let stem = fade_motion::motion_stem(&fade.motion_name, &behaviour_name);
+                decoded.push((stem, fade));
+            }
+            Err(error) => report.note(format!("motion {label:?} was not recovered: {error}")),
+        }
+    }
+    decoded.sort_by(|a, b| (&a.0, &a.1.motion_name).cmp(&(&b.0, &b.1.motion_name)));
+
+    let mut names: Vec<String> = decoded.iter().map(|(stem, _)| stem.clone()).collect();
+    fade_motion::dedupe_names(&mut names, report);
+
+    let mut motions: Vec<Motion> =
+        decoded.iter().zip(names).map(|((_, fade), name)| fade_motion::to_motion(fade, name, report)).collect();
+    motions.sort_by(|a, b| a.name.cmp(&b.name));
+    motions
 }
 
 /// A file name that is safe to write and stable across runs.
