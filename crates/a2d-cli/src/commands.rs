@@ -279,7 +279,7 @@ fn open_spine_bundle(
     inventory: a2d_import::SpineInventory,
     mut report: LoadReport,
     frames_dir: Option<&Path>,
-    exit_after: Option<Duration>,
+    flags: ViewerFlags,
 ) -> Result<(), CliError> {
     let (Some(skeleton), Some(atlas)) = (&inventory.skeleton, &inventory.atlas) else {
         return Err(DecodeError::UnsupportedFormat("this bundle holds no complete Spine rig".into()).into());
@@ -350,12 +350,12 @@ Opening {} in the desktop viewer.",
         path.display()
     )?;
     writeln!(out, "  drag to move, scroll to scale, Space pauses, Tab cycles animations, Esc quits.")?;
-    if let Some(after) = exit_after {
+    if let Some(after) = flags.exit_after {
         writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;
     }
     writeln!(out)?;
 
-    let options = a2d_desktop::RunOptions { packages: Vec::new(), exit_after };
+    let options = a2d_desktop::RunOptions { packages: Vec::new(), exit_after: flags.exit_after, hidden: flags.hidden };
     let result = a2d_desktop::run_with(options, vec![loaded], &mut report);
     print_report(out, &report)?;
 
@@ -406,7 +406,7 @@ fn open_cubism_viewer(
     out: &mut dyn std::io::Write,
     path: &Path,
     bytes: &[u8],
-    exit_after: Option<Duration>,
+    flags: ViewerFlags,
 ) -> Result<(), CliError> {
     let mut report = LoadReport::new();
     let (name, moc, textures) = cubism_from_bundle(bytes, &mut report)?;
@@ -442,13 +442,13 @@ Opening {} in the desktop viewer.",
         path.display()
     )?;
     writeln!(out, "  drag to move, scroll to scale, Space pauses, Esc quits.")?;
-    if let Some(after) = exit_after {
+    if let Some(after) = flags.exit_after {
         writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;
     }
     writeln!(out)?;
 
     // No packages: the remembered list would otherwise open a Spine model too.
-    let options = a2d_desktop::RunOptions { packages: Vec::new(), exit_after };
+    let options = a2d_desktop::RunOptions { packages: Vec::new(), exit_after: flags.exit_after, hidden: flags.hidden };
     let result = a2d_desktop::run_with(options, vec![loaded], &mut report);
     print_report(out, &report)?;
 
@@ -570,11 +570,20 @@ fn render_cubism_pose(
     Ok(())
 }
 
+/// How `preview` opens the interactive viewer. Ignored when rendering frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ViewerFlags {
+    /// Quit automatically after this long.
+    pub exit_after: Option<Duration>,
+    /// Create the window invisible and unfocused, for scripted runs and tests.
+    pub hidden: bool,
+}
+
 pub fn preview(
     out: &mut dyn std::io::Write,
     package_dir: &Path,
     frames_dir: Option<&Path>,
-    exit_after: Option<Duration>,
+    flags: ViewerFlags,
 ) -> Result<(), CliError> {
     // A Unity bundle is not a package, but it is what a Cubism model arrives
     // in, so `preview` opens one directly rather than refusing.
@@ -586,12 +595,12 @@ pub fn preview(
         let mut report = LoadReport::new();
         let spine = a2d_import::inspect_spine_bundle(&bytes, &mut report)?;
         if spine.is_spine() {
-            return open_spine_bundle(out, package_dir, spine, report, frames_dir, exit_after);
+            return open_spine_bundle(out, package_dir, spine, report, frames_dir, flags);
         }
 
         return match frames_dir {
             Some(frames) => render_cubism_bundle(out, &bytes, frames),
-            None => open_cubism_viewer(out, package_dir, &bytes, exit_after),
+            None => open_cubism_viewer(out, package_dir, &bytes, flags),
         };
     }
 
@@ -612,21 +621,25 @@ pub fn preview(
 
     match frames_dir {
         Some(dir) => export_frames(out, package_dir, dir),
-        None => open_viewer(out, package_dir, exit_after),
+        None => open_viewer(out, package_dir, flags),
     }
 }
 
-fn open_viewer(out: &mut dyn std::io::Write, package_dir: &Path, exit_after: Option<Duration>) -> Result<(), CliError> {
+fn open_viewer(out: &mut dyn std::io::Write, package_dir: &Path, flags: ViewerFlags) -> Result<(), CliError> {
     writeln!(out, "Opening {} in the desktop viewer.", package_dir.display())?;
     writeln!(out, "  drag to move, scroll to scale, Space pauses, Tab cycles animations, Esc quits.")?;
     writeln!(out, "  everything is also in the tray menu.")?;
-    if let Some(after) = exit_after {
+    if let Some(after) = flags.exit_after {
         writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;
     }
     writeln!(out)?;
 
     let mut report = LoadReport::new();
-    let options = a2d_desktop::RunOptions { packages: vec![package_dir.to_path_buf()], exit_after };
+    let options = a2d_desktop::RunOptions {
+        packages: vec![package_dir.to_path_buf()],
+        exit_after: flags.exit_after,
+        hidden: flags.hidden,
+    };
     let result = a2d_desktop::run(options, &mut report);
     print_report(out, &report)?;
 

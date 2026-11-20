@@ -46,6 +46,18 @@ pub struct RunOptions {
     /// which is what makes it usable to *test* that path rather than a
     /// separate one that only tests itself.
     pub exit_after: Option<Duration>,
+    /// Create the window invisible and unfocused.
+    ///
+    /// For scripted runs and tests, so a smoke test does not throw a window
+    /// onto the desktop of whoever is running it. The event loop, device,
+    /// surface, render, present, quit and save are the real ones, but the draw
+    /// trigger is not: a hidden window gets no `RedrawRequested` on Windows, so
+    /// hidden mode draws straight from `about_to_wait` instead. The visible
+    /// trigger (`request_redraw` and `RedrawRequested`) is therefore not
+    /// exercised by a hidden run.
+    ///
+    /// On Wayland winit cannot hide a window, so this has no effect there.
+    pub hidden: bool,
 }
 
 /// What a run did.
@@ -115,6 +127,7 @@ pub fn run_with(
         cursor: Vec2::ZERO,
         report: std::mem::take(report),
         exit_after: options.exit_after,
+        hidden: options.hidden,
         deadline: None,
         active_since: None,
         frames: 0,
@@ -168,6 +181,8 @@ struct App {
     /// start, and a deadline ticking through that would quit before the first
     /// frame was ever drawn.
     exit_after: Option<Duration>,
+    /// Whether the window is created invisible and unfocused.
+    hidden: bool,
     /// The instant that deadline falls due, once there is a window.
     deadline: Option<Instant>,
     /// When the window came up, so the reported frame rate measures drawing
@@ -190,6 +205,10 @@ impl App {
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true)
+            // Neither shown nor focused when hidden: `with_active(false)` alone
+            // still shows the window, it just declines to take the focus.
+            .with_visible(!self.hidden)
+            .with_active(!self.hidden)
             .with_inner_size(LogicalSize::new(w, h));
 
         let window = Arc::new(
@@ -529,7 +548,13 @@ impl ApplicationHandler for App {
             self.handle_command(TrayCommand::Quit, event_loop);
             return;
         }
-        if let Some(active) = &self.active {
+        if self.hidden {
+            // Windows delivers no `RedrawRequested` to an invisible window
+            // (there is nothing to paint), so asking would leave a scripted run
+            // at zero frames. Draw directly instead: the surface, device,
+            // render and present are the same calls the visible path makes.
+            self.redraw();
+        } else if let Some(active) = &self.active {
             active.window.request_redraw();
         }
     }

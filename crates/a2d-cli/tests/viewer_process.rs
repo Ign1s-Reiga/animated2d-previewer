@@ -6,6 +6,15 @@
 //! launching the built binary with `--exit-after`, which takes exactly the same
 //! shutdown path as quitting by hand.
 //!
+//! The window is created with `--hidden`, so running the suite does not throw
+//! windows onto the developer's desktop or steal their focus. The event loop,
+//! the wgpu surface, rendering, presenting and the save-on-quit path are the
+//! real ones, and the frame-count assertions prove frames are rendered and
+//! presented. What a hidden run does *not* cover is the visible draw trigger:
+//! hidden mode draws from `about_to_wait` instead of via `RedrawRequested`.
+//! One opt-in test, `a_visible_window_redraws_on_request`, covers that and
+//! opens a real window; see `tests/README.md`.
+//!
 //! `A2D_CONFIG_DIR` points the viewer at a scratch directory, so these never
 //! touch the real configuration.
 //!
@@ -79,22 +88,27 @@ fn prepare(label: &str) -> (TempDir, PathBuf, PathBuf) {
 }
 
 /// Runs the viewer for [`DRAW_FOR`] with settings isolated to `config_dir`.
-fn run_viewer(package: &Path, config_dir: &Path) -> Output {
+fn run_viewer(package: &Path, config_dir: &Path, hidden: bool) -> Output {
     // A poisoned lock means another test panicked, not that the guard is
     // unusable; taking it anyway keeps the real failure visible instead of
     // burying it under lock errors.
     let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    Command::new(env!("CARGO_BIN_EXE_animated2d"))
-        .args(["preview", &package.display().to_string(), "--exit-after", DRAW_FOR])
-        .env(CONFIG_DIR_ENV, config_dir)
-        .output()
-        .expect("the animated2d binary should be runnable")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_animated2d"));
+    command.args(["preview", &package.display().to_string(), "--exit-after", DRAW_FOR]);
+    if hidden {
+        command.arg("--hidden");
+    }
+    command.env(CONFIG_DIR_ENV, config_dir).output().expect("the animated2d binary should be runnable")
 }
 
 /// Runs the viewer and returns its stdout, or `None` when the machine cannot
 /// open a window at all.
 fn run_or_skip(package: &Path, config_dir: &Path) -> Option<String> {
-    let output = run_viewer(package, config_dir);
+    run_or_skip_with(package, config_dir, true)
+}
+
+fn run_or_skip_with(package: &Path, config_dir: &Path, hidden: bool) -> Option<String> {
+    let output = run_viewer(package, config_dir, hidden);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
@@ -133,7 +147,7 @@ fn the_viewer_draws_a_window_and_saves_its_settings_on_the_way_out() {
 
     assert!(stdout.contains("Opening"), "{stdout}");
     let frames = presented_frames(&stdout);
-    assert!(frames > 0, "the window opened but never drew:\n{stdout}");
+    assert!(frames > 0, "the viewer ran but never rendered and presented a frame:\n{stdout}");
 
     assert!(config_file.is_file(), "quitting should have written {}", config_file.display());
     let (config, report) = Config::load_from(&config_file);
@@ -194,7 +208,7 @@ fn an_out_of_range_config_is_repaired_rather_than_refused() {
 #[test]
 fn a_package_that_does_not_exist_fails_with_a_clear_message() {
     let dir = temp_dir("missing");
-    let output = run_viewer(&dir.path().join("nope.a2dpack"), &dir.path().join("config"));
+    let output = run_viewer(&dir.path().join("nope.a2dpack"), &dir.path().join("config"), true);
     assert!(!output.status.success(), "opening a missing package should fail");
 
     let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -213,4 +227,23 @@ fn a_nonsense_exit_deadline_is_refused_before_anything_opens() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("positive number of seconds"), "{stderr}");
+}
+
+#[test]
+#[ignore = "opens a visible window; set A2D_VISIBLE_VIEWER_TESTS=1 and run with --ignored"]
+fn a_visible_window_redraws_on_request() {
+    // Every other run here is hidden and draws from `about_to_wait`, so none of
+    // them touches the visible trigger: `request_redraw` and the
+    // `RedrawRequested` handler. Delete either and they all still pass while the
+    // real viewer freezes. This is the one test that launches a visible window.
+    if std::env::var("A2D_VISIBLE_VIEWER_TESTS").is_err() {
+        return;
+    }
+    let (_dir, package, config_dir) = prepare("visible");
+    let Some(stdout) = run_or_skip_with(&package, &config_dir, false) else { return };
+    assert!(
+        presented_frames(&stdout) > 0,
+        "the visible window never redrew:
+{stdout}"
+    );
 }
