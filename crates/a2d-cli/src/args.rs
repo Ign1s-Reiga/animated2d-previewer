@@ -16,7 +16,7 @@ pub enum Command {
     Inspect { input: PathBuf, game: Option<String> },
     Import { input: PathBuf, output: PathBuf, game: Option<String> },
     Validate { package: PathBuf },
-    Preview { package: PathBuf, out: Option<PathBuf>, exit_after: Option<f32> },
+    Preview { package: PathBuf, out: Option<PathBuf>, exit_after: Option<f32>, hidden: bool },
     Help,
     Version,
 }
@@ -60,11 +60,13 @@ where
                 return Err(err("`inspect` does not take -o/--output"));
             }
             reject_exit_after(&split)?;
+            reject_hidden(&split)?;
             Ok(Command::Inspect { input: one_path(split.positional, "inspect <input>")?, game: split.game })
         }
         "import" => {
             let split = split_flags(rest)?;
             reject_exit_after(&split)?;
+            reject_hidden(&split)?;
             let output = split.output.clone().ok_or_else(|| err("`import` needs -o/--output <output.a2dpack>"))?;
             let input = one_path(split.positional, "import <input> -o <output.a2dpack>")?;
             Ok(Command::Import { input, output, game: split.game })
@@ -72,6 +74,7 @@ where
         "validate" => {
             let split = split_flags(rest)?;
             reject_exit_after(&split)?;
+            reject_hidden(&split)?;
             reject_extra(split.game, split.output)?;
             Ok(Command::Validate { package: one_path(split.positional, "validate <package>")? })
         }
@@ -85,6 +88,7 @@ where
                 package: one_path(split.positional, "preview <package>")?,
                 out: split.output,
                 exit_after: split.exit_after,
+                hidden: split.hidden,
             })
         }
         other if other.starts_with('-') => Err(err(format!("unknown option `{other}`; try `animated2d help`"))),
@@ -99,6 +103,7 @@ struct Split {
     game: Option<String>,
     output: Option<PathBuf>,
     exit_after: Option<f32>,
+    hidden: bool,
 }
 
 fn split_flags(args: &[String]) -> Result<Split, ArgError> {
@@ -106,6 +111,7 @@ fn split_flags(args: &[String]) -> Result<Split, ArgError> {
     let mut game = None;
     let mut output = None;
     let mut exit_after = None;
+    let mut hidden = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -128,6 +134,10 @@ fn split_flags(args: &[String]) -> Result<Split, ArgError> {
                 output = Some(PathBuf::from(&arg["--output=".len()..]));
                 i += 1;
             }
+            "--hidden" => {
+                hidden = true;
+                i += 1;
+            }
             "--exit-after" => {
                 let value = args.get(i + 1).ok_or_else(|| err("--exit-after needs a number of seconds"))?;
                 exit_after = Some(parse_seconds(value)?);
@@ -147,7 +157,7 @@ fn split_flags(args: &[String]) -> Result<Split, ArgError> {
             }
         }
     }
-    Ok(Split { positional, game, output, exit_after })
+    Ok(Split { positional, game, output, exit_after, hidden })
 }
 
 /// Parses a positive, finite number of seconds.
@@ -164,6 +174,13 @@ fn one_path(positional: Vec<String>, usage: &str) -> Result<PathBuf, ArgError> {
         0 => Err(err(format!("missing path; usage: animated2d {usage}"))),
         n => Err(err(format!("expected one path, got {n}; usage: animated2d {usage}"))),
     }
+}
+
+fn reject_hidden(split: &Split) -> Result<(), ArgError> {
+    if split.hidden {
+        return Err(err("only `preview` takes --hidden"));
+    }
+    Ok(())
 }
 
 fn reject_exit_after(split: &Split) -> Result<(), ArgError> {
@@ -207,6 +224,9 @@ OPTIONS:
     --exit-after <s> `preview` only: quit the viewer after this many seconds.
                      Takes the same shutdown path as quitting by hand, so it is
                      usable for scripted screenshots and smoke tests.
+    --hidden         `preview` only: create the window invisible and unfocused.
+                     For scripted runs and tests; everything else is the real
+                     path, so frames are still drawn and settings still saved.
 
 NOTES:
     <input> may be a single asset or a directory. Detection reads file contents,
@@ -287,7 +307,7 @@ mod tests {
         assert_eq!(parse_ok(&["validate", "p.a2dpack"]), Command::Validate { package: "p.a2dpack".into() });
         assert_eq!(
             parse_ok(&["preview", "p.a2dpack"]),
-            Command::Preview { package: "p.a2dpack".into(), out: None, exit_after: None }
+            Command::Preview { package: "p.a2dpack".into(), out: None, exit_after: None, hidden: false }
         );
         assert!(parse(["validate", "p", "--game", "unity_spine"]).is_err());
         assert!(parse(["preview", "p", "--game", "unity_spine"]).is_err());
@@ -297,15 +317,35 @@ mod tests {
     fn preview_takes_an_output_directory_for_frames() {
         assert_eq!(
             parse_ok(&["preview", "p.a2dpack", "-o", "frames"]),
-            Command::Preview { package: "p.a2dpack".into(), out: Some("frames".into()), exit_after: None }
+            Command::Preview {
+                package: "p.a2dpack".into(),
+                out: Some("frames".into()),
+                exit_after: None,
+                hidden: false
+            }
         );
     }
 
     #[test]
     fn preview_takes_a_scripted_exit_deadline() {
-        let expected = Command::Preview { package: "p".into(), out: None, exit_after: Some(2.5) };
+        let expected = Command::Preview { package: "p".into(), out: None, exit_after: Some(2.5), hidden: false };
         assert_eq!(parse_ok(&["preview", "p", "--exit-after", "2.5"]), expected);
         assert_eq!(parse_ok(&["preview", "p", "--exit-after=2.5"]), expected);
+    }
+
+    #[test]
+    fn preview_takes_a_hidden_flag() {
+        let expected = Command::Preview { package: "p".into(), out: None, exit_after: Some(1.0), hidden: true };
+        assert_eq!(parse_ok(&["preview", "p", "--exit-after", "1", "--hidden"]), expected);
+        assert_eq!(parse_ok(&["preview", "--hidden", "p", "--exit-after=1"]), expected);
+    }
+
+    #[test]
+    fn only_preview_takes_hidden() {
+        for command in ["inspect", "import", "validate"] {
+            let e = parse([command, "p", "--hidden"]).unwrap_err();
+            assert!(e.to_string().contains("only `preview`"), "for {command}: {e}");
+        }
     }
 
     #[test]

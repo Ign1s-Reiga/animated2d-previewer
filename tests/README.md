@@ -38,7 +38,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Cubism assembly | `crates/a2d-cli/tests/cubism_orientation.rs` | a posed model is coherent — its pupil axes stay square and right-handed — and fits its canvas once un-zoomed; asserted from Cubism's conventional parameter meanings rather than from a reference image — `#[ignore]`, gated on `A2D_FIXTURE_CUBISM` |
 | Constraint geometry | `crates/a2d-runtime/src/spine/pose.rs` | IK, the four transform-constraint modes, and path constraints against hand-computed geometry — a straight path and a square one have exactly known arc lengths |
 | Viewer behaviour | `crates/a2d-desktop/src/{config,state,tray}.rs` | config persistence and clamping, drag/scale/selection, tray id mapping — all without opening a window |
-| Subprocess | `crates/a2d-cli/tests/viewer_process.rs` | the real binary opens a window, presents frames, and writes settings on the way out |
+| Subprocess | `crates/a2d-cli/tests/viewer_process.rs` | the real binary runs a hidden window, renders and presents frames, and writes settings on the way out |
+| Visible window | `crates/a2d-cli/tests/viewer_process.rs` | the visible draw trigger (`request_redraw` / `RedrawRequested`) that hidden runs bypass — `#[ignore]`, gated on `A2D_VISIBLE_VIEWER_TESTS` |
 
 ## Tests that need a real asset
 
@@ -191,4 +192,15 @@ machine that *should* have a GPU wants:
 
 ```bash
 A2D_REQUIRE_GPU=1 cargo test --workspace
+```
+
+## Tests that open a visible window
+
+The subprocess viewer tests run with `--hidden`, which draws from `about_to_wait`
+rather than through `RedrawRequested`. One opt-in test launches a visible window
+to cover the real trigger. It opens a visible window; run before touching the
+redraw path:
+
+```bash
+A2D_VISIBLE_VIEWER_TESTS=1 cargo test -p a2d-cli --test viewer_process -- --ignored
 ```
