@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use a2d_core::ir::cubism::CubismIr;
 use a2d_core::ir::spine::SpineIr;
-use a2d_core::{DecodeError, LoadReport};
+use a2d_core::{preferred_animation, AnimationInfo, DecodeError, LoadReport};
 
 use crate::bin_io::{Reader, Writer};
 use crate::manifest::{AnimationEntry, Manifest, ModelType, TextureEntry, FORMAT_VERSION};
@@ -95,18 +95,26 @@ impl Package {
 
     /// Builds a package from a decoded Cubism model.
     ///
-    /// A Cubism model carries no animations of its own -- its motions live
-    /// outside the MOC3 and are not decoded yet -- so the manifest lists none
-    /// and names no default. That is the honest state rather than an empty
-    /// placeholder: `inspect` and `validate` both report it.
+    /// The manifest lists the model's motions and names a default by the same
+    /// rule the Spine side uses. A model with no motions lists none and names
+    /// no default: `inspect` and `validate` both report that.
     pub fn from_cubism(ir: CubismIr, display_name: impl Into<String>, source_format: impl Into<String>) -> Package {
         let mut manifest = Manifest::new(ModelType::Cubism, display_name);
         manifest.source_format = source_format.into();
+        manifest.animations =
+            ir.motions.iter().map(|m| AnimationEntry { name: m.name.clone(), duration: m.duration }).collect();
+        let infos: Vec<AnimationInfo> =
+            ir.motions.iter().map(|m| AnimationInfo { name: m.name.clone(), duration: m.duration }).collect();
+        manifest.default_animation = preferred_animation(&infos).map(str::to_string);
         Package { manifest, model: PackageModel::Cubism(ir), textures: Vec::new() }
     }
 
     /// Encodes `model.bin`.
-    pub fn encode_model(&self) -> Vec<u8> {
+    ///
+    /// Fails, naming the field, when the model holds a value the reader would
+    /// refuse (a motion with a negative fade, say), so a package that writes
+    /// is a package that loads.
+    pub fn encode_model(&self) -> Result<Vec<u8>, DecodeError> {
         let mut w = Writer::with_capacity(64 * 1024);
         w.raw(MODEL_MAGIC);
         w.u32(FORMAT_VERSION);
@@ -117,10 +125,10 @@ impl Package {
             }
             PackageModel::Cubism(ir) => {
                 w.u8(1);
-                cubism_io::write(&mut w, ir);
+                cubism_io::write(&mut w, ir)?;
             }
         }
-        w.into_bytes()
+        Ok(w.into_bytes())
     }
 
     /// Decodes `model.bin`.
@@ -130,6 +138,9 @@ impl Package {
         }
         let mut r = Reader::new(&bytes[4..]);
         let version = r.u32()?;
+        if version == 0 {
+            return Err(DecodeError::UnsupportedFormat("model.bin format version 0 never existed".into()));
+        }
         if version > FORMAT_VERSION {
             return Err(DecodeError::UnsupportedFormat(format!(
                 "model.bin format version {version} is newer than this build supports ({FORMAT_VERSION})"
@@ -137,7 +148,7 @@ impl Package {
         }
         let model = match r.u8()? {
             0 => PackageModel::Spine(spine_io::read(&mut r)?),
-            1 => PackageModel::Cubism(cubism_io::read(&mut r)?),
+            1 => PackageModel::Cubism(cubism_io::read(&mut r, version)?),
             other => {
                 return Err(DecodeError::UnsupportedFormat(format!("unknown model kind tag {other} in model.bin")))
             }
@@ -150,11 +161,16 @@ impl Package {
     pub fn write_to(&self, dir: &Path) -> Result<(), DecodeError> {
         let io = |path: &Path, e: std::io::Error| DecodeError::io(path.display().to_string(), e);
 
+        // Everything that can be refused is computed before the directory is
+        // touched, so a refused model leaves nothing behind.
+        let manifest_json = self.manifest.to_json()?;
+        let model_bytes = self.encode_model()?;
+
         fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
         let manifest_path = dir.join("manifest.json");
-        fs::write(&manifest_path, self.manifest.to_json()?).map_err(|e| io(&manifest_path, e))?;
+        fs::write(&manifest_path, manifest_json).map_err(|e| io(&manifest_path, e))?;
         let model_path = dir.join("model.bin");
-        fs::write(&model_path, self.encode_model()).map_err(|e| io(&model_path, e))?;
+        fs::write(&model_path, model_bytes).map_err(|e| io(&model_path, e))?;
 
         if !self.textures.is_empty() {
             let textures = dir.join("textures");
@@ -603,33 +619,50 @@ mod tests {
     fn a_rich_skeleton_round_trips_through_model_bin() {
         let ir = rich_ir();
         let package = Package::from_spine(ir.clone(), "Hero");
-        let bytes = package.encode_model();
+        let bytes = package.encode_model().unwrap();
         let decoded = Package::decode_model(&bytes).unwrap();
         assert_eq!(decoded.as_spine().unwrap(), &ir);
     }
 
     #[test]
     fn encoding_is_byte_stable_across_runs() {
-        let a = Package::from_spine(rich_ir(), "Hero").encode_model();
-        let b = Package::from_spine(rich_ir(), "Hero").encode_model();
+        let a = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
+        let b = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn re_encoding_a_decoded_model_reproduces_the_same_bytes() {
         // This is the property golden tests rely on.
-        let first = Package::from_spine(rich_ir(), "Hero").encode_model();
+        let first = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
         let decoded = Package::decode_model(&first).unwrap();
         let PackageModel::Spine(ir) = decoded else { panic!("a Spine package must decode as one") };
-        let second = Package::from_spine(ir, "Hero").encode_model();
+        let second = Package::from_spine(ir, "Hero").encode_model().unwrap();
         assert_eq!(first, second);
     }
 
     #[test]
     fn model_bin_starts_with_its_magic_and_version() {
-        let bytes = Package::from_spine(rich_ir(), "Hero").encode_model();
+        let bytes = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
         assert_eq!(&bytes[..4], MODEL_MAGIC);
         assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), FORMAT_VERSION);
+    }
+
+    #[test]
+    fn a_version_1_spine_model_reads_exactly_as_before() {
+        // Generated by the version 1 writer from `rich_ir()`. The Spine layout
+        // did not change in version 2, so the same bytes must still decode.
+        let bytes = include_bytes!("../tests/fixtures/spine_v1.model.bin");
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 1);
+        let decoded = Package::decode_model(bytes).unwrap();
+        assert_eq!(decoded.as_spine().unwrap(), &rich_ir());
+    }
+
+    #[test]
+    fn writers_always_write_the_current_version() {
+        let bytes = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
+        assert_eq!(FORMAT_VERSION, 2);
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 2);
     }
 
     #[test]
@@ -645,7 +678,7 @@ mod tests {
 
     #[test]
     fn a_newer_model_version_is_refused_rather_than_misread() {
-        let mut bytes = Package::from_spine(rich_ir(), "Hero").encode_model();
+        let mut bytes = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
         bytes[4..8].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         let err = Package::decode_model(&bytes).unwrap_err();
         assert!(err.to_string().contains("newer"), "{err}");
@@ -653,7 +686,7 @@ mod tests {
 
     #[test]
     fn truncating_model_bin_anywhere_is_an_error_and_never_a_panic() {
-        let full = Package::from_spine(rich_ir(), "Hero").encode_model();
+        let full = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
         for cut in (0..full.len()).step_by(17) {
             let _ = Package::decode_model(&full[..cut]);
         }
@@ -661,7 +694,7 @@ mod tests {
 
     #[test]
     fn corrupting_single_bytes_never_panics() {
-        let full = Package::from_spine(rich_ir(), "Hero").encode_model();
+        let full = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
         for at in (8..full.len()).step_by(29) {
             let mut bytes = full.clone();
             bytes[at] ^= 0xff;
@@ -673,7 +706,7 @@ mod tests {
     fn a_dangling_bone_parent_is_rejected_on_load() {
         let mut ir = rich_ir();
         ir.bones[1].parent = Some(BoneId(99));
-        let bytes = Package::from_spine(ir, "Hero").encode_model();
+        let bytes = Package::from_spine(ir, "Hero").encode_model().unwrap();
         let err = Package::decode_model(&bytes).unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
     }
@@ -682,7 +715,7 @@ mod tests {
     fn a_bone_parented_to_a_later_bone_is_rejected_on_load() {
         let mut ir = rich_ir();
         ir.bones[0].parent = Some(BoneId(1));
-        let bytes = Package::from_spine(ir, "Hero").encode_model();
+        let bytes = Package::from_spine(ir, "Hero").encode_model().unwrap();
         let err = Package::decode_model(&bytes).unwrap_err();
         assert!(err.to_string().contains("not before it"), "{err}");
     }
@@ -691,7 +724,7 @@ mod tests {
     fn a_dangling_skin_attachment_is_rejected_on_load() {
         let mut ir = rich_ir();
         ir.skins[0].entries[0].attachment = AttachmentId(999);
-        let bytes = Package::from_spine(ir, "Hero").encode_model();
+        let bytes = Package::from_spine(ir, "Hero").encode_model().unwrap();
         let err = Package::decode_model(&bytes).unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
     }
