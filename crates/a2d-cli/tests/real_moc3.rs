@@ -313,6 +313,11 @@ fn a_bundle_reconstructs_into_a_package_that_poses_identically() {
     let package = a2d_import::import_bundle(&bytes, &mut report).expect("the bundle should reconstruct");
     assert_eq!(package.manifest.model_type, a2d_pack::ModelType::Cubism);
     assert!(!package.textures.is_empty(), "a model with no texture page cannot be drawn");
+    assert!(
+        !package.manifest.animations.is_empty(),
+        "no motion was recovered from the fade motion data; the report said:
+{report}"
+    );
     for texture in &package.textures {
         assert!(texture.bytes.starts_with(b"\x89PNG"), "{} is not a PNG", texture.file);
     }

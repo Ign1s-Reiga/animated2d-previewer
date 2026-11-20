@@ -182,6 +182,27 @@ pub fn read_name(file: &SerializedFile, object: &Object) -> Result<Option<String
     Ok(Some(reader(file, object)?.string()?))
 }
 
+/// A `MonoBehaviour`'s own fields: a reader positioned just past the header
+/// and `m_Name`, plus that name.
+///
+/// This is the generic half of reading a behaviour whose type tree is stripped;
+/// the field order after it belongs to the C# class, which only the importer
+/// that recognises the class may interpret. Errors when `object` is not a
+/// `MonoBehaviour`.
+pub fn behaviour_body<'a>(file: &'a SerializedFile, object: &Object) -> Result<(Reader<'a>, String), DecodeError> {
+    if object.class_id != ClassId::MONO_BEHAVIOUR {
+        return Err(DecodeError::corrupt(format!(
+            "object {} is a {}, not a MonoBehaviour",
+            object.path_id,
+            object.class_id.name()
+        )));
+    }
+    let mut r = reader(file, object)?;
+    skip_behaviour_header(&mut r)?;
+    let name = r.string()?;
+    Ok((r, name))
+}
+
 /// `m_GameObject`, `m_Enabled` and `m_Script`.
 fn skip_behaviour_header(r: &mut Reader<'_>) -> Result<PPtr, DecodeError> {
     let _game_object = PPtr::read(r)?;

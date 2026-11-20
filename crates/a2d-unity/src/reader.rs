@@ -7,6 +7,8 @@
 
 use a2d_core::DecodeError;
 
+use crate::curve::{AnimationCurve, Keyframe, KEYFRAME_BYTES, MIN_CURVE_BYTES};
+
 /// Byte order of the stream being read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Endian {
@@ -15,6 +17,7 @@ pub enum Endian {
 }
 
 /// A bounds-checked cursor over a byte slice.
+#[derive(Debug, Clone)]
 pub struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -163,6 +166,70 @@ impl<'a> Reader<'a> {
         self.align(4)?;
         Ok(text)
     }
+
+    /// An element count, refused when `count` elements of at least `min_each`
+    /// bytes could not fit in what remains, so a corrupt length errors instead
+    /// of allocating.
+    fn count(&mut self, min_each: usize, what: &str) -> Result<usize, DecodeError> {
+        let at = self.pos as u64;
+        let n = self.i32()?;
+        let n = usize::try_from(n).map_err(|_| DecodeError::corrupt_at(format!("{what} count {n} is negative"), at))?;
+        if n.checked_mul(min_each).is_none_or(|need| need > self.remaining()) {
+            return Err(DecodeError::corrupt_at(
+                format!("{what} declares {n} entries but only {} bytes remain", self.remaining()),
+                at,
+            ));
+        }
+        Ok(n)
+    }
+
+    /// A `string[]`: an `i32` count, then each string length-prefixed and padded.
+    pub fn string_array(&mut self) -> Result<Vec<String>, DecodeError> {
+        let n = self.count(4, "a string array")?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.string()?);
+        }
+        Ok(out)
+    }
+
+    /// An `f32[]`: an `i32` count, then the values.
+    pub fn f32_array(&mut self) -> Result<Vec<f32>, DecodeError> {
+        let n = self.count(4, "a float array")?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.f32()?);
+        }
+        Ok(out)
+    }
+
+    /// One `AnimationCurve`. See [`crate::curve`] for the (unverified) layout.
+    pub fn animation_curve(&mut self) -> Result<AnimationCurve, DecodeError> {
+        let n = self.count(KEYFRAME_BYTES, "an animation curve")?;
+        let mut keys = Vec::with_capacity(n);
+        for _ in 0..n {
+            keys.push(Keyframe {
+                time: self.f32()?,
+                value: self.f32()?,
+                in_slope: self.f32()?,
+                out_slope: self.f32()?,
+                weighted_mode: self.i32()?,
+                in_weight: self.f32()?,
+                out_weight: self.f32()?,
+            });
+        }
+        Ok(AnimationCurve { keys, pre_infinity: self.i32()?, post_infinity: self.i32()?, rotation_order: self.i32()? })
+    }
+
+    /// An `AnimationCurve[]`: an `i32` count, then each curve.
+    pub fn animation_curve_array(&mut self) -> Result<Vec<AnimationCurve>, DecodeError> {
+        let n = self.count(MIN_CURVE_BYTES, "an animation curve array")?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(self.animation_curve()?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -232,5 +299,87 @@ mod tests {
     fn a_negative_string_length_is_refused_rather_than_cast() {
         let data = [0xFF, 0xFF, 0xFF, 0xFF];
         assert!(Reader::new(&data, Endian::Little).string().is_err());
+    }
+
+    fn le(values: &[i32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn f(v: f32) -> i32 {
+        v.to_bits() as i32
+    }
+
+    #[test]
+    fn a_string_array_reads_each_padded_string() {
+        let mut data = le(&[2, 1]);
+        data.extend_from_slice(&[b'a', 0, 0, 0]);
+        data.extend_from_slice(&le(&[5]));
+        data.extend_from_slice(&[b'h', b'e', b'l', b'l', b'o', 0, 0, 0]);
+        data.extend_from_slice(&le(&[9]));
+        let mut r = Reader::new(&data, Endian::Little);
+        assert_eq!(r.string_array().unwrap(), vec!["a", "hello"]);
+        assert_eq!(r.i32().unwrap(), 9);
+    }
+
+    #[test]
+    fn a_float_array_reads_its_values() {
+        let data = le(&[2, f(1.5), f(-2.0)]);
+        assert_eq!(Reader::new(&data, Endian::Little).f32_array().unwrap(), vec![1.5, -2.0]);
+        assert!(Reader::new(&le(&[0]), Endian::Little).f32_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_animation_curve_reads_keys_and_trailer() {
+        let data = le(&[
+            2,
+            f(0.0),
+            f(1.0),
+            f(0.5),
+            f(0.25),
+            0,
+            f(0.0),
+            f(0.0),
+            f(1.0),
+            f(2.0),
+            f(f32::INFINITY),
+            f(0.0),
+            3,
+            f(1.0),
+            f(1.0),
+            2,
+            1,
+            4,
+        ]);
+        let mut r = Reader::new(&data, Endian::Little);
+        let c = r.animation_curve().unwrap();
+        assert_eq!(c.keys.len(), 2);
+        assert_eq!(c.keys[0].out_slope, 0.25);
+        assert_eq!(c.keys[1].value, 2.0);
+        assert!(c.keys[1].in_slope.is_infinite());
+        assert_eq!(c.keys[1].weighted_mode, 3);
+        assert_eq!((c.pre_infinity, c.post_infinity, c.rotation_order), (2, 1, 4));
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn a_truncated_array_or_curve_is_an_error() {
+        let full = le(&[1, f(0.0), f(0.0), f(0.0), f(0.0), 0, f(0.0), f(0.0), 0, 0, 0]);
+        for cut in 0..full.len() {
+            let mut r = Reader::new(&full[..cut], Endian::Little);
+            assert!(r.animation_curve().is_err(), "cut at {cut}");
+        }
+        assert!(Reader::new(&le(&[3, f(1.0)]), Endian::Little).f32_array().is_err());
+        assert!(Reader::new(&le(&[2, 1]), Endian::Little).string_array().is_err());
+    }
+
+    #[test]
+    fn absurd_or_negative_counts_are_refused_before_allocating() {
+        for n in [i32::MAX, -1, 1_000_000] {
+            let data = le(&[n, 0, 0, 0, 0]);
+            assert!(Reader::new(&data, Endian::Little).string_array().is_err());
+            assert!(Reader::new(&data, Endian::Little).f32_array().is_err());
+            assert!(Reader::new(&data, Endian::Little).animation_curve().is_err());
+            assert!(Reader::new(&data, Endian::Little).animation_curve_array().is_err());
+        }
     }
 }
