@@ -323,7 +323,24 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
         report.warn(Degradation::MissingReference { kind: "texture".into(), name: "any Texture2D".into() });
     }
 
+    record_warnings(&mut package, report);
     Ok(package)
+}
+
+/// Copies the import report into the manifest, so `preview` and `validate`
+/// can show it after the bundle is gone.
+///
+/// Unresolved motion targets are left out: they are re-derived from the IR
+/// every time the package is opened and validated, so persisting them as well
+/// would print each one twice. Order is the report's insertion order, which is
+/// deterministic for a given bundle.
+fn record_warnings(package: &mut Package, report: &LoadReport) {
+    let rederived = match &package.model {
+        a2d_pack::PackageModel::Cubism(ir) => ir.unresolved_motion_targets(),
+        _ => Vec::new(),
+    };
+    package.manifest.import_warnings =
+        report.warnings().iter().filter(|w| !rederived.contains(w)).map(|w| w.to_string()).collect();
 }
 
 /// Decodes every `CubismFadeMotionData` into a motion.
@@ -432,6 +449,44 @@ mod tests {
         assert!(read_i32(&[1, 2], 0).is_err());
         assert!(read_i32(&[1, 2, 3, 4], 2).is_err());
         assert_eq!(read_i32(&[1, 0, 0, 0], 0).unwrap(), 1);
+    }
+
+    fn cubism_package(motions: Vec<a2d_core::ir::cubism::Motion>) -> Package {
+        let ir = a2d_core::ir::cubism::CubismIr { motions, ..Default::default() };
+        Package::from_cubism(ir, "m", "cubism-moc3-v3")
+    }
+
+    #[test]
+    fn report_warnings_are_recorded_in_the_manifest_in_order() {
+        let mut package = cubism_package(Vec::new());
+        let mut report = LoadReport::new();
+        report.note("2 AnimationClip(s) have no matching fade motion data");
+        report.warn(Degradation::MissingReference { kind: "texture".into(), name: "any Texture2D".into() });
+        record_warnings(&mut package, &report);
+        let expected: Vec<String> = report.warnings().iter().map(|w| w.to_string()).collect();
+        assert_eq!(package.manifest.import_warnings, expected);
+        assert_eq!(expected.len(), 2);
+    }
+
+    #[test]
+    fn unresolved_motion_targets_are_not_persisted_because_they_are_rederived() {
+        use a2d_core::ir::cubism::{Motion, MotionCurve};
+        let motion = Motion {
+            name: "Idle".into(),
+            duration: 1.0,
+            curves: vec![MotionCurve { target: "ParamNoSuchThing".into(), ..MotionCurve::default() }],
+            ..Motion::default()
+        };
+        let mut package = cubism_package(vec![motion]);
+        let a2d_pack::PackageModel::Cubism(ir) = &package.model else { panic!("cubism package expected") };
+        let mut report = LoadReport::new();
+        for d in ir.unresolved_motion_targets() {
+            report.warn(d);
+        }
+        report.note("kept");
+        assert_eq!(report.len(), 2);
+        record_warnings(&mut package, &report);
+        assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
     }
 
     #[test]
