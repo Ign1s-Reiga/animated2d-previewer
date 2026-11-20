@@ -316,3 +316,157 @@ pub fn cubism_package(with_motion: bool) -> a2d_pack::Package {
     package.textures.push(a2d_pack::TextureFile { file: "texture_00.png".into(), bytes: Fixture::png(64, 64) });
     package
 }
+
+/// A headless GPU, or `None` to skip. `A2D_REQUIRE_GPU` turns the skip into a
+/// failure, for machines that should have an adapter.
+pub fn gpu() -> Option<a2d_render::GpuContext> {
+    match a2d_render::GpuContext::headless() {
+        Ok(gpu) => Some(gpu),
+        Err(e) => {
+            if std::env::var("A2D_REQUIRE_GPU").is_ok() {
+                panic!("A2D_REQUIRE_GPU is set, but no GPU adapter is available: {e}");
+            }
+            eprintln!("skipping visual regression test: {e}");
+            None
+        }
+    }
+}
+
+/// Fraction of pixels with any coverage.
+pub fn coverage(image: &a2d_render::Rgba8Image) -> f32 {
+    let covered = image.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+    covered as f32 / (image.width * image.height) as f32
+}
+
+/// Records `image` as `dir/name` if there is no baseline yet, otherwise asserts
+/// it matches the stored one within `tolerance` (0-255 channel units).
+pub fn check_baseline(dir: &Path, name: &str, image: &a2d_render::Rgba8Image, tolerance: u8) {
+    std::fs::create_dir_all(dir).expect("baseline directory should be creatable");
+    let path = dir.join(name);
+    if !path.exists() {
+        std::fs::write(&path, a2d_render::encode_png(image).expect("encode")).expect("write baseline");
+        eprintln!("recorded baseline {}", path.display());
+        return;
+    }
+    let stored =
+        a2d_render::decode_png(&std::fs::read(&path).expect("read baseline"), "baseline").expect("baseline decodes");
+    let diff = image.diff(&stored).unwrap_or_else(|| {
+        panic!(
+            "baseline {} is {}x{}, this render is {}x{}",
+            path.display(),
+            stored.width,
+            stored.height,
+            image.width,
+            image.height
+        )
+    });
+    assert!(
+        diff.within(tolerance),
+        "{name} differs from {}: {diff}
+delete the baseline to re-record it",
+        path.display()
+    );
+}
+
+/// A synthetic Cubism package built to break visibly if deformation regresses.
+///
+/// Two triangles in a 2 x 2 unit canvas (the descriptions below are as drawn, y up,
+/// i.e. after the runtime flips the file's y-down positions), driven by two parameters through a
+/// 2-key keyform blend each:
+///
+/// * `A` (lower half) slides right as `ParamAngleX` goes -30 -> 30: its x
+///   offset is `(p + 30) / 60`. The motion eases `ParamAngleX` with a Hermite
+///   segment (zero slopes) from -30 at 0 s to 30 at 1 s, so the value at
+///   0.25 s is -20.625, not the linear -15.
+/// * `B` (upper half) rises by `0.3 * (p + 30) / 60` as `ParamAngleY` goes
+///   -30 -> 30. Its curve is a stepped key at 0 s (-30) then 30 at 0.75 s, so
+///   it holds still through 0.5 s and has jumped by 1.0 s.
+///
+/// Motion "idle" lasts two seconds.
+pub fn cubism_deformation_package() -> a2d_pack::Package {
+    use a2d_core::ir::cubism::{
+        Canvas, CubismIr, CurveKey, Drawable, KeyformBinding, Keyforms, Motion, MotionCurve, Parameter,
+        ParameterBinding,
+    };
+
+    let drawable = |id: &str, begin: u32, binding: u32| Drawable {
+        id: id.into(),
+        parent_deformer: None,
+        uvs: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+        indices: vec![0, 1, 2],
+        keyform_begin: begin,
+        keyform_count: 2,
+        keyform_binding: binding,
+        masks: vec![],
+        flags: 0,
+        part: None,
+        texture: 0,
+    };
+    let param = |id: &str| Parameter { id: id.into(), minimum: -30.0, maximum: 30.0, default: 0.0 };
+
+    let mut ir = CubismIr {
+        canvas: Canvas { pixels_per_unit: 100.0, origin: (100.0, 100.0), size: (200.0, 200.0) },
+        parameters: vec![param("ParamAngleX"), param("ParamAngleY")],
+        part_ids: vec![],
+        deformer_ids: vec![],
+        drawable_ids: vec!["A".into(), "B".into()],
+        glue_ids: vec![],
+        drawables: vec![drawable("A", 0, 0), drawable("B", 2, 1)],
+        parameter_bindings: vec![
+            ParameterBinding { parameter: 0, keys: vec![-30.0, 30.0] },
+            ParameterBinding { parameter: 1, keys: vec![-30.0, 30.0] },
+        ],
+        keyform_bindings: vec![KeyformBinding { axes: vec![0] }, KeyformBinding { axes: vec![1] }],
+        keyforms: Keyforms {
+            positions: vec![
+                // MOC3 y runs down the canvas and the runtime flips it, so a
+                // positive y here is drawn in the lower half.
+                // A at -30: left, lower half. A at +30: the same shape 1.0 to the right.
+                -0.9, 0.8, -0.1, 0.8, -0.9, 0.2, //
+                0.1, 0.8, 0.9, 0.8, 0.1, 0.2, //
+                // B at -30: upper half. B at +30: the same shape 0.3 higher.
+                -0.4, -0.1, 0.4, -0.1, 0.0, -0.5, //
+                -0.4, -0.4, 0.4, -0.4, 0.0, -0.8,
+            ],
+            warp_offsets: vec![],
+            drawable_offsets: vec![0, 6, 12, 18],
+        },
+        draw_order: vec![0, 1],
+        drawable_keyform_opacities: vec![1.0; 4],
+        drawable_keyform_draw_orders: vec![500.0; 4],
+        ..CubismIr::default()
+    };
+    let key = |time: f32, value: f32, slope: f32, stepped: bool| CurveKey {
+        time,
+        value,
+        in_slope: slope,
+        out_slope: slope,
+        stepped,
+    };
+    ir.motions = vec![Motion {
+        name: "idle".into(),
+        duration: 2.0,
+        curves: vec![
+            MotionCurve {
+                target: "ParamAngleX".into(),
+                keys: vec![key(0.0, -30.0, 0.0, false), key(1.0, 30.0, 0.0, false)],
+                ..MotionCurve::default()
+            },
+            MotionCurve {
+                target: "ParamAngleY".into(),
+                keys: vec![key(0.0, -30.0, 0.0, true), key(0.75, 30.0, 0.0, false)],
+                ..MotionCurve::default()
+            },
+        ],
+        ..Motion::default()
+    }];
+
+    let mut package = a2d_pack::Package::from_cubism(ir, "synthetic-deform", "cubism-moc3-v3");
+    package.manifest.textures.push(a2d_pack::TextureEntry {
+        file: "texture_00.png".into(),
+        size: Some([64, 64]),
+        premultiplied_alpha: false,
+    });
+    package.textures.push(a2d_pack::TextureFile { file: "texture_00.png".into(), bytes: Fixture::png(64, 64) });
+    package
+}

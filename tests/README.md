@@ -33,6 +33,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Architecture | `crates/a2d-cli/tests/architecture.rs` | the layering rules in `CLAUDE.md` §3, enforced rather than reviewed |
 | GPU | `crates/a2d-render/tests/render.rs` | clear, tint, blend modes, draw order, stencil clipping, read-back, buffer growth — all against real pixels |
 | Visual regression | `crates/a2d-cli/tests/visual.rs` | fixed timestamps rendered through the whole stack; determinism and movement |
+| Visual regression (Cubism) | `crates/a2d-cli/tests/visual_cubism.rs` | the same timestamps for the Cubism family, plus hand-computed geometry: keyform blending, a Hermite segment and a stepped segment, asserted on emitted vertices and on rendered pixel centroids |
 | Real-asset | `crates/a2d-unity/tests/real_bundle.rs`, `crates/a2d-cli/tests/{unity_inspect,real_moc3}.rs` | a real Unity bundle parses, every object is addressable, the inventory holds what §12 asks for, and the MOC3 inside it reads with sane identifiers and parameter ranges — `#[ignore]`, gated on `A2D_FIXTURE_CUBISM` |
 | Unity Spine | `crates/a2d-cli/tests/unity_spine.rs` | a real Unity bundle yields a skeleton and atlas that the existing decoder reads with no Unity-specific handling — `#[ignore]`, gated on `A2D_FIXTURE_SPINE_BUNDLE` |
 | Cubism assembly | `crates/a2d-cli/tests/cubism_orientation.rs` | a posed model is coherent — its pupil axes stay square and right-handed — and fits its canvas once un-zoomed; asserted from Cubism's conventional parameter meanings rather than from a reference image — `#[ignore]`, gated on `A2D_FIXTURE_CUBISM` |
@@ -67,7 +68,7 @@ Document each new variable in the table below.
 | Variable | Points at | Used by |
 | --- | --- | --- |
 | `A2D_REQUIRE_GPU` | any value; turns a missing-GPU skip into a failure | every GPU test |
-| `A2D_BASELINE_DIR` | a directory of baseline frames | `a2d-cli --test visual` |
+| `A2D_BASELINE_DIR` | a directory of baseline frames | `a2d-cli --test {visual,visual_cubism}` |
 | `A2D_CONFIG_DIR` | a directory to keep `config.json` in, instead of the per-user one | the viewer; `a2d-cli --test viewer_process` |
 | `A2D_FIXTURE_SPINE_BUNDLE` | a Unity AssetBundle holding a Spine rig | `a2d-cli --test unity_spine` |
 | `A2D_FIXTURE_CUBISM` | a Unity AssetBundle holding a Cubism model | `a2d-unity --test real_bundle`, `a2d-cli --test {unity_inspect,real_moc3,cubism_orientation}` |
@@ -101,6 +102,26 @@ A2D_BASELINE_DIR=tests/fixtures/local/baseline cargo test -p a2d-cli --test visu
 ```
 
 Delete a baseline file to re-record it.
+
+### Cubism
+
+`crates/a2d-cli/tests/visual_cubism.rs` is the Cubism counterpart. Its model is
+`support::cubism_deformation_package`: two triangles, each driven by a two-key
+keyform blend, so a wrong blend, a Hermite segment sampled linearly, a stepped segment
+treated as linear, or an un-flipped y moves pixels by a computable amount.
+
+- Triangle A (lower half) slides by `(p + 30) / 60` as `ParamAngleX` eases from
+  -30 to 30 over one second with zero slopes. At 0.25 s the parameter is
+  -20.625 (blend weight 0.15625); linear interpolation would give 0.25.
+- Triangle B (upper half) rises by `0.3 * (p + 30) / 60` and is driven by a
+  stepped curve, so it stays put at 0.0, 0.25 and 0.5 s and has moved by 1.0 s.
+
+Beyond the properties `visual.rs` checks (drawn, deterministic, moves, fresh
+model and backward scrub reproduce frames), two tests assert the hand-computed
+numbers: `posed_geometry_matches_the_hand_computed_blend` on the emitted
+vertices (CPU only, runs without a GPU), and
+`rendered_triangles_land_where_the_blend_puts_them` on pixel centroids (1.5 px
+slack). `A2D_BASELINE_DIR` works the same way; files are named `cubism_idle_*`.
 
 ## Whether a Cubism model is assembled coherently
 
