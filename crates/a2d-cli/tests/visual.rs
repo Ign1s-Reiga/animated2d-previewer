@@ -32,7 +32,7 @@ use a2d_runtime::GenericSpineModel;
 #[path = "support/mod.rs"]
 mod support;
 
-use support::{Fixture, TempDir};
+use support::{coverage, gpu, Fixture, TempDir};
 
 const SIZE: u32 = 256;
 const TIMESTAMPS: [f32; 4] = a2d_cli::REGRESSION_TIMESTAMPS;
@@ -45,19 +45,6 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 fn temp_dir(label: &str) -> TempDir {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     TempDir::new(std::env::temp_dir().join(format!("a2d-vis-{}-{}-{}", label, std::process::id(), n)))
-}
-
-fn gpu() -> Option<GpuContext> {
-    match GpuContext::headless() {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            if std::env::var("A2D_REQUIRE_GPU").is_ok() {
-                panic!("A2D_REQUIRE_GPU is set, but no GPU adapter is available: {e}");
-            }
-            eprintln!("skipping visual regression test: {e}");
-            None
-        }
-    }
 }
 
 /// Everything needed to render one character, built from a synthetic fixture.
@@ -113,12 +100,6 @@ impl Harness {
             .expect("render should succeed");
         self.target.read_pixels(&self.gpu).expect("read-back should succeed")
     }
-}
-
-/// Fraction of pixels with any coverage.
-fn coverage(image: &Rgba8Image) -> f32 {
-    let covered = image.pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
-    covered as f32 / (image.width * image.height) as f32
 }
 
 #[test]
@@ -209,37 +190,9 @@ fn frames_match_a_stored_baseline_when_one_is_configured() {
     let mut harness = Harness::build(gpu, "baseline");
     std::fs::create_dir_all(&dir).expect("baseline directory should be creatable");
 
-    let mut written = 0;
     for time in TIMESTAMPS {
         let image = harness.frame(time);
-        let path = dir.join(format!("hero_idle_{time:.2}.png"));
-
-        if !path.exists() {
-            std::fs::write(&path, a2d_render::encode_png(&image).expect("encode")).expect("write baseline");
-            written += 1;
-            continue;
-        }
-
-        let stored = a2d_render::decode_png(&std::fs::read(&path).expect("read baseline"), "baseline")
-            .expect("baseline should decode");
-        let diff = image.diff(&stored).unwrap_or_else(|| {
-            panic!(
-                "baseline {} is {}x{}, this render is {}x{}",
-                path.display(),
-                stored.width,
-                stored.height,
-                image.width,
-                image.height
-            )
-        });
-        assert!(
-            diff.within(TOLERANCE),
-            "t={time} differs from {}: {diff}\ndelete the baseline to re-record it",
-            path.display()
-        );
-    }
-    if written > 0 {
-        eprintln!("recorded {written} baseline frame(s) in {}", dir.display());
+        support::check_baseline(&dir, &format!("hero_idle_{time:.2}.png"), &image, TOLERANCE);
     }
 }
 
