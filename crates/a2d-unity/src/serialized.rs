@@ -150,6 +150,11 @@ impl std::fmt::Debug for SerializedFile {
 }
 
 impl SerializedFile {
+    /// The object with this path id, if the file holds it.
+    pub fn find_object(&self, path_id: i64) -> Option<&Object> {
+        self.objects.iter().find(|o| o.path_id == path_id)
+    }
+
     /// The raw bytes of one object.
     pub fn object_data(&self, object: &Object) -> Result<&[u8], DecodeError> {
         let start = self

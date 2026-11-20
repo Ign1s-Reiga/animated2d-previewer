@@ -11,7 +11,7 @@
 //! A2D_FIXTURE_CUBISM=/path/to/bundle cargo test -p a2d-unity -- --ignored
 //! ```
 
-use a2d_unity::{Bundle, ClassId, Inventory, SerializedFile};
+use a2d_unity::{AnimationClip, Bundle, ClassId, Inventory, SerializedFile};
 
 fn fixture() -> Option<Vec<u8>> {
     let path = std::env::var("A2D_FIXTURE_CUBISM").ok()?;
@@ -168,4 +168,23 @@ fn a_real_texture_decodes_and_can_be_checked_against_another_reader() {
             clear as f64 * 100.0 / total as f64
         );
     }
+}
+
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Unity AssetBundle"]
+fn every_animation_clip_object_parses_to_its_last_byte() {
+    // `AnimationClip::parse` rejects leftover bytes, so success here means the
+    // layout consumed the object exactly: the only evidence that it is right.
+    let Some((_, file)) = open() else { return };
+    let mut clips = 0;
+    for object in file.objects.iter().filter(|o| o.class_id == ClassId::ANIMATION_CLIP) {
+        let data = file.object_data(object).expect("the object should be in range");
+        let clip = AnimationClip::parse(data).unwrap_or_else(|e| panic!("clip object {}: {e}", object.path_id));
+        assert_eq!(
+            clip.streamed_curve_count() + clip.dense.curve_count as usize + clip.constants.len(),
+            clip.bindings.len()
+        );
+        clips += 1;
+    }
+    println!("{clips} AnimationClip objects parsed");
 }

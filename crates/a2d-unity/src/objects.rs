@@ -94,6 +94,7 @@ impl ObjectInfo {
 /// Every object in a serialized file, identified as far as it can be.
 pub struct Inventory {
     pub objects: Vec<ObjectInfo>,
+    scripts: HashMap<i64, ScriptInfo>,
 }
 
 impl Inventory {
@@ -137,7 +138,12 @@ impl Inventory {
             })
             .collect();
 
-        Inventory { objects }
+        Inventory { objects, scripts }
+    }
+
+    /// The C# identity of the local `MonoScript` with this path id.
+    pub fn script(&self, path_id: i64) -> Option<&ScriptInfo> {
+        self.scripts.get(&path_id)
     }
 
     /// Objects whose `MonoBehaviour` script has the given class name.
@@ -203,12 +209,40 @@ pub fn behaviour_body<'a>(file: &'a SerializedFile, object: &Object) -> Result<(
     Ok((r, name))
 }
 
-/// `m_GameObject`, `m_Enabled` and `m_Script`.
-fn skip_behaviour_header(r: &mut Reader<'_>) -> Result<PPtr, DecodeError> {
-    let _game_object = PPtr::read(r)?;
+/// The name of the `GameObject` a `MonoBehaviour` is attached to.
+///
+/// `Ok(None)` when the behaviour is detached, or its owner is not in this
+/// file. Errors when `object` is not a `MonoBehaviour`, or is unreadable.
+pub fn behaviour_owner_name(file: &SerializedFile, object: &Object) -> Result<Option<String>, DecodeError> {
+    if object.class_id != ClassId::MONO_BEHAVIOUR {
+        return Err(DecodeError::corrupt(format!(
+            "object {} is a {}, not a MonoBehaviour",
+            object.path_id,
+            object.class_id.name()
+        )));
+    }
+    let mut r = reader(file, object)?;
+    let (game_object, _) = read_behaviour_header(&mut r)?;
+    if !game_object.is_local() {
+        return Ok(None);
+    }
+    match file.find_object(game_object.path_id) {
+        Some(owner) if owner.class_id == ClassId::GAME_OBJECT => read_name(file, owner),
+        _ => Ok(None),
+    }
+}
+
+/// `m_GameObject`, `m_Enabled` and `m_Script`: the owner, then the script.
+fn read_behaviour_header(r: &mut Reader<'_>) -> Result<(PPtr, PPtr), DecodeError> {
+    let game_object = PPtr::read(r)?;
     let _enabled = r.u8()?;
     r.align(4)?;
-    PPtr::read(r)
+    Ok((game_object, PPtr::read(r)?))
+}
+
+/// The header, keeping only the script.
+fn skip_behaviour_header(r: &mut Reader<'_>) -> Result<PPtr, DecodeError> {
+    Ok(read_behaviour_header(r)?.1)
 }
 
 /// The script a `MonoBehaviour` instantiates, as a local path id.
@@ -313,5 +347,139 @@ mod tests {
             assembly: "Live2D".into(),
         });
         assert_eq!(info.type_label(), "CubismMoc");
+    }
+
+    // --- A minimal serialized file, enough to exercise object lookup. ---
+
+    fn put_i32(o: &mut Vec<u8>, v: i32) {
+        o.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_string(o: &mut Vec<u8>, s: &str) {
+        put_i32(o, s.len() as i32);
+        o.extend_from_slice(s.as_bytes());
+        while o.len() % 4 != 0 {
+            o.push(0);
+        }
+    }
+    fn put_pptr(o: &mut Vec<u8>, file: i32, path: i64) {
+        put_i32(o, file);
+        o.extend_from_slice(&path.to_le_bytes());
+    }
+
+    /// `(path_id, type_index, bytes)` objects into a version-17 file with no
+    /// type tree. Type 0 is GameObject, 1 MonoScript, 2 MonoBehaviour.
+    fn build(objects: &[(i64, usize, Vec<u8>)]) -> SerializedFile {
+        // The 20-byte header is a multiple of four, so alignment inside the
+        // metadata is the same as alignment from the start of the file.
+        let mut meta = Vec::new();
+        meta.extend_from_slice(b"2022.3.0f1\0");
+        put_i32(&mut meta, 5); // target platform
+        meta.push(0); // no type tree
+        put_i32(&mut meta, 3);
+        for class in [1i32, 115, 114] {
+            put_i32(&mut meta, class);
+            meta.push(0); // not stripped
+            meta.extend_from_slice(&(-1i16).to_le_bytes());
+            if class == 114 {
+                meta.extend_from_slice(&[0; 16]); // script hash
+            }
+            meta.extend_from_slice(&[0; 16]); // old type hash
+        }
+        put_i32(&mut meta, objects.len() as i32);
+        let mut data = Vec::new();
+        for (path_id, type_index, bytes) in objects {
+            while (20 + meta.len()) % 4 != 0 {
+                meta.push(0);
+            }
+            meta.extend_from_slice(&path_id.to_le_bytes());
+            meta.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            meta.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            put_i32(&mut meta, *type_index as i32);
+            data.extend_from_slice(bytes);
+        }
+        put_i32(&mut meta, 0); // script types
+        put_i32(&mut meta, 0); // externals
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&0u32.to_be_bytes()); // metadata size, unused
+        file.extend_from_slice(&0u32.to_be_bytes()); // file size, unused
+        file.extend_from_slice(&17u32.to_be_bytes());
+        file.extend_from_slice(&((20 + meta.len()) as u32).to_be_bytes());
+        file.extend_from_slice(&[0, 0, 0, 0]); // little-endian, reserved
+        file.extend_from_slice(&meta);
+        file.extend_from_slice(&data);
+        SerializedFile::parse(&file).expect("the synthetic file should parse")
+    }
+
+    fn game_object(name: &str) -> Vec<u8> {
+        let mut o = Vec::new();
+        put_i32(&mut o, 0); // no components
+        put_i32(&mut o, 0); // layer
+        put_string(&mut o, name);
+        o
+    }
+
+    fn mono_script(class: &str) -> Vec<u8> {
+        let mut o = Vec::new();
+        put_string(&mut o, class);
+        put_i32(&mut o, 0);
+        o.extend_from_slice(&[0; 16]);
+        put_string(&mut o, class);
+        put_string(&mut o, "Some.Namespace");
+        put_string(&mut o, "Assembly");
+        o
+    }
+
+    fn behaviour(owner: (i32, i64), script: i64, name: &str) -> Vec<u8> {
+        let mut o = Vec::new();
+        put_pptr(&mut o, owner.0, owner.1);
+        o.extend_from_slice(&[1, 0, 0, 0]); // enabled + padding
+        put_pptr(&mut o, 0, script);
+        put_string(&mut o, name);
+        o
+    }
+
+    fn sample() -> SerializedFile {
+        build(&[
+            (10, 0, game_object("Owner")),
+            (20, 1, mono_script("Thing")),
+            (30, 2, behaviour((0, 10), 20, "b1")),
+            (31, 2, behaviour((0, 0), 20, "detached")),
+            (32, 2, behaviour((1, 10), 20, "elsewhere")),
+            (33, 2, behaviour((0, 99), 20, "dangling")),
+        ])
+    }
+
+    #[test]
+    fn an_object_is_found_by_path_id() {
+        let file = sample();
+        assert_eq!(file.find_object(30).map(|o| o.class_id), Some(ClassId::MONO_BEHAVIOUR));
+        assert_eq!(file.find_object(10).map(|o| o.class_id), Some(ClassId::GAME_OBJECT));
+        assert!(file.find_object(12345).is_none());
+    }
+
+    #[test]
+    fn a_behaviour_reports_the_name_of_its_owner() {
+        let file = sample();
+        let owner = |id| behaviour_owner_name(&file, file.find_object(id).unwrap());
+        assert_eq!(owner(30).unwrap().as_deref(), Some("Owner"));
+        assert_eq!(owner(31).unwrap(), None, "a detached behaviour has no owner");
+        assert_eq!(owner(32).unwrap(), None, "an owner in another file is not resolved");
+        assert_eq!(owner(33).unwrap(), None, "a dangling owner is not an error");
+        // Only a behaviour has an owner in this sense.
+        assert!(behaviour_owner_name(&file, file.find_object(10).unwrap()).is_err());
+    }
+
+    #[test]
+    fn the_inventory_resolves_scripts_by_path_id() {
+        let file = sample();
+        let inventory = Inventory::build(&file);
+        let script = inventory.script(20).expect("the script is known");
+        assert_eq!(script.full_name(), "Some.Namespace.Thing");
+        assert!(inventory.script(30).is_none(), "a behaviour is not a script");
+        assert!(inventory.script(999).is_none());
+        assert_eq!(inventory.by_script("Thing").count(), 4);
+        let names: Vec<_> = inventory.by_script("Thing").filter_map(|o| o.name.clone()).collect();
+        assert_eq!(names, ["b1", "detached", "elsewhere", "dangling"]);
     }
 }
