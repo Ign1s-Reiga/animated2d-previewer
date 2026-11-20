@@ -84,6 +84,7 @@ pub use a2d_core::ir::cubism::{
     Canvas, Counts, CubismIr, Deformer, DeformerKind, Drawable, KeyformBinding, Keyforms, Parameter, ParameterBinding,
     RotationDeformer, RotationKeyform, WarpDeformer,
 };
+pub use a2d_core::ir::cubism::{CurveKey, Motion, MotionCurve};
 
 /// One 64-byte fixed-width identifier slot.
 const ID_LEN: usize = 64;
@@ -398,6 +399,8 @@ impl Moc3 {
                 draw_order,
                 drawable_keyform_opacities,
                 drawable_keyform_draw_orders,
+                // A MOC3 holds no motions; they live in separate files.
+                motions: Vec::new(),
             },
         })
     }

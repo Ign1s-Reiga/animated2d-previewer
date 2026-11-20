@@ -48,6 +48,8 @@ pub fn write(w: &mut Writer, ir: &CubismIr) {
     w.u32_seq(&ir.draw_order);
     w.f32_seq(&ir.drawable_keyform_opacities);
     w.f32_seq(&ir.drawable_keyform_draw_orders);
+    // `ir.motions` is not written yet: persisting it changes the layout and
+    // needs a format version bump.
 }
 
 /// Reads a whole model and checks that its tables refer to each other.
@@ -70,6 +72,8 @@ pub fn read(r: &mut Reader<'_>) -> Result<CubismIr, DecodeError> {
         draw_order: r.u32_seq()?,
         drawable_keyform_opacities: r.f32_seq()?,
         drawable_keyform_draw_orders: r.f32_seq()?,
+        // Motions are not persisted yet: that needs a format version bump.
+        motions: Vec::new(),
     };
     validate_references(&ir)?;
     Ok(ir)
@@ -439,6 +443,7 @@ mod tests {
             draw_order: vec![1, 0],
             drawable_keyform_opacities: vec![1.0, 1.0, 0.0, 1.0, 0.5, 0.25],
             drawable_keyform_draw_orders: vec![500.0; 6],
+            motions: vec![],
         }
     }
 

@@ -285,6 +285,58 @@ pub struct CubismIr {
     pub drawable_keyform_opacities: Vec<f32>,
     /// Draw order of each drawable keyform, in the same order.
     pub drawable_keyform_draw_orders: Vec<f32>,
+    /// The model's own motions. Empty when the source supplied none.
+    pub motions: Vec<Motion>,
+}
+
+/// One authored motion: parameter curves over a fixed length.
+///
+/// Source-neutral on purpose. Whatever container the curves came from, they
+/// arrive here as keyed Hermite segments in seconds.
+///
+/// The fade fields are stored so a package can keep what the source said, but
+/// nothing applies them yet: playback neither crossfades motions nor ramps a
+/// curve in and out.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Motion {
+    pub name: String,
+    /// Length of one pass, in seconds. Looping wraps at this, not at the last key.
+    pub duration: f32,
+    /// Seconds to fade in. Not applied yet.
+    pub fade_in: f32,
+    /// Seconds to fade out. Not applied yet.
+    pub fade_out: f32,
+    pub curves: Vec<MotionCurve>,
+}
+
+/// A curve driving one target, by identifier.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MotionCurve {
+    /// The parameter identifier this curve drives. It may name nothing in the
+    /// model; evaluation ignores such a curve and reports it instead.
+    pub target: String,
+    /// Per-curve fade override in seconds; `None` means use the motion's. Not
+    /// applied yet.
+    pub fade_in: Option<f32>,
+    pub fade_out: Option<f32>,
+    /// Ordered by time, non-decreasing.
+    pub keys: Vec<CurveKey>,
+}
+
+/// One keyframe of a [`MotionCurve`].
+///
+/// Segments are cubic Hermite. Slopes are in value per second, and the segment
+/// between keys `k0` and `k1` uses `k0.out_slope` and `k1.in_slope`. A linear
+/// segment is one whose slopes both equal the chord, `(v1 - v0) / (t1 - t0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CurveKey {
+    pub time: f32,
+    pub value: f32,
+    pub in_slope: f32,
+    pub out_slope: f32,
+    /// The segment *leaving* this key holds `value` until the next key. An
+    /// explicit flag rather than an infinite slope, which no arithmetic survives.
+    pub stepped: bool,
 }
 
 impl CubismIr {
