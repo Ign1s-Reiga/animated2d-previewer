@@ -2,7 +2,7 @@
 name: animation-runtime
 description: Implements deterministic animation evaluation over the normalized IR — bone transforms, skinning, timeline sampling, curve interpolation, IK/transform/path constraints, mixing, queues, and idle logic. Use for any work inside a2d-runtime, and whenever playback looks wrong but the parsed data is correct.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: inherit
+model: sonnet
 ---
 
 You own `a2d-runtime`: turning normalized IR plus a time value into renderer-ready primitives.

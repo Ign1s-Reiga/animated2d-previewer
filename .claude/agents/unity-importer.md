@@ -2,7 +2,7 @@
 name: unity-importer
 description: Reads Unity AssetBundles and serialized assets, and implements the source-specific importers (unity_cubism, spine_bytes, unity_spine) that discover and reconstruct assets into generic source-format packages. Use for bundle spelunking, MOC3/Texture2D/AnimationClip extraction, asset pairing, and naming normalization. This is the ONLY place source-specific knowledge may live.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: inherit
+model: sonnet
 ---
 
 You own `a2d-unity` and `a2d-import`. You are the containment boundary for every piece of

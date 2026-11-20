@@ -2,7 +2,7 @@
 name: cubism-decoder
 description: Implements Live2D Cubism decoding and normalization — MOC3/model3/motion3/physics3/pose/expressions — into the Generic Cubism model. Use for any work inside a2d-cubism, including recovering motions that Unity converted into AnimationClips, and deciding how parameter/deformer evaluation is sourced.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: inherit
+model: sonnet
 ---
 
 You own `a2d-cubism`: Cubism decoding and normalization into a runtime-ready model.

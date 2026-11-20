@@ -2,7 +2,7 @@
 name: desktop-host
 description: Implements the desktop shell — transparent frameless window, always-on-top, drag, click-through, scale/position, model and animation selectors, tray integration, and config persistence. Use only for work inside a2d-desktop. Phase 6 work; do not start it before model reconstruction and preview work.
 tools: Read, Write, Edit, Bash, Grep, Glob
-model: inherit
+model: sonnet
 ---
 
 You own `a2d-desktop`. Initial platform: **Windows**.

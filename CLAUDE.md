@@ -411,20 +411,29 @@ invalid bone parents · invalid slot references · malformed atlas references ·
 
 Delegate to the agent that owns the layer. Agents are in `.claude/agents/`.
 
-| Agent | Owns |
-|---|---|
-| `architecture-guardian` | layering/dependency review — run before any merge that touches ≥2 crates |
-| `format-detective` | detection heuristics, magic numbers, version sniffing, `inspect`/`validate` |
-| `spine-decoder` | `a2d-spine` — version decoders → Generic Spine IR |
-| `cubism-decoder` | `a2d-cubism` — moc3/motion3/physics/pose → Generic Cubism model |
-| `unity-importer` | `a2d-unity`, `a2d-import` — bundle spelunking, asset reconstruction |
-| `animation-runtime` | `a2d-runtime` — timelines, curves, skinning, constraints, mixing |
-| `renderer-engineer` | `a2d-render` — wgpu, blending, masks, batching, high-DPI |
-| `desktop-host` | `a2d-desktop` — transparent window, drag, click-through, tray, config |
-| `test-engineer` | unit/golden/visual-regression harnesses, fixture hygiene |
+**Model policy:** investigation runs on Opus 5.5; escalate to Fable 5.2 (pass `model: fable` on
+the Agent call) only for hard research — reverse-engineering an undocumented layout (e.g. Unity
+`AnimationClip` curve data, unknown MOC3 sections), or a question Opus already failed to settle.
+Fable costs about twice Opus. Coding runs on Sonnet 5.5, review runs on Opus 5.5. The `model:`
+frontmatter of each agent encodes the defaults — keep it that way when adding agents.
 
-When a task spans layers, do the work layer by layer with the owning agent, then run
-`architecture-guardian` last.
+| Agent | Role | Model | Owns |
+|---|---|---|---|
+| `researcher` | investigate | opus (fable when hard) | read-only codebase/format research → a plan with owners per step |
+| `format-detective` | investigate | opus | detection heuristics, magic numbers, version sniffing, `inspect`/`validate` |
+| `spine-decoder` | code | sonnet | `a2d-spine` — version decoders → Generic Spine IR |
+| `cubism-decoder` | code | sonnet | `a2d-cubism` — moc3/motion3/physics/pose → Generic Cubism model |
+| `unity-importer` | code | sonnet | `a2d-unity`, `a2d-import` — bundle spelunking, asset reconstruction |
+| `animation-runtime` | code | sonnet | `a2d-runtime` — timelines, curves, skinning, constraints, mixing |
+| `renderer-engineer` | code | sonnet | `a2d-render` — wgpu, blending, masks, batching, high-DPI |
+| `desktop-host` | code | sonnet | `a2d-desktop` — transparent window, drag, click-through, tray, config |
+| `test-engineer` | code | sonnet | unit/golden/visual-regression harnesses, fixture hygiene |
+| `code-reviewer` | review | opus | correctness, robustness, test quality of a diff |
+| `architecture-guardian` | review | opus | layering/dependency review — run before any merge that touches ≥2 crates |
+
+Standard flow: `researcher` → owning coding agent(s), layer by layer → `code-reviewer` →
+`architecture-guardian` last when ≥2 crates are touched. Skip the research step for changes
+whose location and approach are already known.
 
 ---
 
