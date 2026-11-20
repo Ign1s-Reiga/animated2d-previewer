@@ -94,7 +94,7 @@ fn the_manifest_matches_its_committed_golden() {
     let actual = std::fs::read_to_string(package_dir.join("manifest.json")).unwrap();
     let expected = "\
 {
-  \"formatVersion\": 1,
+  \"formatVersion\": 2,
   \"modelType\": \"spine\",
   \"sourceGame\": \"generic\",
   \"sourceFormat\": \"spine-3.8\",
@@ -153,7 +153,7 @@ fn a_reimported_package_reproduces_the_same_model_bytes() {
 
     let first = std::fs::read(package_dir.join("model.bin")).unwrap();
     let package = a2d_pack::Package::read_from(&package_dir).unwrap();
-    let second = package.encode_model();
+    let second = package.encode_model().unwrap();
     assert_eq!(first, second);
 }
 

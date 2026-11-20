@@ -344,4 +344,33 @@ impl CubismIr {
     pub fn parameter(&self, id: &str) -> Option<&Parameter> {
         self.parameters.iter().find(|p| p.id == id)
     }
+
+    /// The parameter index a motion curve's target names, if any.
+    ///
+    /// The one place targets are resolved: playback binds curves with it and
+    /// validation reports through it, so what is applied and what is reported
+    /// as unresolved cannot disagree.
+    pub fn motion_target(&self, id: &str) -> Option<usize> {
+        self.parameters.iter().position(|p| p.id == id)
+    }
+
+    /// One degradation per motion curve whose target names no parameter.
+    ///
+    /// Playback skips such a curve; this is how it is reported instead of being
+    /// lost silently. Both the model and package validation use it, so the
+    /// wording is identical.
+    pub fn unresolved_motion_targets(&self) -> Vec<crate::Degradation> {
+        let mut out = Vec::new();
+        for m in &self.motions {
+            for c in &m.curves {
+                if self.motion_target(&c.target).is_none() {
+                    out.push(crate::Degradation::MissingReference {
+                        kind: format!("parameter targeted by motion {:?}", m.name),
+                        name: c.target.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
 }

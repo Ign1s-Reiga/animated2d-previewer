@@ -32,7 +32,9 @@ pub fn sample(keys: &[CurveKey], t: f32) -> Option<f32> {
         return Some(k0.value);
     }
     let span = k1.time - k0.time;
-    if span <= f32::EPSILON {
+    // Finite keys can still be far enough apart that the span overflows, which
+    // would turn the division below into 0 * inf. Treat it like a zero span.
+    if !span.is_finite() || span <= f32::EPSILON {
         return Some(k1.value);
     }
     let s = (t - k0.time) / span;
@@ -43,7 +45,10 @@ pub fn sample(keys: &[CurveKey], t: f32) -> Option<f32> {
     let h10 = s3 - 2.0 * s2 + s;
     let h01 = -2.0 * s3 + 3.0 * s2;
     let h11 = s3 - s2;
-    Some(h00 * k0.value + h10 * span * k0.out_slope + h01 * k1.value + h11 * span * k1.in_slope)
+    let v = h00 * k0.value + h10 * span * k0.out_slope + h01 * k1.value + h11 * span * k1.in_slope;
+    // Huge opposite tangent terms can still overflow to inf - inf. A finite key
+    // value is a better answer than NaN, which `Parameter::clamp` lets through.
+    Some(if v.is_finite() { v } else { k0.value })
 }
 
 /// Maps a playhead onto a motion of `duration` seconds.
@@ -60,29 +65,6 @@ pub fn wrap_time(t: f32, duration: f32, looping: bool) -> f32 {
     } else {
         t.clamp(0.0, duration)
     }
-}
-
-/// Every curve whose target names no parameter of the model, as
-/// `(motion name, target)`.
-///
-/// Evaluation ignores these. They are exposed so an importer can turn each one
-/// into a named degradation rather than losing it silently.
-pub fn unresolved_targets(ir: &CubismIr) -> Vec<(&str, &str)> {
-    let mut out = Vec::new();
-    for m in &ir.motions {
-        for c in &m.curves {
-            if resolve(ir, &c.target).is_none() {
-                out.push((m.name.as_str(), c.target.as_str()));
-            }
-        }
-    }
-    out
-}
-
-/// The parameter index a curve target names. The one place targets are resolved,
-/// so what playback applies and what is reported as unresolved cannot disagree.
-fn resolve(ir: &CubismIr, target: &str) -> Option<usize> {
-    ir.parameters.iter().position(|p| p.id == target)
 }
 
 /// A motion being played: its curves bound to parameter indices once, plus a
@@ -105,8 +87,8 @@ impl MotionPlayer {
         let mut bindings = Vec::new();
         for (ci, c) in m.curves.iter().enumerate() {
             // A curve that resolves to nothing is simply not bound; it is
-            // reported through `unresolved_targets`.
-            if let Some(pi) = resolve(ir, &c.target) {
+            // reported through `CubismIr::unresolved_motion_targets`.
+            if let Some(pi) = ir.motion_target(&c.target) {
                 bindings.push((ci, pi));
             }
         }
@@ -207,6 +189,24 @@ mod tests {
         // 0.5*1 + 0.125*2*1 + 0.5*2 + (-0.125)*2*(-1) = 0.5 + 0.25 + 1 + 0.25 = 2.0
         let keys = [key(0.0, 1.0, 0.0, 1.0), key(2.0, 2.0, -1.0, 0.0)];
         assert!((sample(&keys, 1.0).unwrap() - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_span_that_overflows_does_not_produce_nan() {
+        // Both times are finite but their difference is inf.
+        let keys = [key(-3e38, 1.0, 0.0, 0.0), key(3e38, 2.0, 0.0, 0.0)];
+        let v = sample(&keys, 0.0).unwrap();
+        assert!(v.is_finite(), "{v}");
+    }
+
+    #[test]
+    fn opposite_huge_tangents_do_not_produce_nan() {
+        // h10 * span * out_slope and h11 * span * in_slope overflow with
+        // opposite signs, so their sum would be inf - inf.
+        let keys = [key(0.0, 1.0, 0.0, 3e38), key(4000.0, 2.0, 3e38, 0.0)];
+        let v = sample(&keys, 2000.0).unwrap();
+        assert!(v.is_finite(), "{v}");
+        assert_eq!(v, 1.0, "falls back to the segment's starting value");
     }
 
     #[test]

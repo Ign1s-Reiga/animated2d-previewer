@@ -43,4 +43,3 @@ pub use moc3::{
     MotionCurve, Parameter, ParameterBinding, RotationDeformer, RotationKeyform, WarpDeformer,
 };
 pub use model::GenericCubismModel;
-pub use motion::unresolved_targets;

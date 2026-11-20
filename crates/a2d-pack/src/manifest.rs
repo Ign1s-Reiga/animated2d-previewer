@@ -8,8 +8,12 @@ use a2d_core::DecodeError;
 use serde::{Deserialize, Serialize};
 
 /// Current package layout version. Bump on any change to `model.bin`'s layout
-/// or to this manifest's required fields.
-pub const FORMAT_VERSION: u32 = 1;
+/// or to this manifest's required fields. Readers accept every version up to
+/// this one; writers always write this one.
+///
+/// * 1 -- first layout.
+/// * 2 -- Cubism `model.bin` gains its motion table. Spine is unchanged.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Which runtime family loads this package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

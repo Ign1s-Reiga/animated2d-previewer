@@ -476,9 +476,9 @@ fn render_cubism_bundle(out: &mut dyn std::io::Write, bytes: &[u8], frames_dir: 
 
 /// Renders a Cubism package's model to a single posed frame.
 ///
-/// A package carries no motions -- Unity turned them into `AnimationClip`s and
-/// nothing decodes those yet -- so there is one frame to render rather than the
-/// timestamps a Spine package gets. Loading it here rather than in
+/// This renders one posed frame rather than the timestamps a Spine package
+/// gets: the viewer does not open Cubism packages yet, so a package's motions
+/// are not played from here. Loading it here rather than in
 /// `a2d-desktop` is not a shortcut: the host may not depend on a decoder
 /// (spec §3), and building the model is what the shared interface is for.
 fn render_cubism_package(
@@ -611,8 +611,7 @@ pub fn preview(
             return match frames_dir {
                 Some(dir) => render_cubism_package(out, &package, dir, &report),
                 None => Err(DecodeError::UnsupportedFormat(
-                    "a Cubism package has no motions yet, so there is nothing to play;                      render a pose with -o instead"
-                        .into(),
+                    "the viewer does not open Cubism packages yet; render a pose with -o instead".into(),
                 )
                 .into()),
             };

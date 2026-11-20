@@ -245,6 +245,12 @@ pub fn validate_cubism(ir: &CubismIr, textures: &[TextureFile], report: &mut Loa
     if ir.draw_order.is_empty() {
         report.warn(Degradation::Note("no paint sequence; drawables will be painted in model order".into()));
     }
+
+    // Playback skips a curve aimed at a parameter the model lacks. Package
+    // validation never builds the model, so it has to say so itself.
+    for degradation in ir.unresolved_motion_targets() {
+        report.warn(degradation);
+    }
 }
 
 #[cfg(test)]

@@ -22,14 +22,14 @@
 use std::time::Duration;
 
 use a2d_core::{
-    preferred_animation, Aabb, AnimatedModel, AnimationInfo, Degradation, ExpressionInfo, HitAreaId, PlayOptions,
-    RenderList, RuntimeError, TextureId,
+    preferred_animation, Aabb, AnimatedModel, AnimationInfo, ExpressionInfo, HitAreaId, PlayOptions, RenderList,
+    RuntimeError, TextureId,
 };
 
 use crate::emit::CubismEmit;
 use crate::eval::{CubismEval, Pose};
 use crate::moc3::CubismIr;
-use crate::motion::{unresolved_targets, MotionPlayer};
+use crate::motion::MotionPlayer;
 
 /// Cubism's conventional parameter names, and how the idle moves each.
 ///
@@ -314,11 +314,8 @@ impl AnimatedModel for GenericCubismModel {
     fn absorb_degradations(&self, report: &mut a2d_core::LoadReport) {
         // A curve aimed at a parameter the model lacks is not applied; say so
         // rather than letting the motion play with a part of it missing.
-        for (motion, target) in unresolved_targets(&self.moc) {
-            report.warn(Degradation::MissingReference {
-                kind: format!("parameter targeted by motion {motion:?}"),
-                name: target.to_string(),
-            });
+        for degradation in self.moc.unresolved_motion_targets() {
+            report.warn(degradation);
         }
     }
 }
