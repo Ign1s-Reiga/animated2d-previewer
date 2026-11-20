@@ -247,3 +247,72 @@ const SKELETON_JSON: &str = r#"{
   }
 }
 "#;
+
+/// A synthetic Cubism package: one triangle that slides across the canvas as
+/// `ParamAngleX` goes from -30 to 30, and optionally a motion ("idle", two
+/// seconds) that sweeps the parameter over that range.
+///
+/// Built straight as IR rather than from MOC3 bytes, so it exercises the package
+/// path (the one a viewer loads) without any game asset.
+pub fn cubism_package(with_motion: bool) -> a2d_pack::Package {
+    use a2d_core::ir::cubism::{
+        Canvas, CubismIr, CurveKey, Drawable, KeyformBinding, Keyforms, Motion, MotionCurve, Parameter,
+        ParameterBinding,
+    };
+
+    let mut ir = CubismIr {
+        canvas: Canvas { pixels_per_unit: 100.0, origin: (100.0, 100.0), size: (200.0, 200.0) },
+        parameters: vec![Parameter { id: "ParamAngleX".into(), minimum: -30.0, maximum: 30.0, default: 0.0 }],
+        part_ids: vec![],
+        deformer_ids: vec![],
+        drawable_ids: vec!["ArtMesh1".into()],
+        glue_ids: vec![],
+        drawables: vec![Drawable {
+            id: "ArtMesh1".into(),
+            parent_deformer: None,
+            uvs: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+            indices: vec![0, 1, 2],
+            keyform_begin: 0,
+            keyform_count: 2,
+            keyform_binding: 0,
+            masks: vec![],
+            flags: 0,
+            part: None,
+            texture: 0,
+        }],
+        parameter_bindings: vec![ParameterBinding { parameter: 0, keys: vec![-30.0, 30.0] }],
+        keyform_bindings: vec![KeyformBinding { axes: vec![0] }],
+        keyforms: Keyforms {
+            // Two keyforms of three vertices: the triangle on the left, then on the right.
+            positions: vec![-0.9, -0.5, -0.1, -0.5, -0.9, 0.5, 0.1, -0.5, 0.9, -0.5, 0.1, 0.5],
+            warp_offsets: vec![],
+            drawable_offsets: vec![0, 6],
+        },
+        draw_order: vec![0],
+        drawable_keyform_opacities: vec![1.0, 1.0],
+        drawable_keyform_draw_orders: vec![500.0, 500.0],
+        ..CubismIr::default()
+    };
+    if with_motion {
+        let key = |time: f32, value: f32| CurveKey { time, value, in_slope: 30.0, out_slope: 30.0, stepped: false };
+        ir.motions = vec![Motion {
+            name: "idle".into(),
+            duration: 2.0,
+            curves: vec![MotionCurve {
+                target: "ParamAngleX".into(),
+                keys: vec![key(0.0, -30.0), key(2.0, 30.0)],
+                ..MotionCurve::default()
+            }],
+            ..Motion::default()
+        }];
+    }
+
+    let mut package = a2d_pack::Package::from_cubism(ir, "synthetic", "cubism-moc3-v3");
+    package.manifest.textures.push(a2d_pack::TextureEntry {
+        file: "texture_00.png".into(),
+        size: Some([64, 64]),
+        premultiplied_alpha: false,
+    });
+    package.textures.push(a2d_pack::TextureFile { file: "texture_00.png".into(), bytes: Fixture::png(64, 64) });
+    package
+}

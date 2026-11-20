@@ -482,8 +482,11 @@ of the model rather than a re-interpretation of it. A real-asset test asserts
 exactly that: the same bundle, posed from the MOC3 and posed from the package
 written to disk, matches vertex for vertex.
 
-A Cubism package has no motions to play, so `preview` without `-o` refuses and
-says why rather than opening an empty viewer.
+`preview` without `-o` opens either in the desktop viewer, and plays the
+motions the package carries (a bundle goes through the importer first, so the
+motions recovered from its fade motion data come along). With `-o` it writes a
+frame per regression timestamp of the default motion; a model with no motions
+keeps a single rest-pose frame. Only texture page zero is sampled.
 
 ## 8. What is still unverified
 

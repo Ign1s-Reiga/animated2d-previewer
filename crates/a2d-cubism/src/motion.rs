@@ -109,6 +109,14 @@ impl MotionPlayer {
         self.time
     }
 
+    /// Puts the playhead at `t` seconds, clamped to the motion and never
+    /// finished. A non-finite `t` gives the start.
+    pub fn seek(&mut self, ir: &CubismIr, t: f32) {
+        let duration = ir.motions.get(self.motion).map_or(0.0, |m| m.duration);
+        self.time = wrap_time(t, duration, false);
+        self.finished = false;
+    }
+
     /// Whether a non-looping motion has reached its end.
     pub fn is_finished(&self) -> bool {
         self.finished

@@ -7,8 +7,9 @@
 //!
 //! It poses, draws, and plays the motions the model is given
 //! ([`CubismIr::motions`]): [`AnimatedModel::animations`] lists them and
-//! [`AnimatedModel::play_animation`] starts one by name. The Unity importer does
-//! not supply any yet, so a model reconstructed from a bundle has none today.
+//! [`AnimatedModel::play_animation`] starts one by name, and
+//! [`AnimatedModel::pose_at`] poses the model at a timestamp. A model built
+//! straight from a MOC3 has none; one built from an imported package does.
 //! Crossfades and per-curve fades are not applied, and part-opacity targets are
 //! not driven; only parameter curves are.
 //!
@@ -253,6 +254,32 @@ impl AnimatedModel for GenericCubismModel {
             self.pending = None;
             self.start_motion(index, opts.looping, opts.speed);
         }
+        Ok(())
+    }
+
+    /// Poses the model `time` seconds into `animation`, from the parameter
+    /// defaults, so the result does not depend on what played before.
+    ///
+    /// `time` is clamped to the motion (not wrapped), matching the Spine side:
+    /// asking for the end shows the final frame. Afterwards the motion is the
+    /// current one, looping, with its playhead at `time`; anything queued is
+    /// dropped. The synthetic idle is not applied.
+    fn pose_at(&mut self, animation: &str, time: f32) -> Result<(), RuntimeError> {
+        let index = self
+            .animations
+            .iter()
+            .position(|a| a.name == animation)
+            .ok_or_else(|| RuntimeError::UnknownAnimation(animation.to_string()))?;
+        self.pending = None;
+        self.motion = MotionPlayer::new(&self.moc, index, true, 1.0);
+        if let Some(player) = &mut self.motion {
+            player.seek(&self.moc, time);
+        }
+        self.reset_values();
+        if let Some(player) = &self.motion {
+            player.apply(&self.moc, &mut self.values);
+        }
+        self.repose();
         Ok(())
     }
 
@@ -656,5 +683,63 @@ mod tests {
         assert_eq!(player.motion_index(), 1);
         // Ten steps is 1.0 s; A ended at 0.95 s, so B is 0.05 s in.
         assert!((player.playhead() - 0.05).abs() < 1e-3, "{}", player.playhead());
+    }
+
+    #[test]
+    fn pose_at_samples_the_motion_at_a_timestamp() {
+        let mut m = with_three(vec![sweep("S", "ParamExtra", 8.0)]);
+        m.pose_at("S", 1.0).expect("known");
+        // Linear 0 -> 8 over two seconds, one second in.
+        assert!((value(&m, "ParamExtra") - 4.0).abs() < 1e-4, "{}", value(&m, "ParamExtra"));
+        m.pose_at("S", 0.25).expect("known");
+        assert!((value(&m, "ParamExtra") - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pose_at_does_not_depend_on_what_happened_before() {
+        let motions = vec![sweep("S", "ParamExtra", 8.0), hold("H", "ParamEyeLOpen", 0.25)];
+        let mut fresh = with_three(motions.clone());
+        fresh.pose_at("S", 0.5).expect("known");
+
+        let mut used = with_three(motions);
+        used.play_animation("H", PlayOptions::once()).expect("known");
+        used.play_animation("S", PlayOptions::looping().queued()).expect("known");
+        for _ in 0..7 {
+            used.update(Duration::from_millis(130)).expect("update");
+        }
+        used.set_parameter("ParamAngleX", 5.0);
+        used.pose_at("S", 0.5).expect("known");
+
+        assert_eq!(used.values, fresh.values);
+        assert_eq!(used.pose().drawables.len(), fresh.pose().drawables.len());
+        let (mut a, mut b) = (RenderList::new(), RenderList::new());
+        used.emit(&mut a);
+        fresh.emit(&mut b);
+        assert_eq!(a.meshes().len(), b.meshes().len());
+        for (x, y) in a.meshes().iter().zip(b.meshes()) {
+            assert_eq!(x.vertices, y.vertices);
+        }
+        // The other motion's parameter is back at rest, not left where it was.
+        let eye_default = used.moc().parameter("ParamEyeLOpen").expect("present").default;
+        assert_eq!(value(&used, "ParamEyeLOpen"), eye_default);
+    }
+
+    #[test]
+    fn pose_at_clamps_beyond_the_ends() {
+        let mut m = with_three(vec![sweep("S", "ParamExtra", 8.0)]);
+        m.pose_at("S", 99.0).expect("known");
+        assert!((value(&m, "ParamExtra") - 8.0).abs() < 1e-4, "the final frame, not a wrap to the start");
+        m.pose_at("S", -3.0).expect("known");
+        assert_eq!(value(&m, "ParamExtra"), 0.0);
+        m.pose_at("S", f32::NAN).expect("known");
+        assert_eq!(value(&m, "ParamExtra"), 0.0);
+    }
+
+    #[test]
+    fn pose_at_an_unknown_animation_is_an_error() {
+        let mut m = with_three(vec![sweep("S", "ParamExtra", 8.0)]);
+        let err = m.pose_at("Nope", 0.0).unwrap_err();
+        assert!(matches!(err, RuntimeError::UnknownAnimation(_)), "{err}");
+        assert!(matches!(model().pose_at("S", 0.0), Err(RuntimeError::UnknownAnimation(_))));
     }
 }

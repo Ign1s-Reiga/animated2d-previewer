@@ -60,9 +60,9 @@ pub struct LoadedModel {
 /// attack reaches twice its own height would otherwise be framed differently
 /// depending on when the camera happened to be asked.
 ///
-/// A model that cannot be posed at a timestamp -- the Cubism family, whose
-/// motions are not decoded -- falls back to whatever it reports now, which for
-/// those is the canvas and already stable.
+/// A model that cannot be posed at a timestamp falls back to whatever it
+/// reports now. A Cubism model can be posed, but its bounds are the canvas, so
+/// sampling it yields the same stable box.
 fn frame_of(model: &mut dyn AnimatedModel) -> Aabb {
     let opening = model.default_animation().map(str::to_string);
     let Some(name) = opening else { return model.bounds() };
@@ -448,8 +448,9 @@ mod tests {
 
     #[test]
     fn a_model_that_cannot_seek_is_framed_by_what_it_reports() {
-        // The Cubism family: its motions are not decoded, and its bounds are
-        // the canvas, which does not move anyway.
+        // A model with no timestamp seeking and no animations: its bounds are
+        // used as they are (a Cubism model's are the canvas, which does not
+        // move anyway).
         struct Fixed;
         impl AnimatedModel for Fixed {
             fn update(&mut self, _dt: Duration) -> Result<(), a2d_core::RuntimeError> {

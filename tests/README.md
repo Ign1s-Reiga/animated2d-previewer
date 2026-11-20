@@ -39,6 +39,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | Constraint geometry | `crates/a2d-runtime/src/spine/pose.rs` | IK, the four transform-constraint modes, and path constraints against hand-computed geometry — a straight path and a square one have exactly known arc lengths |
 | Viewer behaviour | `crates/a2d-desktop/src/{config,state,tray}.rs` | config persistence and clamping, drag/scale/selection, tray id mapping — all without opening a window |
 | Subprocess | `crates/a2d-cli/tests/viewer_process.rs` | the real binary runs a hidden window, renders and presents frames, and writes settings on the way out |
+| Cubism preview | `crates/a2d-cli/tests/cubism_preview.rs`, `viewer_process.rs` | a synthetic Cubism package opens in a hidden window and presents frames; `preview -o` writes a frame per regression timestamp of its motion, or one rest-pose frame without motions |
 | Visible window | `crates/a2d-cli/tests/viewer_process.rs` | the visible draw trigger (`request_redraw` / `RedrawRequested`) that hidden runs bypass — `#[ignore]`, gated on `A2D_VISIBLE_VIEWER_TESTS` |
 
 ## Tests that need a real asset
