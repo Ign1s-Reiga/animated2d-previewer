@@ -776,7 +776,7 @@ fn print_moc3(
     writeln!(out, "  mesh:        {vertices} vertices, {triangles} triangles")?;
     writeln!(
         out,
-        "  keyforms:    {} ({} warp, {} drawable; not yet evaluated, so no pose)",
+        "  keyforms:    {} ({} warp, {} drawable)",
         model.keyforms.len(),
         model.keyforms.warp_offsets.len(),
         model.keyforms.drawable_offsets.len()
@@ -980,7 +980,7 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<()
     print_report(out, &report)?;
     writeln!(
         out,
-        "\nReconstruction is not implemented yet: this reports what the bundle holds, \nnot a package that can be loaded."
+        "\nThis reports what the bundle holds. `animated2d import` reconstructs a loadable \npackage from it, and `animated2d preview` opens it directly."
     )?;
     Ok(())
 }
