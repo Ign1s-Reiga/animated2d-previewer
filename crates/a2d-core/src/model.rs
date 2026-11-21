@@ -107,15 +107,31 @@ pub struct ExpressionInfo {
 ///   opens mid-attack with the camera fitted to a swing twice the character's
 ///   height.
 ///
+/// * `normal` and `wait`: both exact names first (`normal` before `wait`), then
+///   names with `normal` as a whole part, then `wait` as a whole part. A part
+///   is a run of letters, so names split on `_`, `-`, `.`, spaces and digits:
+///   `Live_normal` and `pose_wait_01` match; `abnormal`, `await` and
+///   `waitress` do not. Cubism models commonly ship mood motions
+///   (`<prefix>_happy`, `_normal`, `_shy`) and no idle, where the first by name
+///   is an arbitrary mood rather than the resting face;
+/// * otherwise the first animation.
+///
 /// `stop` is deliberately not in the list: it reads as a standing pose but is
 /// a zero-length one on every rig seen, so it has nothing to play.
 pub fn preferred_animation(all: &[AnimationInfo]) -> Option<&str> {
     let exact = |want: &str| all.iter().find(|a| a.name.eq_ignore_ascii_case(want));
     let loose = |want: &str| all.iter().find(|a| a.name.to_ascii_lowercase().contains(want));
+    let part = |want: &str| {
+        all.iter().find(|a| a.name.split(|c: char| !c.is_ascii_alphabetic()).any(|p| p.eq_ignore_ascii_case(want)))
+    };
     exact("idle")
         .or_else(|| loose("idle"))
         .or_else(|| exact("stand"))
         .or_else(|| loose("stand"))
+        .or_else(|| exact("normal"))
+        .or_else(|| exact("wait"))
+        .or_else(|| part("normal"))
+        .or_else(|| part("wait"))
         .or_else(|| all.first())
         .map(|a| a.name.as_str())
 }
@@ -153,7 +169,7 @@ pub trait AnimatedModel {
     /// Name the viewer should show. Defaults to the package display name.
     fn display_name(&self) -> &str;
 
-    /// A sensible animation to start with: `idle` if present, else the first.
+    /// A sensible animation to start with; see [`preferred_animation`].
     ///
     /// The rule is the same for every runtime family, so it lives here rather
     /// than being restated per model.
@@ -216,6 +232,46 @@ mod tests {
         // It reads like one but is zero-length on every rig seen, so there
         // would be nothing to play.
         assert_eq!(preferred_animation(&named(&["Hitaction_1", "Stop"])), Some("Hitaction_1"));
+    }
+
+    #[test]
+    fn stand_beats_normal_and_idle_beats_both() {
+        assert_eq!(preferred_animation(&named(&["pose_normal", "pose_stand"])), Some("pose_stand"));
+        assert_eq!(preferred_animation(&named(&["pose_normal", "pose_stand", "pose_idle"])), Some("pose_idle"));
+    }
+
+    #[test]
+    fn normal_beats_wait_and_wait_beats_first() {
+        assert_eq!(preferred_animation(&named(&["pose_happy", "pose_wait", "pose_normal"])), Some("pose_normal"));
+        assert_eq!(preferred_animation(&named(&["pose_happy", "pose_shy", "pose_wait"])), Some("pose_wait"));
+    }
+
+    #[test]
+    fn exact_names_beat_substrings_and_case_is_ignored() {
+        assert_eq!(preferred_animation(&named(&["pose_normal", "NORMAL"])), Some("NORMAL"));
+        assert_eq!(preferred_animation(&named(&["pose_wait", "Wait"])), Some("Wait"));
+        assert_eq!(preferred_animation(&named(&["pose_happy", "Pose_NORMAL"])), Some("Pose_NORMAL"));
+    }
+
+    #[test]
+    fn both_exact_names_beat_either_partial_match() {
+        assert_eq!(preferred_animation(&named(&["wait", "normal_attack"])), Some("wait"));
+        assert_eq!(preferred_animation(&named(&["wait", "normal"])), Some("normal"));
+    }
+
+    #[test]
+    fn normal_and_wait_match_whole_name_parts_only() {
+        for name in ["x_abnormal", "await", "waitress", "normality"] {
+            assert_eq!(preferred_animation(&named(&["pose_happy", name])), Some("pose_happy"), "{name}");
+        }
+        for name in ["Live_normal", "pose_wait_01", "pose-normal2", "a.wait"] {
+            assert_eq!(preferred_animation(&named(&["pose_happy", name])), Some(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn no_match_falls_back_to_the_first_animation() {
+        assert_eq!(preferred_animation(&named(&["pose_happy", "pose_shy", "pose_smile"])), Some("pose_happy"));
     }
 
     #[test]
