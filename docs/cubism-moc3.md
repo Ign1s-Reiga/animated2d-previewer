@@ -324,8 +324,8 @@ is ordinary data, not a rare special case. Reading it is optional: a layout
 without it leaves every base at zero, which is exactly how the chain behaved
 before the field was identified.
 
-Constraints are applied in the order the chain is walked, from the drawable
-outward to the root.
+Deformers are resolved parents first, from the root down, and a drawable is then
+carried through its resolved parent alone (section 4).
 
 ### Which way is up
 
@@ -355,33 +355,61 @@ The earlier reasoning held that the sign should be positive because `a2d-unity`
 flips Unity's bottom-up rows when it reads a `Texture2D`. That flip is real; the
 conclusion drawn from it was not.
 
-### The scale rule
+### How deformers compose
 
-**Every space in a model is canvas pixels, with one exception: a warp
-deformer's children live in its unit square.** A rotation deformer sitting under
-a warp is therefore the one place a unit conversion is needed.
+Deformers are resolved into canvas space **parents first**; a drawable is then
+carried through its resolved parent only.
 
-The exchange rate is the warp's own grid extent — the grid spans the parent's
-space while the children span zero to one — and it **accumulates**: a warp
-nested in another warp measures its grid in that warp's units, not in pixels, so
-the rates multiply down the chain. Missing the accumulation makes shallow chains
-look almost right and deep ones wrong by a factor of a thousand.
+- **Warp.** Its grid is carried through its parent, so the lookup lands in
+  canvas space. It adds no scale: its total scale is its parent's, one at the
+  root.
+- **Rotation under a rotation.** Origin through the parent, angles add, scales
+  multiply.
+- **Rotation under a warp.** Only a *position* and an *angle* come from the
+  warp. The origin goes through the warp; the turn is the direction of a short
+  probe along the warp's own up axis (`0.1` of its unit square, retried from
+  the other side and shorter, up to ten times) against where an unbent warp
+  would point it. Total scale is the parent's times the rotation's own. **A
+  warp lends no scale**, and everything beneath the rotation stays rigid.
+  If the warp is squashed so flat that no probe has a direction, the rotation
+  keeps its origin and its own angle and the model keeps posing.
 
-Rates are taken from the *posed* grids rather than the setup ones, so a warp
-that stretches carries its children with it.
-
+A point in a rotation's frame lands at `origin + R(angle) * (p * total scale)`,
+where a rotation's total scale is the product of every rotation scale above it.
 The root rotation is the pixels-to-units bridge: its scale is the reciprocal of
-the canvas's pixels-per-unit. On one model, scale `0.00026192` against a canvas
-of 3792 px/unit — reciprocal 3818 — exactly as the transform predicts.
+the canvas's pixels-per-unit (`0.00026192` against 3792 px/unit, reciprocal
+3818, on one model).
 
-How the rule was found is worth recording, because it was not found by
-statistics. Dumping one small model's deformer tree in full and reading it gave
-three consecutive lines: a warp with a grid spanning `-627..686` pixels, a
-rotation under it sitting at `(0.501, 0.500)` — dead centre of a unit square —
-and *that* rotation's own child back at `(305.6, -48.5)`, pixels again.
-`0.501 + 305.6/1312` lands at `0.734`, inside the square. Aggregate
-correlation-hunting produced three separately confounded results before that;
-one readable tree settled it.
+**Evidence.**
+
+- The Cubism Editor manual, on a warp parent with a rotation child: moving the
+  warp's control points makes the rotation and its children "move and rotate
+  rather than deform".
+- *Texture proportions.* A rigid mesh -- one keyform, hung off a rotation -- is
+  an exact similarity of its texture layout. Posed under this rule it stays
+  one to within `1e-5` on three real models, across every sampled frame of
+  every motion. Under the previous rule (a per-axis unit taken from the warp's
+  bounding box, children pushed through the warp's bilinear lookup) a hem
+  panel was 4.2:1 against its texture, and fabric strands pumped between about
+  0.5 and 3.4 times their size within one motion.
+- *Twin meshes.* Models carry identical local meshes on two independent chains
+  (one through several warps and rotations, one under a root warp). Their posed
+  sizes agree exactly under this rule and differed by up to 14% under the old.
+- Glue closure at rest never got worse (a model's closed glues: 97 -> 98 of
+  121; others unchanged).
+
+An earlier version of this section said the exchange rate between a warp and a
+rotation under it was the warp's grid extent, and that forcing the rate
+isotropic "changes no model measurably". The second claim was false: on one
+model it takes a hem panel from 4.2:1 to 1:1. What the earlier reading got right
+is the observation it started from -- a rotation sitting at `(0.501, 0.500)`
+under a warp, dead centre of the unit square, with its own child back at
+pixel-sized coordinates. The origin is a position in the warp; the child lives
+in the rotation's own space. What it got wrong was inferring that the warp
+rescales that space.
+
+Canvas fit could not have caught this: the old rule landed every drawable
+inside its canvas. Only the texture could.
 
 ## 5. Stored defaults are not display values
 
@@ -562,16 +590,22 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
   much stronger than landing in the right frame, but a picture that looks right
   cannot show that a particular warp bends the way Live2D bends it, or that
   blending weights are right *between* keys rather than only on them.
-- **Motions.** A package carries none, so a Cubism model poses and draws but
-  does not move. See below.
-- **The unit conversion between a warp and a rotation under it.** It takes the
-  warp's posed bounding box per axis, which is exact for an axis-aligned
-  lattice and approximate for a turned one. Reading the setup grid instead, or
-  forcing the rate isotropic, changes no model measurably, so nothing available
-  here distinguishes them.
+- **Rotation under a warp.** The rule in section 4 is checked against texture
+  proportions and the editor manual, not a reference runtime. Three points
+  within it are open: the probe length (`0.1` of the unit square, from memory
+  of the Cubism 2 SDK, not confirmed for later versions; `0.01` moves a vertex
+  by at most `1.1e-3` canvas units on the worst model measured); warp inside
+  warp, where the child's grid is carried through the parent rather than each
+  point being walked through both (up to `0.02` canvas units apart at rest,
+  `0.06` in motion); and glue where a gap exists at rest (the widest is `0.3`
+  canvas units on one model), which pulls a mesh towards its partner and can
+  still stretch it. Whether Cubism shows the same pull needs a reference.
 - **Motions.** The bundles' animations are Unity `AnimationClip`s in the
-  compressed muscle-clip form, not `motion3.json`. They are not decoded, so a
-  model poses and draws but does not play its own animation.
+  compressed muscle-clip form, not `motion3.json`. Their parameter curves are
+  recovered and carried in the package as keyed Hermite segments, so a model
+  plays its own animations. What is not applied is fading: the stored fade
+  fields are kept, but playback neither crossfades nor ramps a curve, and the
+  bundles examined carried no fade data to read.
 - **Physics, pose files, expressions, hit areas.** All live outside the MOC3 and
   are not read.
 - **Animated draw order.** Section 69 is decoded but unused: turning the
