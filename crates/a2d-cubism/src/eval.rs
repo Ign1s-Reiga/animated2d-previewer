@@ -82,6 +82,10 @@
 //!   widest is `0.3` canvas units on one model) and no choice of parameters
 //!   closes the worst one. Glue pulls such a pair together, which can still
 //!   stretch a mesh. Whether Cubism shows the same pull needs a reference.
+//! * Glue toward a hidden mesh. A glue is applied whatever the opacity of
+//!   either mesh. On one model that drags a visible mesh 0.6 canvas units
+//!   towards a fully transparent, static partner. Whether Cubism skips it is
+//!   unknown.
 //!
 //! # The grid orientation, and how it was found
 //!
@@ -206,6 +210,18 @@
 //! exactly at the default pose on every glue of a real model. The rule closes
 //! the gap in rendered output; it has not been compared with a reference
 //! runtime, and only an intensity of one has been seen in real data.
+//!
+//! A pair closes by `I * (wa + wb)` of its gap, not always all of it. Weights
+//! summing below one are real data (seen on two of three real models): the
+//! Cubism Editor lets an artist partly or fully release glued vertices
+//! (<https://docs.live2d.com/en/cubism-editor-manual/glue>), so such a pair is
+//! left open on purpose and is not a decoding error. One vertex was also seen
+//! in two glues; file order is applied and is unverified. Which weight belongs
+//! to which mesh is supported by seam geometry (a pair's share `wa / (wa + wb)`
+//! rises towards mesh B in all 282 glues whose weights vary, and swapping the
+//! weights raises triangle flips) but not by a reference runtime. Open: a glue
+//! can pull a visible mesh towards a fully transparent partner, and it is not
+//! known whether Cubism skips such a glue, as this code does not.
 //!
 //! # What is still unverified
 //!
@@ -1042,6 +1058,92 @@ mod tests {
             mid_raw.drawables[0][1].1 + (mid_raw.drawables[1][1].1 - mid_raw.drawables[0][1].1) * 0.25 * 0.5,
         );
         assert!(close(mid.drawables[0][1], a), "{:?} vs {a:?}", mid.drawables[0][1]);
+    }
+
+    /// The glue-cleared pose at 30 degrees, for the tests below.
+    fn raw_at_30() -> Pose {
+        let mut raw_moc = glued_pair(&[1.0; 3]);
+        raw_moc.glues.clear();
+        raw_moc.pose(&[30.0])
+    }
+
+    #[test]
+    fn a_partly_released_pair_closes_only_its_share() {
+        // Weights summing below one are real data (the editor lets an artist
+        // release glued vertices), so the pair must close by exactly
+        // I * (wa + wb) of its gap. Pair one gets 0.3 and 0.2 here.
+        let mut moc = glued_pair(&[1.0; 3]);
+        moc.glues[0].pairs[0].weight_a = 0.3;
+        moc.glues[0].pairs[0].weight_b = 0.2;
+        let raw = raw_at_30();
+        let pose = moc.pose(&[30.0]);
+        // A = (1, 0) and B = (cos 30, sin 30) in the file's space; y flips.
+        let (c, s) = (30f32.to_radians().cos(), 30f32.to_radians().sin());
+        let (a, b) = ((1.0, 0.0f32), (c, -s));
+        let expect_a = (a.0 + 0.3 * (b.0 - a.0), a.1 + 0.3 * (b.1 - a.1));
+        let expect_b = (b.0 + 0.2 * (a.0 - b.0), b.1 + 0.2 * (a.1 - b.1));
+        assert!(close(pose.drawables[0][1], expect_a), "{:?} vs {expect_a:?}", pose.drawables[0][1]);
+        assert!(close(pose.drawables[1][1], expect_b), "{:?} vs {expect_b:?}", pose.drawables[1][1]);
+        // The gap left is (1 - 0.5) of the one the pose had without glue.
+        let before = dist(raw.drawables[0][1], raw.drawables[1][1]);
+        let after = dist(pose.drawables[0][1], pose.drawables[1][1]);
+        assert!(before > 0.1, "the premise is a gap");
+        assert!((after - 0.5 * before).abs() < 1e-5, "{after} vs half of {before}");
+    }
+
+    #[test]
+    fn a_fully_released_pair_stays_where_its_chains_put_it() {
+        let mut moc = glued_pair(&[1.0; 3]);
+        moc.glues[0].pairs[0].weight_a = 0.0;
+        moc.glues[0].pairs[0].weight_b = 0.0;
+        let raw = raw_at_30();
+        let pose = moc.pose(&[30.0]);
+        assert_eq!(pose.drawables[0][1], raw.drawables[0][1]);
+        assert_eq!(pose.drawables[1][1], raw.drawables[1][1]);
+        // The other pair of the same glue still closes.
+        assert!(close(pose.drawables[0][2], pose.drawables[1][2]));
+    }
+
+    #[test]
+    fn one_sided_weights_move_only_one_mesh() {
+        let mut moc = glued_pair(&[1.0; 3]);
+        moc.glues[0].pairs[0].weight_a = 1.0;
+        moc.glues[0].pairs[0].weight_b = 0.0;
+        let raw = raw_at_30();
+        let pose = moc.pose(&[30.0]);
+        // A lands exactly on B's un-glued position and B does not move.
+        assert!(close(pose.drawables[0][1], raw.drawables[1][1]), "{:?}", pose.drawables);
+        assert_eq!(pose.drawables[1][1], raw.drawables[1][1]);
+    }
+
+    #[test]
+    fn a_vertex_in_two_glues_sees_the_earlier_glues_result() {
+        // UNVERIFIED against Cubism: this pins the order the code chose (file
+        // order, each glue reading what the ones before it wrote). One real
+        // model names a single vertex twice and no one-pass order closes both
+        // of its glues, so the rule is a guess; change this test with it.
+        let mut moc = glued_pair(&[1.0; 3]);
+        let mut second = moc.glues[0].clone();
+        // Mesh 1 vertex 1 is already in the first glue; pull it fully onto
+        // mesh 0 vertex 2, which is also already named there.
+        second.mesh_a = 1;
+        second.mesh_b = 0;
+        second.pairs = vec![a2d_core::ir::cubism::GluePair { vertex_a: 1, vertex_b: 2, weight_a: 1.0, weight_b: 0.0 }];
+        moc.glues.push(second);
+        let raw = raw_at_30();
+        let pose = moc.pose(&[30.0]);
+        // The first glue puts pair two (0.5, 0.5) on the midpoint of its raw
+        // positions and pair one on 0.75 A + 0.25 B.
+        let (a1, b1) = (raw.drawables[0][1], raw.drawables[1][1]);
+        let (a2, b2) = (raw.drawables[0][2], raw.drawables[1][2]);
+        let mid2 = (0.5 * (a2.0 + b2.0), 0.5 * (a2.1 + b2.1));
+        let p1 = (0.75 * a1.0 + 0.25 * b1.0, 0.75 * a1.1 + 0.25 * b1.1);
+        // The second then moves mesh 1 vertex 1 onto what mesh 0 vertex 2 is
+        // by then: the midpoint, not its raw position.
+        assert!(close(pose.drawables[0][1], p1), "{:?}", pose.drawables);
+        assert!(close(pose.drawables[1][1], mid2), "{:?} vs {mid2:?}", pose.drawables[1][1]);
+        assert!(close(pose.drawables[0][2], mid2));
+        assert!(close(pose.drawables[1][2], mid2));
     }
 
     #[test]

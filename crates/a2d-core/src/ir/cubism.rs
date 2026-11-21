@@ -226,7 +226,12 @@ pub struct WarpDeformer {
 ///
 /// Each vertex moves towards the other in proportion to its own weight. When
 /// the two weights of a pair sum to one and `I` is one, both land on the same
-/// point.
+/// point. Otherwise the pair closes by `I * (wa + wb)` of its gap, leaving
+/// `|1 - I(wa + wb)|` of it (a sum above one crosses over). Sums below one occur in real models, where the editor lets an
+/// artist partly or fully release glued vertices
+/// (<https://docs.live2d.com/en/cubism-editor-manual/glue>). A vertex may also
+/// be named by more than one glue; they apply in file order, which is
+/// unverified against Cubism.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Glue {
     /// The two meshes, as indices into [`CubismIr::drawables`].
@@ -251,6 +256,8 @@ pub struct GluePair {
     /// A vertex of [`Glue::mesh_b`], local to that drawable.
     pub vertex_b: u32,
     /// How far the vertex on mesh A moves towards mesh B's, at full intensity.
+    /// Which weight belongs to which mesh is inferred from seam geometry, not
+    /// from a reference runtime.
     pub weight_a: f32,
     /// How far the vertex on mesh B moves towards mesh A's, at full intensity.
     pub weight_b: f32,
