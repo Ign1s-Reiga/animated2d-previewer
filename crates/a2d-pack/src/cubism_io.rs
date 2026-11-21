@@ -9,6 +9,11 @@
 //! * Version 1: everything up to and including the per-keyform draw orders.
 //!   Motions did not exist in the IR, so a version 1 model reads with none.
 //! * Version 2: appends the motion table.
+//! * Version 3: appends the glue table (`glues: seq`, `glue_intensities: f32 seq`).
+//!   A glue is `mesh_a, mesh_b, keyform_binding, keyform_begin, keyform_count: u32`
+//!   then `pairs: seq` of `vertex_a, vertex_b: u32, weight_a, weight_b: f32`.
+//!   A version 2 model reads with no glue; its package validates with a note
+//!   telling the user to re-import.
 //!
 //! A motion is `name: str, duration: f32, fade_in: f32, fade_out: f32,
 //! curves: seq`. A curve is `target: str, fade_in: opt f32, fade_out: opt f32,
@@ -54,6 +59,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     for m in &ir.motions {
         validate_motion(m)?;
     }
+    validate_glues(ir)?;
     write_canvas(w, &ir.canvas);
     w.seq(&ir.parameters, write_parameter);
     write_ids(w, &ir.part_ids);
@@ -74,6 +80,10 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     // Added in format version 2. Always written, so a motion-less model still
     // carries a zero count rather than ending early.
     w.seq(&ir.motions, write_motion);
+    // Added in format version 3, after the motions so that a version 2 model
+    // is a prefix of a version 3 one.
+    w.seq(&ir.glues, write_glue);
+    w.f32_seq(&ir.glue_intensities);
     Ok(())
 }
 
@@ -81,7 +91,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
 ///
 /// `version` is the format version from the `model.bin` header. A version 1
 /// model ends after the draw-order tracks and has no motions; version 2 adds
-/// the motion table. The layout is chosen by the header, never inferred from
+/// the motion table and version 3 the glue table. The layout is chosen by the header, never inferred from
 /// how many bytes happen to remain.
 pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     let mut ir = CubismIr {
@@ -91,6 +101,8 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
         deformer_ids: read_ids(r, "deformer id")?,
         drawable_ids: read_ids(r, "drawable id")?,
         glue_ids: read_ids(r, "glue id")?,
+        glues: Vec::new(),
+        glue_intensities: Vec::new(),
         drawables: r.seq("drawable", 32, read_drawable)?,
         warp_deformers: r.seq("warp deformer", 24, read_warp)?,
         rotation_deformers: r.seq("rotation deformer", 20, read_rotation)?,
@@ -107,8 +119,105 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     if version >= 2 {
         ir.motions = r.seq("motion", 20, read_motion)?;
     }
+    if version >= 3 {
+        ir.glues = r.seq("glue", 24, read_glue)?;
+        ir.glue_intensities = r.f32_seq()?;
+    }
     validate_references(&ir)?;
+    validate_glues(&ir)?;
     Ok(ir)
+}
+
+/// The one set of rules for glue, applied by the writer before it emits a byte
+/// and by the reader after it parses the table, like [`validate_motion`].
+///
+/// Everything here is an index that posing would otherwise follow blindly, or
+/// a number it would multiply into a vertex.
+fn validate_glues(ir: &CubismIr) -> Result<(), DecodeError> {
+    if !ir.glues.is_empty() && ir.glues.len() != ir.glue_ids.len() {
+        return Err(DecodeError::corrupt(format!(
+            "the model has {} glue ids but {} glues",
+            ir.glue_ids.len(),
+            ir.glues.len()
+        )));
+    }
+    if ir.glue_intensities.iter().any(|v| !v.is_finite()) {
+        return Err(DecodeError::corrupt("a glue intensity is not finite".to_string()));
+    }
+    for (g, glue) in ir.glues.iter().enumerate() {
+        let mesh = |what: &str, index: u32| -> Result<usize, DecodeError> {
+            let d = ir.drawables.get(index as usize).ok_or_else(|| {
+                DecodeError::corrupt(format!("glue {g} {what} is drawable {index} of {}", ir.drawables.len()))
+            })?;
+            Ok(d.vertex_count())
+        };
+        let vertices_a = mesh("mesh A", glue.mesh_a)?;
+        let vertices_b = mesh("mesh B", glue.mesh_b)?;
+        for (p, pair) in glue.pairs.iter().enumerate() {
+            if pair.vertex_a as usize >= vertices_a || pair.vertex_b as usize >= vertices_b {
+                return Err(DecodeError::corrupt(format!(
+                    "glue {g} pair {p} names vertices {} and {} of meshes with {vertices_a} and {vertices_b}",
+                    pair.vertex_a, pair.vertex_b
+                )));
+            }
+            if !(pair.weight_a.is_finite() && pair.weight_b.is_finite()) {
+                return Err(DecodeError::corrupt(format!("glue {g} pair {p} has a non-finite weight")));
+            }
+        }
+        let binding = ir.keyform_bindings.get(glue.keyform_binding as usize).ok_or_else(|| {
+            DecodeError::corrupt(format!(
+                "glue {g} keyform binding {} of {}",
+                glue.keyform_binding,
+                ir.keyform_bindings.len()
+            ))
+        })?;
+        let mut grid = 1u64;
+        for axis in &binding.axes {
+            let keys = ir.parameter_bindings.get(*axis as usize).map_or(0, |b| b.keys.len() as u64);
+            grid = grid.saturating_mul(keys);
+        }
+        if grid != glue.keyform_count as u64 {
+            return Err(DecodeError::corrupt(format!(
+                "glue {g} has {} keyforms but its parameters imply {grid}",
+                glue.keyform_count
+            )));
+        }
+        let end = glue.keyform_begin as u64 + glue.keyform_count as u64;
+        if end > ir.glue_intensities.len() as u64 {
+            return Err(DecodeError::corrupt(format!(
+                "glue {g} keyforms reach {end}, past the {} intensities stored",
+                ir.glue_intensities.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn write_glue(w: &mut Writer, g: &Glue) {
+    w.u32(g.mesh_a);
+    w.u32(g.mesh_b);
+    w.u32(g.keyform_binding);
+    w.u32(g.keyform_begin);
+    w.u32(g.keyform_count);
+    w.seq(&g.pairs, |w, p| {
+        w.u32(p.vertex_a);
+        w.u32(p.vertex_b);
+        w.f32(p.weight_a);
+        w.f32(p.weight_b);
+    });
+}
+
+fn read_glue(r: &mut Reader<'_>) -> Result<Glue, DecodeError> {
+    Ok(Glue {
+        mesh_a: r.u32()?,
+        mesh_b: r.u32()?,
+        keyform_binding: r.u32()?,
+        keyform_begin: r.u32()?,
+        keyform_count: r.u32()?,
+        pairs: r.seq("glue pair", 16, |r| {
+            Ok(GluePair { vertex_a: r.u32()?, vertex_b: r.u32()?, weight_a: r.f32()?, weight_b: r.f32()? })
+        })?,
+    })
 }
 
 /// Rejects indices that point outside the table they name.
@@ -530,6 +639,8 @@ mod tests {
             deformer_ids: vec!["Rotation1".into(), "Warp1".into()],
             drawable_ids: vec!["ArtMesh1".into(), "ArtMesh2".into()],
             glue_ids: vec![],
+            glues: vec![],
+            glue_intensities: vec![],
             drawables: vec![
                 Drawable {
                     id: "ArtMesh1".into(),
@@ -870,8 +981,10 @@ mod tests {
     #[test]
     fn an_implausible_motion_count_is_refused_before_allocating() {
         let mut bytes = Package::from_cubism(model(), "test", "x").encode_model().unwrap();
-        let at = bytes.len() - 4;
-        bytes[at..].copy_from_slice(&u32::MAX.to_le_bytes());
+        // The motion count is followed by the two empty glue tables, a count
+        // each.
+        let at = bytes.len() - 12;
+        bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("a huge count should be refused");
         assert!(err.to_string().contains("motion count"), "{err}");
     }
@@ -916,5 +1029,120 @@ mod tests {
         let bytes = Package::from_cubism(ir, "test", "x").encode_model().unwrap();
         let err = Package::decode_model(&bytes).expect_err("an offset past the pool should be refused");
         assert!(format!("{err}").contains("past the"), "{err}");
+    }
+
+    /// `with_motions()` plus a glue joining the two drawables, with three
+    /// intensity keyforms over the three-key axis the glue is bound to.
+    fn with_glue() -> CubismIr {
+        let mut ir = with_motions();
+        ir.glue_ids = vec!["Glue1".into()];
+        ir.glues = vec![Glue {
+            mesh_a: 0,
+            mesh_b: 1,
+            keyform_binding: 0,
+            keyform_begin: 0,
+            keyform_count: 3,
+            pairs: vec![
+                GluePair { vertex_a: 1, vertex_b: 2, weight_a: 0.25, weight_b: 0.75 },
+                GluePair { vertex_a: 2, vertex_b: 0, weight_a: 0.5, weight_b: 0.5 },
+            ],
+        }];
+        ir.glue_intensities = vec![1.0, 0.5, 0.25];
+        ir
+    }
+
+    #[test]
+    fn glue_round_trips_and_re_encodes_to_identical_bytes() {
+        let ir = with_glue();
+        let first = Package::from_cubism(ir.clone(), "test", "x").encode_model().unwrap();
+        let PackageModel::Cubism(back) = Package::decode_model(&first).expect("should decode") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert_eq!(back, ir);
+        assert_eq!(Package::from_cubism(back, "test", "x").encode_model().unwrap(), first);
+    }
+
+    #[test]
+    fn a_version_2_model_reads_with_no_glue() {
+        // Generated by the version 2 writer from `with_motions()`, so it keeps
+        // its motions and ends exactly where the glue table now begins.
+        let bytes = include_bytes!("../tests/fixtures/cubism_v2.model.bin");
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 2);
+        let PackageModel::Cubism(ir) = Package::decode_model(bytes).expect("v2 must still load") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert!(ir.glues.is_empty() && ir.glue_intensities.is_empty());
+        assert_eq!(ir, with_motions());
+    }
+
+    #[test]
+    fn a_version_3_header_over_version_2_bytes_is_refused() {
+        let mut bytes = include_bytes!("../tests/fixtures/cubism_v2.model.bin").to_vec();
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        assert!(Package::decode_model(&bytes).is_err());
+    }
+
+    #[test]
+    fn a_package_that_names_glues_it_cannot_apply_says_to_re_import() {
+        let mut ir = with_glue();
+        ir.glues.clear();
+        ir.glue_intensities.clear();
+        let text = Package::from_cubism(ir, "test", "x")
+            .validate()
+            .warnings()
+            .iter()
+            .map(|w| w.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("re-import"), "{text}");
+        let healthy = Package::from_cubism(with_glue(), "test", "x").validate();
+        assert!(healthy.warnings().iter().all(|w| !w.to_string().contains("re-import")));
+    }
+
+    #[test]
+    fn bad_glue_is_refused_by_the_writer_and_the_reader_alike() {
+        type Edit = fn(&mut CubismIr);
+        let cases: [(&str, Edit); 9] = [
+            ("mesh A", |ir| ir.glues[0].mesh_a = 9),
+            ("mesh B", |ir| ir.glues[0].mesh_b = 9),
+            ("names vertices", |ir| ir.glues[0].pairs[0].vertex_a = 3),
+            ("names vertices", |ir| ir.glues[0].pairs[1].vertex_b = 3),
+            ("non-finite weight", |ir| ir.glues[0].pairs[0].weight_b = f32::NAN),
+            ("keyform binding", |ir| ir.glues[0].keyform_binding = 7),
+            ("its parameters imply", |ir| ir.glues[0].keyform_count = 2),
+            ("past the", |ir| ir.glue_intensities.truncate(2)),
+            ("not finite", |ir| ir.glue_intensities[1] = f32::INFINITY),
+        ];
+        for (field, edit) in cases {
+            let mut ir = with_glue();
+            edit(&mut ir);
+            let err = Package::from_cubism(ir, "test", "x").encode_model().expect_err("the writer should refuse");
+            assert!(matches!(err, DecodeError::Corrupt { .. }), "{err:?}");
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
+
+        // And the reader, reached by patching bytes since the writer refuses.
+        // The glue table holds the only run of `0, 1, 0, 0, 3`: mesh A, mesh B,
+        // binding, keyform begin and keyform count.
+        let good = Package::from_cubism(with_glue(), "test", "x").encode_model().unwrap();
+        let needle: Vec<u8> = [0u32, 1, 0, 0, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let at = good.windows(needle.len()).position(|w| w == needle.as_slice()).expect("glue table");
+        let mut bytes = good.clone();
+        bytes[at..at + 4].copy_from_slice(&9u32.to_le_bytes());
+        let err = Package::decode_model(&bytes).expect_err("a dangling mesh should be refused on read");
+        assert!(err.to_string().contains("mesh A"), "{err}");
+    }
+
+    #[test]
+    fn truncating_or_corrupting_glue_bytes_never_panics() {
+        let full = Package::from_cubism(with_glue(), "test", "x").encode_model().unwrap();
+        for cut in 0..full.len() {
+            let _ = Package::decode_model(&full[..cut]);
+        }
+        for at in 8..full.len() {
+            let mut bytes = full.clone();
+            bytes[at] ^= 0xff;
+            let _ = Package::decode_model(&bytes);
+        }
     }
 }

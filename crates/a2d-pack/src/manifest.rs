@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// * 1 -- first layout.
 /// * 2 -- Cubism `model.bin` gains its motion table. Spine is unchanged.
-pub const FORMAT_VERSION: u32 = 2;
+/// * 3 -- Cubism `model.bin` gains its glue table and glue intensities. Spine is
+///   unchanged.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Which runtime family loads this package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

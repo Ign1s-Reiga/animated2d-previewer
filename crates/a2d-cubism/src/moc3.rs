@@ -85,6 +85,7 @@ pub use a2d_core::ir::cubism::{
     RotationDeformer, RotationKeyform, WarpDeformer,
 };
 pub use a2d_core::ir::cubism::{CurveKey, Motion, MotionCurve};
+pub use a2d_core::ir::cubism::{Glue, GluePair};
 
 /// One 64-byte fixed-width identifier slot.
 const ID_LEN: usize = 64;
@@ -107,6 +108,24 @@ mod section {
     pub const PARAMETER_MINIMUMS: usize = 52;
     pub const PARAMETER_DEFAULTS: usize = 53;
     pub const GLUE_IDS: usize = 90;
+    // Glue, sections 91 to 100. Each is per glue except the last three, which
+    // are per pair-list entry and per glue keyform.
+    /// Which keyform binding drives each glue's intensity.
+    pub const GLUE_KEYFORM_BINDING: usize = 91;
+    pub const GLUE_KEYFORM_BEGIN: usize = 92;
+    pub const GLUE_KEYFORM_COUNT: usize = 93;
+    /// The two meshes each glue joins, as drawable indices.
+    pub const GLUE_MESH_A: usize = 94;
+    pub const GLUE_MESH_B: usize = 95;
+    /// Each glue's range in the pair-entry lists below.
+    pub const GLUE_PAIR_BEGIN: usize = 96;
+    pub const GLUE_PAIR_COUNT: usize = 97;
+    /// One weight per pair-list entry. Entries come in twos: weight A, then B.
+    pub const GLUE_WEIGHTS: usize = 98;
+    /// One **u16** vertex index per pair-list entry: vertex in A, then in B.
+    pub const GLUE_VERTICES: usize = 99;
+    /// One intensity per glue keyform.
+    pub const GLUE_INTENSITIES: usize = 100;
 
     pub const DRAWABLE_PARENT_DEFORMERS: usize = 40;
     /// Which part each drawable belongs to. `u32::MAX` for none.
@@ -223,6 +242,10 @@ mod count {
     pub const DRAWABLES: usize = 4;
     pub const PARAMETERS: usize = 5;
     pub const GLUES: usize = 20;
+    /// Total entries across every glue's pair list.
+    pub const GLUE_PAIR_ENTRIES: usize = 21;
+    /// Total glue keyforms.
+    pub const GLUE_KEYFORMS: usize = 22;
     pub const ROTATION_KEYFORMS: usize = 8;
     pub const PARAMETER_BINDING_REFS: usize = 11;
     pub const KEYFORM_BINDINGS: usize = 12;
@@ -361,6 +384,8 @@ impl Moc3 {
         }
         check_keyform_grids(&keyform_bindings, &parameter_bindings, &warp_deformers, &rotation_deformers, &drawables)?;
         let keyforms = read_keyforms(bytes, &sections, &warp_deformers, &drawables)?;
+        let (glues, glue_intensities) =
+            read_glues(bytes, &sections, &counts, &drawables, &keyform_bindings, &parameter_bindings)?;
         let draw_order = {
             let at = section_offset(&sections, section::DRAWABLE_DRAW_ORDER, "drawable draw order")?;
             (0..drawables.len()).map(|i| u32_at(bytes, at + i * 4)).collect::<Result<Vec<u32>, _>>()?
@@ -388,6 +413,8 @@ impl Moc3 {
                 deformer_ids,
                 drawable_ids,
                 glue_ids,
+                glues,
+                glue_intensities,
                 drawables,
                 warp_deformers,
                 rotation_deformers,
@@ -1231,6 +1258,165 @@ fn read_keyforms(
     Ok(Keyforms { positions, warp_offsets, drawable_offsets })
 }
 
+/// Reads every glue: the vertex pairs it stitches and the keyforms of its
+/// intensity.
+///
+/// Sections 91 to 100 and count slots 21 and 22 were located by the same
+/// closure arithmetic as the rest, and each is checked here rather than
+/// trusted: the pair lists must tile the declared entry total exactly with
+/// every list an even length (entries come in A/B twos), the keyform ranges
+/// must tile the declared keyform total, every vertex must lie inside the mesh
+/// it indexes, and each glue's keyform count must be the product of its
+/// binding's axes. A model that does not satisfy all of it has a different
+/// layout and is refused rather than stitched wrongly.
+fn read_glues(
+    bytes: &[u8],
+    sections: &[u32],
+    counts: &Counts,
+    drawables: &[Drawable],
+    keyform_bindings: &[KeyformBinding],
+    parameter_bindings: &[ParameterBinding],
+) -> Result<(Vec<Glue>, Vec<f32>), DecodeError> {
+    let n = counts.glues as usize;
+    if n == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let entries = checked_count(counts_at(bytes, sections, count::GLUE_PAIR_ENTRIES)?, 2, bytes, "glue pair entry")?;
+    let keyform_total = checked_count(counts_at(bytes, sections, count::GLUE_KEYFORMS)?, 4, bytes, "glue keyform")?;
+
+    let u32s = |index: usize, what: &str| -> Result<Vec<u32>, DecodeError> {
+        let at = section_offset(sections, index, what)?;
+        (0..n).map(|i| u32_at(bytes, at + i * 4)).collect()
+    };
+    let binding = u32s(section::GLUE_KEYFORM_BINDING, "glue keyform binding")?;
+    let keyform_begin = u32s(section::GLUE_KEYFORM_BEGIN, "glue keyform begin")?;
+    let keyform_count = u32s(section::GLUE_KEYFORM_COUNT, "glue keyform count")?;
+    let mesh_a = u32s(section::GLUE_MESH_A, "glue mesh A")?;
+    let mesh_b = u32s(section::GLUE_MESH_B, "glue mesh B")?;
+    let pair_begin = u32s(section::GLUE_PAIR_BEGIN, "glue pair begin")?;
+    let pair_count = u32s(section::GLUE_PAIR_COUNT, "glue pair count")?;
+
+    let weights_at = section_offset(sections, section::GLUE_WEIGHTS, "glue weight")?;
+    let vertices_at = section_offset(sections, section::GLUE_VERTICES, "glue vertex")?;
+    let intensities_at = section_offset(sections, section::GLUE_INTENSITIES, "glue intensity")?;
+
+    let mut glues = Vec::with_capacity(n);
+    let (mut expect_entry, mut expect_keyform) = (0u64, 0u64);
+    for g in 0..n {
+        if pair_begin[g] as u64 != expect_entry {
+            return Err(DecodeError::corrupt(format!(
+                "glue {g} claims pair entries from {} where {expect_entry} was expected",
+                pair_begin[g]
+            )));
+        }
+        if pair_count[g] % 2 != 0 {
+            return Err(DecodeError::corrupt(format!(
+                "glue {g} has {} pair entries, which cannot be whole pairs",
+                pair_count[g]
+            )));
+        }
+        expect_entry += pair_count[g] as u64;
+        if expect_entry > entries as u64 {
+            return Err(DecodeError::corrupt(format!(
+                "glue {g} reaches pair entry {expect_entry}, past the {entries} the count table declares"
+            )));
+        }
+        if keyform_begin[g] as u64 != expect_keyform {
+            return Err(DecodeError::corrupt(format!(
+                "glue {g} claims keyforms from {} where {expect_keyform} was expected",
+                keyform_begin[g]
+            )));
+        }
+        expect_keyform += keyform_count[g] as u64;
+        if expect_keyform > keyform_total as u64 {
+            return Err(DecodeError::corrupt(format!(
+                "glue {g} reaches keyform {expect_keyform}, past the {keyform_total} the count table declares"
+            )));
+        }
+
+        let mesh = |what: &str, index: u32| -> Result<usize, DecodeError> {
+            drawables.get(index as usize).map(Drawable::vertex_count).ok_or_else(|| {
+                DecodeError::corrupt(format!("glue {g} {what} is drawable {index} of {}", drawables.len()))
+            })
+        };
+        let vertices_in_a = mesh("mesh A", mesh_a[g])?;
+        let vertices_in_b = mesh("mesh B", mesh_b[g])?;
+
+        let grid = keyform_bindings
+            .get(binding[g] as usize)
+            .ok_or_else(|| {
+                DecodeError::corrupt(format!("glue {g} keyform binding {} of {}", binding[g], keyform_bindings.len()))
+            })?
+            .axes
+            .iter()
+            .try_fold(1u64, |n, axis| {
+                parameter_bindings.get(*axis as usize).map(|p| n.saturating_mul(p.keys.len() as u64))
+            })
+            .ok_or_else(|| DecodeError::corrupt(format!("glue {g} binding names a missing parameter binding")))?;
+        if grid != keyform_count[g] as u64 {
+            return Err(DecodeError::corrupt(format!(
+                "glue {g} has {} keyforms but its parameters imply {grid}",
+                keyform_count[g]
+            )));
+        }
+
+        let mut pairs = Vec::with_capacity(pair_count[g] as usize / 2);
+        for p in 0..pair_count[g] as usize / 2 {
+            let entry = pair_begin[g] as usize + p * 2;
+            let vertex = |e: usize| -> Result<u32, DecodeError> {
+                let at = vertices_at + e * 2;
+                let slice = bytes.get(at..at + 2).ok_or_else(|| {
+                    DecodeError::corrupt_at(format!("glue {g} vertex entry {e} is past the end"), at as u64)
+                })?;
+                Ok(u16::from_le_bytes(slice.try_into().unwrap_or([0; 2])) as u32)
+            };
+            let (vertex_a, vertex_b) = (vertex(entry)?, vertex(entry + 1)?);
+            if vertex_a as usize >= vertices_in_a || vertex_b as usize >= vertices_in_b {
+                return Err(DecodeError::corrupt(format!(
+                    "glue {g} pair {p} names vertices {vertex_a} and {vertex_b} of meshes with \
+                     {vertices_in_a} and {vertices_in_b}"
+                )));
+            }
+            let (weight_a, weight_b) =
+                (f32_at(bytes, weights_at + entry * 4)?, f32_at(bytes, weights_at + (entry + 1) * 4)?);
+            if !(weight_a.is_finite() && weight_b.is_finite()) {
+                return Err(DecodeError::corrupt(format!("glue {g} pair {p} has a non-finite weight")));
+            }
+            pairs.push(GluePair { vertex_a, vertex_b, weight_a, weight_b });
+        }
+        glues.push(Glue {
+            mesh_a: mesh_a[g],
+            mesh_b: mesh_b[g],
+            keyform_binding: binding[g],
+            keyform_begin: keyform_begin[g],
+            keyform_count: keyform_count[g],
+            pairs,
+        });
+    }
+    // Ranges that tile the lists are not enough on their own: they must also
+    // account for all of them, or something not decoded here owns the rest.
+    if expect_entry != entries as u64 {
+        return Err(DecodeError::corrupt(format!(
+            "the glues account for {expect_entry} pair entries, but the count table declares {entries}"
+        )));
+    }
+    if expect_keyform != keyform_total as u64 {
+        return Err(DecodeError::corrupt(format!(
+            "the glues account for {expect_keyform} keyforms, but the count table declares {keyform_total}"
+        )));
+    }
+
+    let mut intensities = Vec::with_capacity(keyform_total);
+    for k in 0..keyform_total {
+        let value = f32_at(bytes, intensities_at + k * 4)?;
+        if !value.is_finite() {
+            return Err(DecodeError::corrupt(format!("glue keyform {k} has a non-finite intensity")));
+        }
+        intensities.push(value);
+    }
+    Ok((glues, intensities))
+}
+
 /// Refuses a count larger than the file could hold.
 ///
 /// Counts come out of the file, so a corrupted one would otherwise be believed
@@ -1356,6 +1542,126 @@ pub(crate) mod tests {
         assert_eq!(moc.drawables[1].blend_mode(), a2d_core::BlendMode::Multiply);
     }
 
+    /// Overwrites one u32 of a built file: entry `at` of section `index`.
+    fn patch_u32(bytes: &mut [u8], index: usize, at: usize, value: u32) {
+        let table = 0x40 + index * 4;
+        let base = u32::from_le_bytes(bytes[table..table + 4].try_into().unwrap()) as usize;
+        bytes[base + at * 4..base + at * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn a_model_without_glue_reads_with_none() {
+        let moc = Moc3::parse(&Builder::new().build()).expect("should parse");
+        assert!(moc.glue_ids.is_empty() && moc.glues.is_empty() && moc.glue_intensities.is_empty());
+    }
+
+    #[test]
+    fn glue_reads_its_meshes_pairs_weights_and_intensities() {
+        let moc = Moc3::parse(&Builder::new().glued(&[1.0, 0.5, 0.25]).build()).expect("should parse");
+        assert_eq!(moc.counts.glues, 1);
+        assert_eq!(moc.glue_ids, ["Glue1"]);
+        assert_eq!(moc.glues.len(), 1);
+        let g = &moc.glues[0];
+        assert_eq!((g.mesh_a, g.mesh_b), (0, 1));
+        assert_eq!((g.keyform_binding, g.keyform_begin, g.keyform_count), (0, 0, 3));
+        assert_eq!(
+            g.pairs,
+            [
+                GluePair { vertex_a: 1, vertex_b: 1, weight_a: 0.25, weight_b: 0.75 },
+                GluePair { vertex_a: 2, vertex_b: 2, weight_a: 0.5, weight_b: 0.5 },
+            ]
+        );
+        assert_eq!(moc.glue_intensities, [1.0, 0.5, 0.25]);
+    }
+
+    #[test]
+    fn an_odd_number_of_pair_entries_is_refused() {
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        patch_u32(&mut bytes, section::GLUE_PAIR_COUNT, 0, 3);
+        patch_u32(&mut bytes, section::COUNTS, count::GLUE_PAIR_ENTRIES, 3);
+        let err = Moc3::parse(&bytes).unwrap_err();
+        assert!(err.to_string().contains("whole pairs"), "{err}");
+    }
+
+    #[test]
+    fn a_glue_vertex_outside_its_mesh_is_refused() {
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        // The vertex table is u16s; point the first entry past the 3-vertex mesh.
+        let table = 0x40 + section::GLUE_VERTICES * 4;
+        let base = u32::from_le_bytes(bytes[table..table + 4].try_into().unwrap()) as usize;
+        bytes[base..base + 2].copy_from_slice(&3u16.to_le_bytes());
+        let err = Moc3::parse(&bytes).unwrap_err();
+        assert!(err.to_string().contains("names vertices"), "{err}");
+    }
+
+    #[test]
+    fn pair_lists_that_do_not_close_on_the_declared_total_are_refused() {
+        // The total is wrong: the one glue's four entries no longer account for it.
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        patch_u32(&mut bytes, section::COUNTS, count::GLUE_PAIR_ENTRIES, 6);
+        let err = Moc3::parse(&bytes).unwrap_err();
+        assert!(err.to_string().contains("pair entries"), "{err}");
+
+        // The start is wrong: the list does not begin where the last ended.
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        patch_u32(&mut bytes, section::GLUE_PAIR_BEGIN, 0, 2);
+        let err = Moc3::parse(&bytes).unwrap_err();
+        assert!(err.to_string().contains("pair entries from"), "{err}");
+    }
+
+    #[test]
+    fn glue_keyforms_that_contradict_their_binding_or_total_are_refused() {
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        patch_u32(&mut bytes, section::COUNTS, count::GLUE_KEYFORMS, 5);
+        let err = Moc3::parse(&bytes).unwrap_err();
+        assert!(err.to_string().contains("keyforms"), "{err}");
+
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        patch_u32(&mut bytes, section::GLUE_KEYFORM_COUNT, 0, 2);
+        patch_u32(&mut bytes, section::COUNTS, count::GLUE_KEYFORMS, 2);
+        let err = Moc3::parse(&bytes).unwrap_err();
+        assert!(err.to_string().contains("its parameters imply"), "{err}");
+    }
+
+    #[test]
+    fn a_glue_naming_a_missing_mesh_or_binding_is_refused() {
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        patch_u32(&mut bytes, section::GLUE_MESH_B, 0, 9);
+        let err = Moc3::parse(&bytes).unwrap_err();
+        assert!(err.to_string().contains("mesh B"), "{err}");
+
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        patch_u32(&mut bytes, section::GLUE_KEYFORM_BINDING, 0, 9);
+        let err = Moc3::parse(&bytes).unwrap_err();
+        assert!(err.to_string().contains("keyform binding"), "{err}");
+    }
+
+    #[test]
+    fn a_non_finite_glue_weight_or_intensity_is_refused() {
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        patch_u32(&mut bytes, section::GLUE_WEIGHTS, 1, f32::NAN.to_bits());
+        assert!(Moc3::parse(&bytes).unwrap_err().to_string().contains("weight"));
+
+        let mut bytes = Builder::new().glued(&[1.0; 3]).build();
+        patch_u32(&mut bytes, section::GLUE_INTENSITIES, 2, f32::INFINITY.to_bits());
+        assert!(Moc3::parse(&bytes).unwrap_err().to_string().contains("intensity"));
+    }
+
+    #[test]
+    fn corrupting_a_glued_model_anywhere_is_an_error_and_never_a_panic() {
+        let full = Builder::new().glued(&[1.0; 3]).build();
+        for cut in 0..full.len() {
+            let _ = Moc3::parse(&full[..cut]);
+        }
+        for i in 0..full.len() {
+            for bit in [0x01u8, 0x80] {
+                let mut bytes = full.clone();
+                bytes[i] ^= bit;
+                let _ = Moc3::parse(&bytes);
+            }
+        }
+    }
+
     /// Builds a MOC3 with the section layout this parser expects.
     ///
     /// Laid out by hand from the module docs, so a disagreement between the two
@@ -1380,6 +1686,12 @@ pub(crate) mod tests {
         /// Drives every element from two parameters rather than one, so the
         /// keyform grid has an axis order to get right.
         two_axis: bool,
+        /// Whether one glue joins the first two drawables.
+        glue: bool,
+        /// Intensity of each glue keyform, in keyform order.
+        glue_intensities: Vec<f32>,
+        /// Angle of each rotation keyform, or none for all zero.
+        rotation_angles: Option<Vec<f32>>,
     }
 
     impl Builder {
@@ -1396,7 +1708,29 @@ pub(crate) mod tests {
                 drawable_parents: None,
                 rotation_base_angle: 0.0,
                 two_axis: false,
+                glue: false,
+                glue_intensities: vec![1.0; 3],
+                rotation_angles: None,
             }
+        }
+
+        /// Adds one glue joining the first two drawables, with the given
+        /// intensity per keyform of the three-key axis.
+        ///
+        /// It stitches vertex 1 of the first drawable to vertex 1 of the
+        /// second with weights 0.25 and 0.75, and vertex 2 to vertex 2 with
+        /// 0.5 and 0.5.
+        pub(crate) fn glued(mut self, intensities: &[f32]) -> Self {
+            self.glue = true;
+            self.glue_intensities = intensities.to_vec();
+            self.drawables = ["ArtMesh1", "ArtMesh2"].to_vec();
+            self
+        }
+
+        /// Sets each rotation keyform's angle, in degrees, in keyform order.
+        pub(crate) fn rotation_angles(mut self, angles: &[f32]) -> Self {
+            self.rotation_angles = Some(angles.to_vec());
+            self
         }
 
         /// Gives the rotation deformer a constant angle to measure from.
@@ -1445,7 +1779,7 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn build(&self) -> Vec<u8> {
-            const SECTIONS: usize = 96;
+            const SECTIONS: usize = 101;
             let table_bytes = SECTIONS * 4;
             let mut body: Vec<u8> = Vec::new();
             let base = 0x40 + table_bytes;
@@ -1462,7 +1796,7 @@ pub(crate) mod tests {
             counts[count::PARTS] = self.parts.len() as u32;
             counts[count::DRAWABLES] = self.drawables.len() as u32;
             counts[count::PARAMETERS] = self.parameters.len() as u32;
-            counts[count::GLUES] = 0;
+            counts[count::GLUES] = u32::from(self.glue);
             // Reserved now, filled in at the end: the geometry below decides
             // several of these.
             let counts_at = body.len();
@@ -1614,7 +1948,8 @@ pub(crate) mod tests {
             offsets[section::ROTATION_KEYFORM_COUNT] = place(&mut body, &u32_array(&[per_element as u32]));
             let f_array = |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
             offsets[section::ROTATION_KEYFORM_OPACITY] = place(&mut body, &f_array(&vec![1.0; per_element]));
-            offsets[section::ROTATION_KEYFORM_ANGLE] = place(&mut body, &f_array(&vec![0.0; per_element]));
+            let angles = self.rotation_angles.clone().unwrap_or_else(|| vec![0.0; per_element]);
+            offsets[section::ROTATION_KEYFORM_ANGLE] = place(&mut body, &f_array(&angles));
             offsets[section::ROTATION_KEYFORM_ORIGIN_X] = place(&mut body, &f_array(&vec![0.0; per_element]));
             offsets[section::ROTATION_KEYFORM_ORIGIN_Y] = place(&mut body, &f_array(&vec![0.0; per_element]));
             offsets[section::ROTATION_KEYFORM_SCALE] = place(&mut body, &f_array(&vec![1.0; per_element]));
@@ -1680,6 +2015,24 @@ pub(crate) mod tests {
                 let orders: Vec<u8> =
                     std::iter::repeat_n(510.0f32, d * per_element).flat_map(|v| v.to_le_bytes()).collect();
                 offsets[section::DRAWABLE_KEYFORM_DRAW_ORDER] = place(&mut body, &orders);
+            }
+
+            if self.glue {
+                offsets[section::GLUE_IDS] = place(&mut body, &ids(&["Glue1"]));
+                offsets[section::GLUE_KEYFORM_BINDING] = place(&mut body, &u32_array(&[0]));
+                offsets[section::GLUE_KEYFORM_BEGIN] = place(&mut body, &u32_array(&[0]));
+                offsets[section::GLUE_KEYFORM_COUNT] = place(&mut body, &u32_array(&[per_element as u32]));
+                offsets[section::GLUE_MESH_A] = place(&mut body, &u32_array(&[0]));
+                offsets[section::GLUE_MESH_B] = place(&mut body, &u32_array(&[1]));
+                offsets[section::GLUE_PAIR_BEGIN] = place(&mut body, &u32_array(&[0]));
+                // Two pairs, so four entries: A then B for each.
+                offsets[section::GLUE_PAIR_COUNT] = place(&mut body, &u32_array(&[4]));
+                offsets[section::GLUE_WEIGHTS] = place(&mut body, &f_array(&[0.25, 0.75, 0.5, 0.5]));
+                let vertices: Vec<u8> = [1u16, 1, 2, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+                offsets[section::GLUE_VERTICES] = place(&mut body, &vertices);
+                offsets[section::GLUE_INTENSITIES] = place(&mut body, &f_array(&self.glue_intensities));
+                counts[count::GLUE_PAIR_ENTRIES] = 4;
+                counts[count::GLUE_KEYFORMS] = self.glue_intensities.len() as u32;
             }
 
             counts[count::DEFORMERS] = (warps + rotations) as u32;

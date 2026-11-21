@@ -267,6 +267,8 @@ pub fn cubism_package(with_motion: bool) -> a2d_pack::Package {
         deformer_ids: vec![],
         drawable_ids: vec!["ArtMesh1".into()],
         glue_ids: vec![],
+        glues: vec![],
+        glue_intensities: vec![],
         drawables: vec![Drawable {
             id: "ArtMesh1".into(),
             parent_deformer: None,
@@ -411,6 +413,8 @@ pub fn cubism_deformation_package() -> a2d_pack::Package {
         deformer_ids: vec![],
         drawable_ids: vec!["A".into(), "B".into()],
         glue_ids: vec![],
+        glues: vec![],
+        glue_intensities: vec![],
         drawables: vec![drawable("A", 0, 0), drawable("B", 2, 1)],
         parameter_bindings: vec![
             ParameterBinding { parameter: 0, keys: vec![-30.0, 30.0] },

@@ -75,7 +75,7 @@ used by the parser:
 | 40 | drawable parent deformer | | 79 | vertex indices |
 | 43 | drawable vertex counts | | 87 | the paint sequence |
 | 44 | drawable vertex offsets (floats) | | 90 | glue ids |
-| 45 | drawable index offsets | | | |
+| 45 | drawable index offsets | | 91-100 | glue, see below |
 | 46 | drawable index counts | | | |
 | 68 | drawable keyform opacity | | 69 | drawable keyform draw order |
 | 39 | drawable part index | | 41 | drawable texture index |
@@ -103,6 +103,74 @@ entries walks straight past it, which is why it was missed on the first pass.
 Sections 4 to 9 are per *part*: 5 is the identity, 4, 6, 7 and 8 are constant on
 every model seen, and 9 is the parent part index with `u32::MAX` at a root.
 Notably **none of them orders the parts**, which matters for §6.
+
+### Glue: sections 91 to 100 and count slots 21 and 22
+
+A glue stitches vertex pairs of two meshes that hang off unrelated deformer
+chains. Authoring tools use it where one surface was split into several meshes
+(a torso skinned in two pieces, cloth cut along a seam). Section 90 holds the
+ids and count slot 20 the number of glues; the rest was located by the same
+closure arithmetic as everything else.
+
+| # | Width | Contents | Per |
+|---|---|---|---|
+| 91 | u32 | keyform binding index | glue |
+| 92 | u32 | keyform begin, into section 100 | glue |
+| 93 | u32 | keyform count | glue |
+| 94 | u32 | mesh A, a drawable index | glue |
+| 95 | u32 | mesh B, a drawable index | glue |
+| 96 | u32 | pair-list begin, into sections 98 and 99 | glue |
+| 97 | u32 | pair-list entry count, always even | glue |
+| 98 | f32 | weights | pair-list entry |
+| 99 | **u16** | vertex indices | pair-list entry |
+| 100 | f32 | glue keyform intensities | glue keyform |
+
+Count slot 21 is the total number of pair-list entries and slot 22 the total
+number of glue keyforms. Entries come in twos: entry `2p` is the vertex on mesh
+A and its weight, entry `2p + 1` the vertex on mesh B and its weight. Section 99
+is `u16`, like the drawable index table in 79, not `u32`.
+
+What established it, on one real model with 122 glues:
+
+* Every section's size fits its declared count, and each glue's begin plus
+  count equals the next glue's begin, ending exactly on slot 21 (2008 entries)
+  for the pair lists and on slot 22 (122) for the keyforms.
+* Every pair-list count is even, and every vertex index lies inside the mesh it
+  indexes — all 1004 pairs.
+* At the default pose, the two vertices of every one of the 1004 pairs
+  **coincide exactly** (gap 0 on all 122 glues). A misread table would not do
+  that.
+* The two weights of every pair sum to one.
+* The section order agrees with the community-published MOC3 layout, which also
+  agrees with every index already pinned above.
+
+**The application rule**, verified by rendering rather than by a reference
+runtime. With `I` the glue's intensity, blended from its keyforms through its
+keyform binding exactly as any other element's keyforms are, and both positions
+read before either is written:
+
+```text
+A' = A + (B - A) * weight_a * I
+B' = B + (A - B) * weight_b * I
+```
+
+Applied after every drawable has been carried up its deformer chain, before the
+y flip. Without it, posing from parameters alone (no motion) opens a transparent
+gap of about 0.011 units between two torso meshes at a single parameter value,
+and the worst gap over all five of that model's motions is 0.0126 units. With it
+the gap is closed to float noise.
+
+Not yet exercised by any model seen: an intensity other than 1, a binding with
+more than one keyform, and a *vertex* named by more than one glue (glues are
+applied in file order, each seeing the result of the earlier ones). Meshes in
+several glues are common (59 on the real model), but no single vertex is in
+more than one, so application order has never mattered. The synthetic tests
+cover the first two by construction; the rule for the third is a guess.
+
+Also unverified: **which weight belongs to which mesh.** On the real model every
+weight pair sums to 1 with intensity 1, so the swapped rule (weight A pulling
+B, and the reverse) closes every gap just as well. Only a reference runtime, or
+a case with an uneven sum or an intensity other than 1, would settle it.
 
 ## 3. What was confirmed, and against what
 
@@ -514,4 +582,6 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
 - **Multiple texture pages.** Section 41 gives each drawable a texture index and
   is read, but the emitter still puts every mesh on one page, because nothing
   loads a second one yet. It is all zero on every model seen.
-- **Glue.** Identifiers are read; the constraint is not applied.
+- **Glue.** Decoded and applied (§2). Unverified: intensities other than 1,
+  which weight belongs to which mesh, and the order of application when one
+  vertex is in several glues.

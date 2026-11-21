@@ -246,6 +246,17 @@ pub fn validate_cubism(ir: &CubismIr, textures: &[TextureFile], report: &mut Loa
         report.warn(Degradation::Note("no paint sequence; drawables will be painted in model order".into()));
     }
 
+    // Glue stitches split meshes back together. A package written before glue
+    // was stored names its glues but cannot say what they join, so the seams
+    // open as the model moves; only a fresh import can put that right.
+    if !ir.glue_ids.is_empty() && ir.glues.is_empty() {
+        report.warn(Degradation::Note(format!(
+            "this package predates stored glue: {} glue constraints are not applied and split meshes may show gaps; \
+             re-import the source to include them",
+            ir.glue_ids.len()
+        )));
+    }
+
     // Playback skips a curve aimed at a parameter the model lacks. Package
     // validation never builds the model, so it has to say so itself.
     for degradation in ir.unresolved_motion_targets() {
