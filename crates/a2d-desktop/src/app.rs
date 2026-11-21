@@ -19,7 +19,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId, WindowLevel};
 
-use crate::config::Config;
+use crate::config::{absolute_path, has_manifest, is_dead_entry, Config};
 use crate::pacing::{FrameClock, PacingStats};
 use crate::state::{Action, ViewerState};
 use crate::tray::{Tray, TrayCommand};
@@ -118,12 +118,28 @@ pub fn run_with(
     preloaded: Vec<LoadedModel>,
     report: &mut LoadReport,
 ) -> Result<RunSummary, ViewerError> {
-    let (config, config_report) = Config::load();
+    let (mut config, config_report) = Config::load();
     report.absorb(config_report);
+
+    // Forget what has been deleted, once, and write that down, so the same
+    // missing path is not reported on every start.
+    // Relative entries first: loaded models carry absolute paths, and an
+    // entry that cannot match its own model is shown twice and loses its
+    // settings.
+    let migrated = config.migrate_relative_entries(has_manifest);
+    let forgot = config.forget_dead_models(is_dead_entry, report);
+    if migrated || forgot {
+        if let Err(e) = config.save() {
+            report.note(format!("settings could not be saved: {e}"));
+        }
+    }
 
     // Packages named on the command line come first, but remembered ones are
     // kept so the selector still lists everything the user has opened before.
-    let mut paths = options.packages;
+    let mut paths: Vec<_> = options.packages.iter().map(|p| absolute_path(p)).collect();
+    // What the caller named is what they want to see, not whichever model
+    // the config last had active.
+    let preferred = preloaded.first().map(|m| m.package_path.clone()).or_else(|| paths.first().cloned());
     for model in &config.models {
         if !paths.contains(&model.package) {
             paths.push(model.package.clone());
@@ -141,7 +157,7 @@ pub fn run_with(
         return Err(ViewerError::NoModels);
     }
     let entries: Vec<_> = models.iter().map(LoadedModel::entry).collect();
-    let state = ViewerState::from_config(&config, entries);
+    let state = ViewerState::from_config_preferring(&config, entries, preferred.as_deref());
 
     let event_loop = EventLoop::new().map_err(|e| unsupported(format!("could not create an event loop: {e}")))?;
     // Poll rather than Wait: the character animates continuously, so there is
@@ -170,6 +186,7 @@ pub fn run_with(
         saved: false,
         backend: "none".to_string(),
         alpha_mode: "none".to_string(),
+        failure: None,
     };
     let result = event_loop.run_app(&mut app);
     *report = std::mem::take(&mut app.report);
@@ -177,6 +194,9 @@ pub fn run_with(
     // say — still gets its settings written.
     app.save_config(report);
     result.map_err(|e| unsupported(format!("the event loop failed: {e}")))?;
+    if let Some(failure) = app.failure.take() {
+        return Err(unsupported(format!("could not start the viewer: {failure}")));
+    }
     // Time spent drawing, falling back to the whole run if a window never came
     // up. Counting start-up would report a frame rate the viewer never had.
     let elapsed = app.active_since.map_or_else(|| started.elapsed(), |at| at.elapsed());
@@ -348,6 +368,9 @@ struct App {
     /// Backend and alpha mode of the surface in use, for the run summary.
     backend: String,
     alpha_mode: String,
+    /// Why the window could not be brought up, if it could not. Returned from
+    /// `run_with` so a failed start is an error and not a run that drew nothing.
+    failure: Option<ViewerError>,
 }
 
 impl App {
@@ -713,7 +736,7 @@ impl ApplicationHandler for App {
                 self.sync_window();
             }
             Err(e) => {
-                self.report.note(format!("could not start the viewer: {e}"));
+                self.failure = Some(e);
                 event_loop.exit();
                 return;
             }
