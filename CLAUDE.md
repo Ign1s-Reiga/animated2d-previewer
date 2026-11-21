@@ -22,15 +22,18 @@ repository, including comments, tests, fixture names and commit messages.
 Primary objective: **correct character playback for desktop viewing.** Nothing else.
 
 **Current phase:** Phase 1 complete for the Spine path and now confirmed against a real
-export; Phase 5 discovery done; Phase 6 implemented. Phase 2's goal — idle playing correctly
-across several characters — is still unverified by eye.
+export; Phases 3 and 4 working for Cubism — real `unity_cubism` bundles import into loadable
+packages and their motions play in the shared viewer; Phase 5 discovery done; Phase 6
+implemented. Phase 2's goal — idle playing correctly across several characters — is still
+unverified by eye for Spine.
 
 Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x and 4.0/4.1),
 `a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints in all four
 modes, path constraints, mixing,
 idle), `a2d-pack`, `a2d-import` (generic + spine_bytes + unity_spine), `a2d-render` (wgpu, batching, blend
 modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transparent frameless
-window, drag, scale, click-through, always-on-top, tray, config persistence), `a2d-cli`.
+window — on Windows through a DirectComposition surface — drag, scale, click-through,
+always-on-top, tray, config persistence, frame pacing), `a2d-cli`.
 
 **The Spine binary 3.8 decoder is now validated against real exports.** 24 Unity-packaged
 rigs from one source decode without a single failure, and the rigs come out coherent — one
@@ -38,13 +41,21 @@ has 189 bones, 86 slots and animations of sensible duration. That is the first t
 Spine path has been checked against a file the Spine editor wrote rather than against our
 own fixture writer. It says nothing about 4.0/4.1, which remains unvalidated.
 
-Partly implemented: `a2d-unity` (UnityFS container, serialized files, object inventory),
-`a2d-import`'s `unity_cubism` discovery, and `a2d-cubism`'s MOC3 reader (identifiers,
-counts, canvas, parameter ranges, and drawable meshes — uvs and triangles). Not
-implemented: the keyform-to-element binding, deformer evaluation, and reconstruction of
-a loadable package. **A MOC3 holds no resting pose** — coordinates come from blending
-keyforms by parameter value — so nothing can be posed until that binding is worked out.
-Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 binary layouts.
+The Cubism path is implemented end to end: `a2d-unity` (UnityFS container, serialized
+files, object inventory, MonoBehaviour bodies, `AnimationClip` decoding with CRC-32
+bindings), `a2d-import`'s `unity_cubism` (bundle → `.a2dpack`, motions recovered from
+`AnimationClip`s and fade motion data), and `a2d-cubism` (MOC3 v2 decode, keyform binding
+and blending, warp and rotation deformers, glue, drawable and deformer opacity, motion
+playback). **A MOC3 holds no resting pose** — coordinates come from blending keyforms by
+parameter value. The layout and the evaluation rules were reverse-engineered and are pinned
+by hand-computed tests and by checks against three real models (`docs/cubism-moc3.md`
+records what established each claim and what is still unverified); there is no comparison
+against the official runtime yet (§11 cross-impl).
+
+Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 binary layouts;
+for Cubism, physics, expressions, pose/part-opacity curves, motion fades and crossfades,
+animated draw order, multiple texture pages, and the model-level curves (opacity, eye blink,
+lip sync) that motions may carry.
 
 **The 4.0/4.1 binary decoder has not been checked against a real export.** Its tests
 round-trip through the fixture writer, which proves the decoder and the writer agree with
@@ -61,8 +72,8 @@ hand-computed geometry, not by comparison against the official runtime. The §11
 cross-implementation check is still outstanding and is what would catch a term in the
 wrong place or a misread vertex layout.
 
-`a2d-cubism` is blocked on the Cubism Core decision in §13.1, which is why §12's first
-task has not been started.
+The Cubism Core decision in §13.1 is settled (independent MOC3 parser), and §12's first task —
+the bundle inspector — is done (`animated2d inspect`).
 
 ---
 
