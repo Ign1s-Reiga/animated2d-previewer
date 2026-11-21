@@ -275,12 +275,9 @@ fn source_format_of(ir: &SpineIr) -> String {
 }
 
 fn default_animation_of(ir: &SpineIr) -> Option<String> {
-    ir.animations
-        .iter()
-        .find(|a| a.name.eq_ignore_ascii_case("idle"))
-        .or_else(|| ir.animations.iter().find(|a| a.name.to_ascii_lowercase().contains("idle")))
-        .or_else(|| ir.animations.first())
-        .map(|a| a.name.clone())
+    let infos: Vec<AnimationInfo> =
+        ir.animations.iter().map(|a| AnimationInfo { name: a.name.clone(), duration: a.duration }).collect();
+    preferred_animation(&infos).map(str::to_string)
 }
 
 #[cfg(test)]
@@ -739,6 +736,17 @@ mod tests {
         assert_eq!(package.manifest.textures.len(), 1);
         assert_eq!(package.manifest.textures[0].size, Some([1024, 2048]));
         assert!(package.manifest.textures[0].premultiplied_alpha);
+    }
+
+    #[test]
+    fn the_spine_manifest_default_follows_the_shared_rule() {
+        for (names, want) in [(["attack", "stand"], "stand"), (["attack", "x_normal"], "x_normal")] {
+            let mut ir = rich_ir();
+            let template = ir.animations[0].clone();
+            ir.animations = names.iter().map(|n| Animation { name: (*n).into(), ..template.clone() }).collect();
+            ir.rebuild_derived();
+            assert_eq!(Package::from_spine(ir, "X").manifest.default_animation.as_deref(), Some(want));
+        }
     }
 
     #[test]

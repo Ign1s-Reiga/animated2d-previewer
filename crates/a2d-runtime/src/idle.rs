@@ -67,16 +67,19 @@ pub struct IdleDirector {
 impl IdleDirector {
     /// Chooses a default idle and variations from an animation list.
     ///
-    /// Anything whose name contains `idle` counts; the shortest such name is
-    /// treated as the default and the rest become variations, which matches how
-    /// rigs are normally named (`idle`, `idle_02`, `idle_blink`).
+    /// The default is [`a2d_core::preferred_animation`], so the director, the
+    /// viewer's opening animation and the package manifest always agree.
+    /// Variations are only animations whose name contains `idle`, other than
+    /// the default (`idle`, `idle_02`, `idle_blink`). A rig with no idle has
+    /// none, and does not rotate through its other motions.
     pub fn from_animations(animations: &[AnimationInfo], seed: u64) -> Self {
-        let mut idles: Vec<&AnimationInfo> =
-            animations.iter().filter(|a| a.name.to_ascii_lowercase().contains("idle")).collect();
-        idles.sort_by_key(|a| (a.name.len(), a.name.clone()));
-
-        let default_idle = idles.first().map(|a| a.name.clone()).or_else(|| animations.first().map(|a| a.name.clone()));
-        let variations = idles.iter().skip(1).map(|a| a.name.clone()).collect();
+        let default_idle = a2d_core::preferred_animation(animations).map(str::to_string);
+        let mut variations: Vec<String> = animations
+            .iter()
+            .filter(|a| a.name.to_ascii_lowercase().contains("idle") && Some(&a.name) != default_idle.as_ref())
+            .map(|a| a.name.clone())
+            .collect();
+        variations.sort();
 
         let mut director = IdleDirector {
             default_idle,
@@ -187,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn the_shortest_idle_name_becomes_the_default() {
+    fn an_exact_idle_is_the_default_and_other_idles_are_variations() {
         let d = IdleDirector::from_animations(&animations(&["idle_02", "idle", "walk", "idle_blink"]), 1);
         assert_eq!(d.default_idle(), Some("idle"));
         let mut vars = d.variations().to_vec();
@@ -196,9 +199,38 @@ mod tests {
     }
 
     #[test]
+    fn without_an_exact_idle_the_first_idle_named_animation_is_the_default() {
+        let d = IdleDirector::from_animations(&animations(&["idle_long_name", "idle_b"]), 1);
+        assert_eq!(d.default_idle(), Some("idle_long_name"));
+        assert_eq!(d.variations(), ["idle_b".to_string()]);
+    }
+
+    #[test]
     fn a_rig_with_no_idle_falls_back_to_the_first_animation() {
         let d = IdleDirector::from_animations(&animations(&["stand", "walk"]), 1);
         assert_eq!(d.default_idle(), Some("stand"));
+        assert!(d.variations().is_empty());
+    }
+
+    #[test]
+    fn the_default_matches_preferred_animation() {
+        for names in [
+            &["pose_happy", "pose_normal", "pose_shy"][..],
+            &["pose_happy", "pose_wait"],
+            &["pose_happy", "pose_shy"],
+            &["pose_normal", "stand", "idle_b"],
+            &["idle_long_name", "idle_b"],
+        ] {
+            let list = animations(names);
+            let d = IdleDirector::from_animations(&list, 1);
+            assert_eq!(d.default_idle(), a2d_core::preferred_animation(&list), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn a_rig_without_idle_has_no_variations_however_many_motions_it_has() {
+        let d = IdleDirector::from_animations(&animations(&["pose_happy", "pose_normal", "pose_shy"]), 1);
+        assert_eq!(d.default_idle(), Some("pose_normal"));
         assert!(d.variations().is_empty());
     }
 
