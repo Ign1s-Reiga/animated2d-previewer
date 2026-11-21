@@ -1790,6 +1790,9 @@ pub(crate) mod tests {
         omit_warp_opacity: bool,
         /// Opacity of each rotation keyform, or none for all one.
         rotation_opacities: Option<Vec<f32>>,
+        /// Vertex count of each drawable, or none for three each. A count of
+        /// zero gives an empty placeholder mesh with no indices.
+        vertex_counts: Option<Vec<usize>>,
     }
 
     impl Builder {
@@ -1812,7 +1815,14 @@ pub(crate) mod tests {
                 warp_opacities: None,
                 omit_warp_opacity: false,
                 rotation_opacities: None,
+                vertex_counts: None,
             }
+        }
+
+        /// Sets each drawable's vertex count; zero makes it an empty mesh.
+        pub(crate) fn vertex_counts(mut self, counts: &[usize]) -> Self {
+            self.vertex_counts = Some(counts.to_vec());
+            self
         }
 
         /// Gives every warp keyform an opacity, in keyform order. Without it
@@ -1954,29 +1964,47 @@ pub(crate) mod tests {
 
             // Geometry: one triangle per drawable, so the offsets and totals
             // have something to be checked against.
-            let verts_each = 3usize;
-            let idx_each = 3usize;
             let d = self.drawables.len();
+            let verts: Vec<usize> = self.vertex_counts.clone().unwrap_or_else(|| vec![3; d]);
+            assert_eq!(verts.len(), d, "one vertex count per drawable");
+            // A mesh with vertices is one triangle (its first three); one
+            // without has nothing to index.
+            let idxs: Vec<usize> = verts.iter().map(|v| if *v >= 3 { 3 } else { 0 }).collect();
             let u32_array = |values: &[u32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
-            offsets[section::DRAWABLE_VERTEX_COUNTS] = place(&mut body, &u32_array(&vec![verts_each as u32; d]));
-            let voff: Vec<u32> = (0..d).map(|i| (i * verts_each * 2) as u32).collect();
+            offsets[section::DRAWABLE_VERTEX_COUNTS] =
+                place(&mut body, &u32_array(&verts.iter().map(|v| *v as u32).collect::<Vec<_>>()));
+            let mut voff = Vec::new();
+            let mut ioff = Vec::new();
+            let (mut vat, mut iat) = (0u32, 0u32);
+            for i in 0..d {
+                voff.push(vat);
+                ioff.push(iat);
+                vat += verts[i] as u32 * 2;
+                iat += idxs[i] as u32;
+            }
             offsets[section::DRAWABLE_VERTEX_OFFSETS] = place(&mut body, &u32_array(&voff));
-            let ioff: Vec<u32> = (0..d).map(|i| (i * idx_each) as u32).collect();
             offsets[section::DRAWABLE_INDEX_OFFSETS] = place(&mut body, &u32_array(&ioff));
-            offsets[section::DRAWABLE_INDEX_COUNTS] = place(&mut body, &u32_array(&vec![idx_each as u32; d]));
+            offsets[section::DRAWABLE_INDEX_COUNTS] =
+                place(&mut body, &u32_array(&idxs.iter().map(|v| *v as u32).collect::<Vec<_>>()));
 
             // Each drawable is given its own `u`, so a mesh that comes out of
             // the emitter says which drawable it came from -- which is what
             // lets a test pin the paint *order* rather than only the count.
+            // Vertices past the third repeat the last corner.
             let uvs: Vec<u8> = (0..d)
                 .flat_map(|i| {
                     let tag = i as f32 * 0.125;
-                    [tag, 0.0, tag + 1.0, 0.0, tag, 1.0]
+                    let corners = [(tag, 0.0), (tag + 1.0, 0.0), (tag, 1.0)];
+                    (0..verts[i]).flat_map(move |v| {
+                        let (u, w) = corners[v.min(2)];
+                        [u, w]
+                    })
                 })
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
             offsets[section::VERTEX_UVS] = place(&mut body, &uvs);
-            let indices: Vec<u8> = (0..d).flat_map(|_| [0u16, 1, 2]).flat_map(|v| v.to_le_bytes()).collect();
+            let indices: Vec<u8> =
+                (0..d).flat_map(|i| (0..idxs[i] as u16).collect::<Vec<_>>()).flat_map(|v| v.to_le_bytes()).collect();
             offsets[section::VERTEX_INDICES] = place(&mut body, &indices);
 
             // --- bindings -------------------------------------------------
@@ -2098,11 +2126,10 @@ pub(crate) mod tests {
 
             // --- the keyform pool ------------------------------------------
             let warp_stride = padded_points(grid_points) as usize * 2;
-            let draw_stride = padded_points(verts_each as u32) as usize * 2;
             let warp_keyforms = warps * per_element;
             let draw_keyforms = d * per_element;
             let warp_floats = warp_stride * warp_keyforms;
-            let draw_floats = draw_stride * draw_keyforms;
+            let draw_floats: usize = verts.iter().map(|v| padded_points(*v as u32) as usize * 2 * per_element).sum();
 
             let warp_kf_offsets: Vec<u32> = (0..warp_keyforms).map(|k| (k * warp_stride) as u32).collect();
             offsets[section::KEYFORM_POSITION_OFFSETS] = place(&mut body, &u32_array(&warp_kf_offsets));
@@ -2128,10 +2155,19 @@ pub(crate) mod tests {
             // fixture each keyform of a drawable is a different size, so a
             // test can name which one a pose selected -- which is the whole
             // point of that fixture.
-            for k in 0..draw_keyforms {
-                let base = warp_floats + k * draw_stride;
-                let reach = if self.two_axis { (k % per_element) as f32 + 1.0 } else { 1.0 };
-                pool[base..base + 6].copy_from_slice(&[0.0, 0.0, reach, 0.0, 0.0, reach]);
+            let mut at = warp_floats;
+            for &count in &verts {
+                let stride = padded_points(count as u32) as usize * 2;
+                for k in 0..per_element {
+                    let reach = if self.two_axis { k as f32 + 1.0 } else { 1.0 };
+                    let corners = [0.0, 0.0, reach, 0.0, 0.0, reach];
+                    for v in 0..count {
+                        let c = v.min(2);
+                        pool[at + v * 2] = corners[c * 2];
+                        pool[at + v * 2 + 1] = corners[c * 2 + 1];
+                    }
+                    at += stride;
+                }
             }
             let pool_bytes: Vec<u8> = pool.iter().flat_map(|v| v.to_le_bytes()).collect();
             offsets[section::KEYFORM_POSITIONS] = place(&mut body, &pool_bytes);
@@ -2177,8 +2213,8 @@ pub(crate) mod tests {
             counts[count::PARAMETER_KEYS] = all_keys.len() as u32;
             counts[count::KEYFORM_BINDINGS] = 1;
             counts[count::PARAMETER_BINDING_REFS] = param_bindings as u32;
-            counts[count::UV_FLOATS] = (d * verts_each * 2) as u32;
-            counts[count::INDICES] = (d * idx_each) as u32;
+            counts[count::UV_FLOATS] = (verts.iter().sum::<usize>() * 2) as u32;
+            counts[count::INDICES] = idxs.iter().sum::<usize>() as u32;
 
             let counts_bytes: Vec<u8> = counts.iter().flat_map(|v| v.to_le_bytes()).collect();
             body[counts_at..counts_at + counts_bytes.len()].copy_from_slice(&counts_bytes);
@@ -2238,6 +2274,29 @@ pub(crate) mod tests {
         assert_eq!(d.triangle_count(), 1);
         assert_eq!(d.uvs, [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]);
         assert_eq!(d.indices, [0, 1, 2]);
+    }
+
+    #[test]
+    fn an_empty_drawable_parses_and_leaves_its_neighbours_intact() {
+        // Real models carry placeholder art meshes with no vertices. Parsing
+        // one exercises zero-count offset bookkeeping and a zero-size keyform
+        // stride (`padded_points(0) == 0`): the drawable after it must still
+        // find its own uvs, triangles and keyforms.
+        let bytes = Builder::new().drawables(3).vertex_counts(&[3, 0, 3]).build();
+        let moc = Moc3::parse(&bytes).expect("an empty drawable is not corrupt");
+        assert_eq!(moc.drawables.len(), 3);
+
+        let empty = &moc.drawables[1];
+        assert_eq!(empty.id, "ArtMesh2");
+        assert!(empty.uvs.is_empty() && empty.indices.is_empty());
+        assert_eq!(empty.keyform_count, 3, "it still owns its keyforms, they are just zero-sized");
+
+        let after = &moc.drawables[2];
+        assert_eq!(after.uvs, [(0.25, 0.0), (1.25, 0.0), (0.25, 1.0)], "the uvs after the gap are its own");
+        assert_eq!(after.indices, [0, 1, 2]);
+        let verts = moc.keyforms.drawable(after.keyform_begin as usize, 3).expect("reachable");
+        assert_eq!(verts, [0.0, 0.0, 1.0, 0.0, 0.0, 1.0], "its keyforms were not displaced by the empty one");
+        assert_eq!(moc.keyforms.drawable(empty.keyform_begin as usize, 0).expect("reachable"), &[] as &[f32]);
     }
 
     #[test]

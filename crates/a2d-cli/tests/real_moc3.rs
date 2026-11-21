@@ -94,9 +94,16 @@ fn a_real_model_has_sane_parameter_ranges() {
     assert!(angle.minimum <= -10.0 && angle.maximum >= 10.0, "ParamAngleX spans {angle:?}");
     assert_eq!(angle.default, 0.0, "a head angle rests at zero");
 
-    if let Some(eye) = moc.parameter("ParamEyeLOpen") {
-        assert_eq!(eye.minimum, 0.0, "a closed eye is zero");
-        assert!(eye.default > 0.0, "an eye rests open");
+    // Where the eye parameters rest is an artist's choice -- some rigs default
+    // open, others closed and let a motion open them -- so only what holds for
+    // any valid model is asserted: a closed eye is the bottom of the range, and
+    // the default lies inside it. The range check above covers the latter.
+    for id in ["ParamEyeLOpen", "ParamEyeROpen"] {
+        if let Some(eye) = moc.parameter(id) {
+            assert_eq!(eye.minimum, 0.0, "{id}: a closed eye is zero");
+            assert!(eye.maximum > eye.minimum, "{id}: the range must not be empty");
+            assert!((eye.minimum..=eye.maximum).contains(&eye.default), "{id}: {eye:?}");
+        }
     }
 
     println!("{} parameters; first five:", moc.parameters.len());
@@ -143,8 +150,15 @@ fn a_real_model_yields_meshes_whose_triangles_are_all_in_range() {
     assert_eq!(moc.drawables.len(), moc.counts.drawables as usize);
     let mut vertices = 0usize;
     let mut triangles = 0usize;
+    let mut empty = 0usize;
     for d in &moc.drawables {
-        assert!(d.vertex_count() > 0, "{} has no vertices", d.id);
+        // An empty placeholder art mesh (zero vertices) is legitimate, and the
+        // offset tables were already checked to close exactly. What must hold
+        // is that "empty" is consistent: no vertices means no indices.
+        if d.vertex_count() == 0 {
+            assert!(d.indices.is_empty(), "{} has indices but no vertices", d.id);
+            empty += 1;
+        }
         assert_eq!(d.indices.len() % 3, 0, "{} has a partial triangle", d.id);
         for &i in &d.indices {
             assert!((i as usize) < d.vertex_count(), "{} index {i} is outside its own mesh", d.id);
@@ -162,7 +176,23 @@ fn a_real_model_yields_meshes_whose_triangles_are_all_in_range() {
         vertices += d.vertex_count();
         triangles += d.triangle_count();
     }
-    println!("{} drawables, {vertices} vertices, {triangles} triangles", moc.drawables.len());
+    // Posing and emitting must cope with empty drawables: one point list per
+    // drawable (empty for the empty ones) and no panic.
+    let pose = moc.pose(&[]);
+    assert_eq!(pose.drawables.len(), moc.drawables.len());
+    for (d, points) in moc.drawables.iter().zip(&pose.drawables) {
+        assert_eq!(points.len(), d.vertex_count(), "{} poses to the wrong number of points", d.id);
+    }
+    let mut list = a2d_core::RenderList::new();
+    a2d_cubism::CubismEmit::emit(&moc.model, &pose, a2d_core::TextureId(0), &mut list);
+    assert!(!list.meshes().is_empty(), "a posed model should emit something to draw");
+    assert!(list.meshes().len() <= moc.drawables.len() - empty);
+    // A sanity ceiling, not a format property: a few placeholder meshes are
+    // normal, but a model that is mostly empty drawables means the vertex
+    // counts were misread.
+    assert!(empty * 10 <= moc.drawables.len(), "{empty} of {} drawables are empty", moc.drawables.len());
+
+    println!("{} drawables ({empty} empty), {vertices} vertices, {triangles} triangles", moc.drawables.len());
     assert!(triangles > 100, "a character mesh should be more than a handful of triangles");
 }
 

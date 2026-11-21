@@ -224,6 +224,26 @@ mod tests {
     }
 
     #[test]
+    fn a_drawable_with_no_vertices_is_posed_and_skipped_without_harm() {
+        // Real models contain empty placeholder art meshes: zero vertices, zero
+        // indices, one keyform. Posing must give them an empty point list rather
+        // than panic or invent geometry, emit must skip them, and the drawables
+        // around them must be unaffected.
+        let bytes = crate::moc3::tests::Builder::new().drawables(3).vertex_counts(&[3, 0, 3]).build();
+        let moc = Moc3::parse(&bytes).expect("should parse");
+
+        let pose = moc.pose(&[]);
+        assert_eq!(pose.drawables.len(), 3);
+        assert!(pose.drawables[1].is_empty(), "an empty drawable poses to no points");
+        assert!(pose.drawables[0].iter().chain(&pose.drawables[2]).all(|(x, y)| x.is_finite() && y.is_finite()));
+
+        let mut list = RenderList::new();
+        moc.emit(&pose, TextureId(0), &mut list);
+        assert_eq!(list.meshes().len(), 2, "the empty drawable is skipped, its neighbours are drawn");
+        assert!(moc.bounds(&pose).is_some());
+    }
+
+    #[test]
     fn an_unmasked_model_registers_no_masks() {
         let moc = Moc3::parse(&crate::moc3::tests::Builder::new().build()).expect("should parse");
         let pose = moc.pose(&[]);
