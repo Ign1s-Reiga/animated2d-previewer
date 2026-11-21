@@ -208,6 +208,54 @@ pub struct WarpDeformer {
     pub keyform_binding: u32,
 }
 
+/// A glue: a constraint that pulls vertices of two meshes together.
+///
+/// Authoring tools split one surface into several meshes (a torso skinned in
+/// two pieces, a cloth cut along a seam) and stitch the cut back together with
+/// a glue. The pieces hang off unrelated deformer chains, so without the glue
+/// they drift apart as parameters move and a gap opens along the seam.
+///
+/// Applying one is the last step of posing, after every drawable has been
+/// carried to canvas space. With `I` the glue's blended intensity, and both
+/// positions read before either is written,
+///
+/// ```text
+/// A' = A + (B - A) * weight_a * I
+/// B' = B + (A - B) * weight_b * I
+/// ```
+///
+/// Each vertex moves towards the other in proportion to its own weight. When
+/// the two weights of a pair sum to one and `I` is one, both land on the same
+/// point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Glue {
+    /// The two meshes, as indices into [`CubismIr::drawables`].
+    pub mesh_a: u32,
+    pub mesh_b: u32,
+    /// Which keyform grid drives the intensity, as an index into
+    /// [`CubismIr::keyform_bindings`].
+    pub keyform_binding: u32,
+    /// This glue's intensity keyforms, as a range in
+    /// [`CubismIr::glue_intensities`].
+    pub keyform_begin: u32,
+    pub keyform_count: u32,
+    /// The stitched vertex pairs.
+    pub pairs: Vec<GluePair>,
+}
+
+/// One stitched pair of vertices.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GluePair {
+    /// A vertex of [`Glue::mesh_a`], local to that drawable.
+    pub vertex_a: u32,
+    /// A vertex of [`Glue::mesh_b`], local to that drawable.
+    pub vertex_b: u32,
+    /// How far the vertex on mesh A moves towards mesh B's, at full intensity.
+    pub weight_a: f32,
+    /// How far the vertex on mesh B moves towards mesh A's, at full intensity.
+    pub weight_b: f32,
+}
+
 /// The keyform coordinate pool.
 ///
 /// Warp deformer keyforms come first, then drawable keyforms, each element's
@@ -267,6 +315,13 @@ pub struct CubismIr {
     pub deformer_ids: Vec<String>,
     pub drawable_ids: Vec<String>,
     pub glue_ids: Vec<String>,
+    /// Stitching between meshes. Empty when the source declared no glue, or
+    /// when a package written before glue was stored is read: `glue_ids` can
+    /// then be longer than this, which `validate` reports.
+    pub glues: Vec<Glue>,
+    /// Every glue keyform's intensity, end to end; each glue owns the range
+    /// its `keyform_begin` and `keyform_count` name.
+    pub glue_intensities: Vec<f32>,
     pub drawables: Vec<Drawable>,
     pub warp_deformers: Vec<WarpDeformer>,
     pub rotation_deformers: Vec<RotationDeformer>,

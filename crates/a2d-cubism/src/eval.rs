@@ -147,6 +147,19 @@
 //! length cannot decide it either way — the two reshapes are transposes and
 //! the fit is identical — so only unequal axes count.
 //!
+//! # Glue
+//!
+//! Meshes that were one surface before the artist split them hang off
+//! unrelated deformer chains, so as parameters move the pieces drift apart and
+//! a transparent gap opens along the seam. A *glue* stitches chosen vertex
+//! pairs back together, and it is applied last, after every drawable has been
+//! carried up its chain and before the y flip: see [`CubismEval::pose`] and
+//! the rule in `a2d_core::ir::cubism::Glue`. Found by reproducing the gap from
+//! parameters alone, with no motion involved, and by the pairs coinciding
+//! exactly at the default pose on every glue of a real model. The rule closes
+//! the gap in rendered output; it has not been compared with a reference
+//! runtime, and only an intensity of one has been seen in real data.
+//!
 //! # What is still unverified
 //!
 //! **No reference runtime has been compared against.** The models now render
@@ -244,6 +257,7 @@ trait EvalInternals {
         units: &[(f32, f32)],
     );
     fn warp_units(&self, grids: &[Vec<(f32, f32)>]) -> Vec<(f32, f32)>;
+    fn apply_glue(&self, drawables: &mut [Vec<(f32, f32)>], unstable: &[usize], values: &[f32]);
 }
 
 impl CubismEval for CubismIr {
@@ -341,16 +355,24 @@ impl CubismEval for CubismIr {
                 unstable.push(index);
             }
 
-            // A MOC3 stores y running down the canvas, the way an image's rows
-            // do; everything downstream of `formats/` takes y as running up.
-            // Converting here rather than at emit keeps `bounds` and `emit`
-            // agreeing, and keeps the whole chain above -- deformer grids,
-            // rotation frames, keyform blending -- working in the file's own
-            // space, where the numbers mean what the format says they mean.
-            for point in &mut points {
+            drawables.push(points);
+        }
+
+        // Glue runs last of everything that moves a vertex: it joins positions
+        // that only exist once every drawable has been carried up its own
+        // chain, and it is what closes the seams those chains open.
+        self.apply_glue(&mut drawables, &unstable, &resolved);
+
+        // A MOC3 stores y running down the canvas, the way an image's rows
+        // do; everything downstream of `formats/` takes y as running up.
+        // Converting here rather than at emit keeps `bounds` and `emit`
+        // agreeing, and keeps the whole chain above -- deformer grids,
+        // rotation frames, keyform blending -- working in the file's own
+        // space, where the numbers mean what the format says they mean.
+        for points in &mut drawables {
+            for point in points {
                 point.1 = -point.1;
             }
-            drawables.push(points);
         }
 
         Pose { drawables, opacities, draw_orders, unstable }
@@ -432,6 +454,59 @@ impl EvalInternals for CubismIr {
             out.push((0, 1.0));
         }
         out
+    }
+
+    /// Pulls each glue's vertex pairs together.
+    ///
+    /// The intensity is blended through the glue's own keyform binding, with
+    /// the same weights machinery as any other keyform, then for every pair
+    /// `A' = A + (B - A) * wa * I` and `B' = B + (A - B) * wb * I`, both read
+    /// before either is written. Glues run in file order, each seeing the
+    /// result of the ones before it.
+    ///
+    /// A glue is skipped when either mesh is unstable: such a mesh holds its
+    /// own un-deformed coordinates, which are in the wrong space to join to.
+    fn apply_glue(&self, drawables: &mut [Vec<(f32, f32)>], unstable: &[usize], values: &[f32]) {
+        for glue in &self.glues {
+            let (a, b) = (glue.mesh_a as usize, glue.mesh_b as usize);
+            if unstable.contains(&a) || unstable.contains(&b) {
+                continue;
+            }
+            let mut intensity = 0.0f32;
+            for (keyform, weight) in self.weights_for(glue.keyform_binding, values) {
+                if let Some(i) = self.glue_intensities.get(glue.keyform_begin as usize + keyform) {
+                    intensity += i * weight;
+                }
+            }
+            if intensity == 0.0 || !intensity.is_finite() {
+                continue;
+            }
+            for pair in &glue.pairs {
+                let (va, vb) = (pair.vertex_a as usize, pair.vertex_b as usize);
+                let (Some(pa), Some(pb)) = (
+                    drawables.get(a).and_then(|m| m.get(va)).copied(),
+                    drawables.get(b).and_then(|m| m.get(vb)).copied(),
+                ) else {
+                    continue;
+                };
+                let (ka, kb) = (pair.weight_a * intensity, pair.weight_b * intensity);
+                let moved_a = (pa.0 + (pb.0 - pa.0) * ka, pa.1 + (pb.1 - pa.1) * ka);
+                let moved_b = (pb.0 + (pa.0 - pb.0) * kb, pb.1 + (pa.1 - pb.1) * kb);
+                // Weights are only required to be finite, so a huge one can
+                // overflow here. A pair that would produce a non-finite vertex
+                // is left where it was rather than handed on to emit.
+                let finite = |p: (f32, f32)| p.0.is_finite() && p.1.is_finite();
+                if !finite(moved_a) || !finite(moved_b) {
+                    continue;
+                }
+                if let Some(slot) = drawables.get_mut(a).and_then(|m| m.get_mut(va)) {
+                    *slot = moved_a;
+                }
+                if let Some(slot) = drawables.get_mut(b).and_then(|m| m.get_mut(vb)) {
+                    *slot = moved_b;
+                }
+            }
+        }
     }
 
     /// Carries points up the deformer chain until they reach canvas space.
@@ -806,6 +881,169 @@ mod tests {
         let moc = crate::Moc3::parse(&bytes).expect("should parse");
         let points = moc.pose(&[0.0]).drawables.into_iter().next().expect("one drawable");
         assert_eq!(points, up(&[(0.0, 0.0), (10.0, 0.0), (0.0, 20.0)]));
+    }
+
+    /// Two triangles sharing a seam. Drawable 0 hangs off the model root and
+    /// never moves; drawable 1 hangs off a rotation deformer that ParamAngleX
+    /// turns by exactly that many degrees (keys -30, 0, 30). So at zero the
+    /// two coincide, and anywhere else the second swings away from the first.
+    ///
+    /// The glue stitches vertex 1 to vertex 1 with weights 0.25 and 0.75, and
+    /// vertex 2 to vertex 2 with 0.5 and 0.5, at the given intensity per key.
+    fn glued_pair(intensities: &[f32]) -> crate::Moc3 {
+        let bytes = crate::moc3::tests::Builder::new()
+            .glued(intensities)
+            .rotation_angles(&[-30.0, 0.0, 30.0])
+            .drawable_parents(&[u32::MAX, 0])
+            .build();
+        crate::Moc3::parse(&bytes).expect("should parse")
+    }
+
+    fn close(a: (f32, f32), b: (f32, f32)) -> bool {
+        (a.0 - b.0).abs() < 1e-5 && (a.1 - b.1).abs() < 1e-5
+    }
+
+    #[test]
+    fn glued_vertices_that_coincide_at_rest_stay_together() {
+        let moc = glued_pair(&[1.0; 3]);
+        let pose = moc.pose(&[0.0]);
+        assert!(close(pose.drawables[0][1], pose.drawables[1][1]), "{:?}", pose.drawables);
+        assert!(close(pose.drawables[0][2], pose.drawables[1][2]), "{:?}", pose.drawables);
+    }
+
+    #[test]
+    fn glue_closes_the_gap_a_turned_deformer_opens() {
+        let mut moc = glued_pair(&[1.0; 3]);
+        let (c, s) = (30f32.to_radians().cos(), 30f32.to_radians().sin());
+
+        // Without the glue the second triangle has swung off the first: the
+        // premise of the test, asserted rather than assumed.
+        let glued = moc.glues.clone();
+        moc.glues.clear();
+        let raw = moc.pose(&[30.0]);
+        let gap = |p: &Pose, v: usize| {
+            let (a, b) = (p.drawables[0][v], p.drawables[1][v]);
+            ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+        };
+        assert!(gap(&raw, 1) > 0.1 && gap(&raw, 2) > 0.1, "{:?}", raw.drawables);
+
+        // With it, both ends of each pair land on the weighted point. Pair one
+        // has weights 0.25 for A and 0.75 for B, so A' = A + 0.25 (B - A) and
+        // B' = B + 0.75 (A - B), which are the same point, 0.75 A + 0.25 B.
+        // In the file's space A = (1, 0) and B = (cos 30, sin 30); the pose
+        // then flips y.
+        moc.glues = glued;
+        let pose = moc.pose(&[30.0]);
+        let expect1 = (0.75 * 1.0 + 0.25 * c, -(0.25 * s));
+        assert!(close(pose.drawables[0][1], expect1), "{:?} vs {expect1:?}", pose.drawables[0][1]);
+        assert!(close(pose.drawables[1][1], expect1), "{:?} vs {expect1:?}", pose.drawables[1][1]);
+        // Pair two is 0.5 and 0.5: the midpoint of (0, 1) and (-sin 30, cos 30).
+        let expect2 = (0.5 * (0.0 - s), -(0.5 * (1.0 + c)));
+        assert!(close(pose.drawables[0][2], expect2), "{:?} vs {expect2:?}", pose.drawables[0][2]);
+        assert!(close(pose.drawables[1][2], expect2), "{:?} vs {expect2:?}", pose.drawables[1][2]);
+
+        // Vertices no pair names are left alone.
+        assert_eq!(pose.drawables[0][0], raw.drawables[0][0]);
+        assert_eq!(pose.drawables[1][0], raw.drawables[1][0]);
+    }
+
+    #[test]
+    fn a_half_intensity_glue_pulls_half_as_far() {
+        // The same pose at intensity one and at one half, from the same raw
+        // positions: the pull of every glued vertex must halve.
+        let full = glued_pair(&[1.0, 1.0, 1.0]).pose(&[30.0]);
+        let half_moc = glued_pair(&[1.0, 1.0, 0.5]);
+        let half = half_moc.pose(&[30.0]);
+        let mut raw_moc = glued_pair(&[1.0; 3]);
+        raw_moc.glues.clear();
+        let raw = raw_moc.pose(&[30.0]);
+
+        for (mesh, vertex) in [(0, 1), (1, 1), (0, 2), (1, 2)] {
+            let pull = |p: &Pose| {
+                let (a, b) = (p.drawables[mesh][vertex], raw.drawables[mesh][vertex]);
+                (a.0 - b.0, a.1 - b.1)
+            };
+            let (f, h) = (pull(&full), pull(&half));
+            assert!(f.0.abs() + f.1.abs() > 0.01, "the premise is a glue that moves something");
+            assert!(close((h.0 * 2.0, h.1 * 2.0), f), "mesh {mesh} vertex {vertex}: {h:?} vs {f:?}");
+        }
+        // The two meshes no longer coincide at half intensity.
+        assert!(!close(half.drawables[0][1], half.drawables[1][1]));
+
+        // Pair one at intensity one half, worked by hand: A = (1, 0) and
+        // B = (cos 30, sin 30) before the flip, so
+        // A' = A + 0.25 * 0.5 * (B - A) and B' = B + 0.75 * 0.5 * (A - B).
+        let (c, s) = (30f32.to_radians().cos(), 30f32.to_radians().sin());
+        let a = (1.0 + 0.125 * (c - 1.0), -(0.125 * s));
+        let b = (c + 0.375 * (1.0 - c), -(s + 0.375 * (0.0 - s)));
+        assert!(close(half.drawables[0][1], a), "{:?} vs {a:?}", half.drawables[0][1]);
+        assert!(close(half.drawables[1][1], b), "{:?} vs {b:?}", half.drawables[1][1]);
+    }
+
+    #[test]
+    fn intensity_blends_between_keys_like_any_other_keyform() {
+        // Keys at 0 and 30 carry intensities 1 and 0, so 15 degrees sits
+        // halfway and pulls half as far as the full-intensity pose would.
+        let moc = glued_pair(&[1.0, 1.0, 0.0]);
+        let mut raw_moc = glued_pair(&[1.0; 3]);
+        raw_moc.glues.clear();
+        let at_30 = moc.pose(&[30.0]);
+        let raw_30 = raw_moc.pose(&[30.0]);
+        assert_eq!(at_30.drawables, raw_30.drawables, "intensity zero is no glue at all");
+        let mid = moc.pose(&[15.0]);
+        let mid_raw = raw_moc.pose(&[15.0]);
+        // At 15 the intensity is 0.5 and the pair-one weights apply to it.
+        let a = (
+            mid_raw.drawables[0][1].0 + (mid_raw.drawables[1][1].0 - mid_raw.drawables[0][1].0) * 0.25 * 0.5,
+            mid_raw.drawables[0][1].1 + (mid_raw.drawables[1][1].1 - mid_raw.drawables[0][1].1) * 0.25 * 0.5,
+        );
+        assert!(close(mid.drawables[0][1], a), "{:?} vs {a:?}", mid.drawables[0][1]);
+    }
+
+    #[test]
+    fn a_pair_whose_pull_would_overflow_is_left_where_it_was() {
+        let mut moc = glued_pair(&[4.0; 3]);
+        let mut raw_moc = glued_pair(&[4.0; 3]);
+        raw_moc.glues.clear();
+        moc.glues[0].pairs[0].weight_a = f32::MAX;
+        let pose = moc.pose(&[30.0]);
+        let raw = raw_moc.pose(&[30.0]);
+        assert!(pose.drawables.iter().flatten().all(|(x, y)| x.is_finite() && y.is_finite()));
+        // The overflowing pair is untouched; the healthy one still applies.
+        assert_eq!(pose.drawables[0][1], raw.drawables[0][1]);
+        assert_eq!(pose.drawables[1][1], raw.drawables[1][1]);
+        assert_ne!(pose.drawables[0][2], raw.drawables[0][2]);
+    }
+
+    #[test]
+    fn a_glue_joining_a_mesh_to_itself_is_applied() {
+        let mut moc = glued_pair(&[1.0; 3]);
+        moc.glues[0].mesh_b = 0;
+        moc.glues[0].pairs = vec![crate::moc3::GluePair { vertex_a: 1, vertex_b: 2, weight_a: 0.25, weight_b: 0.75 }];
+        // Vertices (1, 0) and (0, 1) of mesh 0: both read before either is
+        // written, so both land on 0.75 A + 0.25 B = (0.75, 0.25), then y flips.
+        let pose = moc.pose(&[0.0]);
+        assert!(close(pose.drawables[0][1], (0.75, -0.25)), "{:?}", pose.drawables[0]);
+        assert!(close(pose.drawables[0][2], (0.75, -0.25)), "{:?}", pose.drawables[0]);
+    }
+
+    #[test]
+    fn a_glue_leaves_an_unstable_mesh_alone() {
+        let moc = glued_pair(&[1.0; 3]);
+        let start = vec![vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], vec![(5.0, 5.0), (6.0, 5.0), (5.0, 6.0)]];
+        let mut stable = start.clone();
+        moc.apply_glue(&mut stable, &[], &[0.0]);
+        assert_ne!(stable, start, "the premise is that this glue moves these");
+        let mut skipped = start.clone();
+        moc.apply_glue(&mut skipped, &[1], &[0.0]);
+        assert_eq!(skipped, start);
+    }
+
+    #[test]
+    fn a_model_with_no_glue_poses_as_it_did() {
+        let moc = crate::Moc3::parse(&crate::moc3::tests::Builder::new().build()).expect("should parse");
+        assert!(moc.glues.is_empty());
+        assert_eq!(moc.pose(&[15.0]).drawables, vec![posed(15.0)]);
     }
 
     #[test]

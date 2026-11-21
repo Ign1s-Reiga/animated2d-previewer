@@ -793,7 +793,8 @@ fn print_moc3(
         model.counts.deformers, model.counts.warp_deformers, model.counts.rotation_deformers
     )?;
     if model.counts.glues > 0 {
-        writeln!(out, "  glues:       {}", model.counts.glues)?;
+        let pairs: usize = model.glues.iter().map(|g| g.pairs.len()).sum();
+        writeln!(out, "  glues:       {} ({pairs} stitched vertex pairs, applied when posing)", model.counts.glues)?;
     }
     if !model.is_verified_version() {
         writeln!(out, "  note:        MOC3 version {} is newer than any checked against a real model", model.version)?;
