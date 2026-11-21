@@ -14,27 +14,74 @@
 //! inside its own canvas. That is not a reference render, but it is the first
 //! criterion here that a wrong pose cannot quietly pass.
 //!
-//! # The scale rule, and how it was found
+//! # How deformers compose
 //!
-//! Every space in a model is canvas pixels, with one exception: a warp
-//! deformer's children live in its unit square. So a rotation deformer sitting
-//! under a warp is the one place where units have to be converted, and that was
-//! the missing piece.
+//! Deformers are resolved into canvas space **parents first**, and a drawable
+//! is then carried through its one resolved parent only. Keyform blending is
+//! unchanged; what changed is how a deformer is placed under its parent.
 //!
-//! The exchange rate is the warp's own grid extent — the grid spans the
-//! parent's space while the children span zero to one — and it **accumulates**:
-//! a warp nested in another warp measures its grid in that warp's units, not in
-//! pixels, so the rates multiply down the chain. Missing the accumulation is
-//! what made the first attempt look almost right and still be wrong by a factor
-//! of a thousand on deep chains.
+//! * A **warp** carries its own grid through its parent, so its lookup lands in
+//!   canvas space. It adds no scale of its own: its total scale is its
+//!   parent's, and one at the root.
+//! * A **rotation under a rotation** sends its origin through the parent,
+//!   adds the angles, and multiplies the scales.
+//! * A **rotation under a warp** takes only a *position* and an *angle* from
+//!   the warp. The origin goes through the warp. The turn is read from a short
+//!   probe along the warp's own up axis, compared with where an unbent warp
+//!   would point it. The total scale is the warp's (its parent's) times the
+//!   rotation's own, so **a warp lends no scale at all** and everything below
+//!   such a rotation stays rigid.
+//!   If the warp is squashed so flat that no probe has a direction, the rotation
+//!   keeps its origin and its own angle and the model keeps posing.
 //!
-//! It was found by dumping one small model's deformer tree in full and reading
-//! it. The giveaway was three lines: a warp with a grid spanning `-627..686`
-//! pixels, a rotation under it sitting at `(0.501, 0.500)` — dead centre of a
-//! unit square — and *that* rotation's own child back at `(305.6, -48.5)`,
-//! pixels again. `0.501 + 305.6/1312` lands at `0.734`, inside the square. No
-//! amount of staring at aggregate statistics produced that; one readable tree
-//! did.
+//! A point in a rotation's frame lands at `origin + R(angle) * (p * total
+//! scale)`. A rotation's total scale is the product of every rotation scale
+//! from the root down to it, with warps contributing one.
+//!
+//! ## What established it
+//!
+//! The Cubism Editor manual says of a rotation under a warp that moving the
+//! warp's control points makes the rotation and its children "move and rotate
+//! rather than deform". That is the rule above, stated by the authoring tool.
+//! Two measurements on real models agree with it and disagree with the rule
+//! this replaced:
+//!
+//! * **Texture proportions.** Every rigid mesh -- one keyform, hung off a
+//!   rotation -- is an exact similarity of its own texture layout. Posed under
+//!   the rule above it stays one, to within `1e-5` on three real models. Under
+//!   the old rule a hem panel came out 4.2:1, and fabric strands stretched and
+//!   contracted by up to seven times during a motion.
+//! * **Twin meshes.** Some models carry two copies of the same local mesh on
+//!   independent chains, one through several warps and rotations and one under
+//!   a root warp. Their posed sizes agree exactly under this rule and differ by
+//!   up to 14% under the old one.
+//!
+//! The old rule converted units: a rotation under a warp measured the warp's
+//! grid extent per axis, and pushed its children through the warp's bilinear
+//! lookup. It was found by reading one model's deformer tree, where a rotation
+//! sits at `(0.501, 0.500)` -- the centre of a unit square -- while its child
+//! is back at pixel coordinates. That observation is still right and is
+//! explained by this rule: the rotation's origin is a position *in the warp*
+//! and its children are in the rotation's own space. What was wrong was the
+//! conclusion that the child space is rescaled by the warp. It was
+//! measurable only against the texture, not against canvas fit.
+//!
+//! ## What is not verified
+//!
+//! * The probe length. The direction vector is read at `0.1` of the warp's unit
+//!   square, retried from the other side and then ten times shorter, up to ten
+//!   times, which is recalled from the Cubism 2 SDK and not re-read. Moving it
+//!   to `0.01` changes a vertex by at most `1.1e-3` canvas units on the worst
+//!   model measured and `1e-6` on the others.
+//! * Warp inside warp. The child's grid is carried through the parent (the SDK's
+//!   structure as recalled) rather than each point being walked through both
+//!   warps. They differ by up to `0.02` canvas units at rest and `0.06` in
+//!   motion on the worst model. Texture agreement leans weakly towards carrying
+//!   the grid, and glue closure at rest is identical.
+//! * Glue that has a gap at rest. A few glues do not coincide at rest (the
+//!   widest is `0.3` canvas units on one model) and no choice of parameters
+//!   closes the worst one. Glue pulls such a pair together, which can still
+//!   stretch a mesh. Whether Cubism shows the same pull needs a reference.
 //!
 //! # The grid orientation, and how it was found
 //!
@@ -168,12 +215,9 @@
 //! way Live2D bends it, or that blending weights are right *between* keys
 //! rather than only on them.
 //!
-//! **Rotation composition** is applied as
-//! `origin + rotate(base + angle) * scale * p / unit`. The unit conversion is
-//! the least pinned part: it takes a warp's posed bounding box per axis, which
-//! is right for an axis-aligned lattice and approximate for a turned one.
-//! Reading the setup grid instead, or forcing the rate isotropic, changes no
-//! model measurably, so nothing available here distinguishes them.
+//! **Rotation composition** is the rule at the top of this module. Its
+//! open points are listed there: the probe length, warp-in-warp order, and
+//! glue that has a gap at rest.
 
 use crate::moc3::{CubismIr, Deformer, DeformerKind, KeyformBinding, RotationKeyform};
 
@@ -248,15 +292,7 @@ pub trait CubismEval {
 trait EvalInternals {
     fn resolve_values(&self, values: &[f32]) -> Vec<f32>;
     fn weights_for(&self, binding: u32, values: &[f32]) -> Vec<(usize, f32)>;
-    fn carry_up(
-        &self,
-        from: Option<u32>,
-        points: &mut [(f32, f32)],
-        warps: &[Vec<(f32, f32)>],
-        rotations: &[RotationKeyform],
-        units: &[(f32, f32)],
-    );
-    fn warp_units(&self, grids: &[Vec<(f32, f32)>]) -> Vec<(f32, f32)>;
+    fn resolve_deformers(&self, warps: &[Vec<(f32, f32)>], rotations: &[RotationKeyform]) -> Vec<Resolved>;
     fn apply_glue(&self, drawables: &mut [Vec<(f32, f32)>], unstable: &[usize], values: &[f32]);
 }
 
@@ -313,7 +349,7 @@ impl CubismEval for CubismIr {
             })
             .collect();
 
-        let units = self.warp_units(&warps);
+        let resolved_deformers = self.resolve_deformers(&warps, &rotations);
 
         let mut unstable = Vec::new();
         let mut drawables = Vec::with_capacity(self.drawables.len());
@@ -349,7 +385,12 @@ impl CubismEval for CubismIr {
             // unusable they are what is reported, so a caller never receives a
             // non-finite vertex to hand to a renderer.
             let local = points.clone();
-            self.carry_up(d.parent_deformer, &mut points, &warps, &rotations, &units);
+            let parent = d.parent_deformer.and_then(|p| resolved_deformers.get(p as usize));
+            if let Some(parent) = parent {
+                for point in points.iter_mut() {
+                    *point = parent.map(*point);
+                }
+            }
             if points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
                 points = local;
                 unstable.push(index);
@@ -509,136 +550,140 @@ impl EvalInternals for CubismIr {
         }
     }
 
-    /// Carries points up the deformer chain until they reach canvas space.
-    fn carry_up(
-        &self,
-        from: Option<u32>,
-        points: &mut [(f32, f32)],
-        warps: &[Vec<(f32, f32)>],
-        rotations: &[RotationKeyform],
-        units: &[(f32, f32)],
-    ) {
-        // `None` is not a special case to handle: a drawable with no parent
-        // deformer is already in model space, so the walk simply does not run.
-        let mut at = from;
-        // The tree is checked acyclic on parse, so this terminates; the counter
-        // is belt and braces against a future change that stops checking.
-        let mut guard = 0usize;
-        while let Some(index) = at {
-            guard += 1;
-            if guard > self.deformers.len() + 1 {
-                return;
-            }
-            let Some(deformer) = self.deformers.get(index as usize) else { return };
-            match deformer.kind {
-                DeformerKind::Warp(i) => {
-                    if let (Some(grid), Some(shape)) = (warps.get(i as usize), self.warp_deformers.get(i as usize)) {
-                        // The second division count is the one that runs along
-                        // a stored row (see `WarpDeformer::divisions`), so it
-                        // is the x axis here.
-                        let (rows, columns) = shape.divisions;
-                        for point in points.iter_mut() {
-                            *point = warp_point(grid, columns as usize, rows as usize, *point);
-                        }
-                    }
-                    // A warp extrapolates outside its grid, so a child that
-                    // arrives in the wrong units grows by a factor per level.
-                    // Stopping here keeps that visible as one bad drawable
-                    // rather than as infinities spreading through the pose.
-                    if points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite()) {
-                        return;
-                    }
-                }
-                DeformerKind::Rotation(i) => {
-                    if let Some(frame) = rotations.get(i as usize) {
-                        // A rotation hands its result to its parent, so it has
-                        // to arrive in the parent's units. Every space in the
-                        // model is canvas pixels except a warp's, which is its
-                        // own unit square, so a rotation sitting under a warp is
-                        // the one place a conversion is needed.
-                        let scale = match deformer.parent.and_then(|p| self.deformers.get(p as usize)) {
-                            Some(Deformer { kind: DeformerKind::Warp(w), .. }) => {
-                                units.get(*w as usize).copied().unwrap_or((1.0, 1.0))
-                            }
-                            _ => (1.0, 1.0),
-                        };
-                        for point in points.iter_mut() {
-                            *point = rotate_point(frame, *point, scale);
-                        }
-                    }
-                }
-            }
-            at = deformer.parent;
-        }
-    }
-
-    /// How many canvas pixels one unit of each warp's child space spans.
+    /// Resolves every deformer into canvas space, parents first.
     ///
-    /// A warp's grid is drawn in its parent's space while its children live in
-    /// a unit square, so the grid's extent is the exchange rate between the
-    /// two. That extent is only in pixels when the parent is *not* itself a
-    /// warp; nested warps measure in their parent's units, so the rates
-    /// multiply down the chain.
-    ///
-    /// Rates are taken from the posed grids rather than setup ones, so a warp
-    /// that stretches carries its children with it.
-    fn warp_units(&self, grids: &[Vec<(f32, f32)>]) -> Vec<(f32, f32)> {
-        let extent = |i: usize| -> Option<(f32, f32)> {
-            let grid = grids.get(i)?;
-            let mut bounds = (f32::MIN, f32::MIN, f32::MAX, f32::MAX);
-            for (x, y) in grid {
-                bounds.0 = bounds.0.max(*x);
-                bounds.1 = bounds.1.max(*y);
-                bounds.2 = bounds.2.min(*x);
-                bounds.3 = bounds.3.min(*y);
-            }
-            let (w, h) = (bounds.0 - bounds.2, bounds.1 - bounds.3);
-            // A degenerate grid has no exchange rate to offer.
-            (w.is_finite() && h.is_finite() && w > f32::EPSILON && h > f32::EPSILON).then_some((w, h))
-        };
-
-        let mut out = vec![(1.0f32, 1.0f32); self.warp_deformers.len()];
-        let mut done = vec![false; self.warp_deformers.len()];
-        // Resolve each warp by walking up to the first non-warp ancestor, then
-        // multiplying back down. Depth is bounded by the tree, which is checked
-        // acyclic on parse.
-        for (index, deformer) in self.deformers.iter().enumerate() {
-            let DeformerKind::Warp(w) = deformer.kind else { continue };
-            if done[w as usize] {
+    /// See the module doc for the rule. The result is indexed like
+    /// `self.deformers`. A deformer whose parent index points nowhere is
+    /// resolved as a root, the same as one with no parent.
+    fn resolve_deformers(&self, warps: &[Vec<(f32, f32)>], rotations: &[RotationKeyform]) -> Vec<Resolved> {
+        let count = self.deformers.len();
+        let mut done: Vec<Option<Resolved>> = (0..count).map(|_| None).collect();
+        for start in 0..count {
+            if done[start].is_some() {
                 continue;
             }
+            // Walk up to the first resolved ancestor (or the root), then
+            // resolve back down. The tree is checked acyclic on parse; the
+            // length cap is belt and braces against that check going away.
             let mut chain = Vec::new();
-            let mut at = Some(index as u32);
+            let mut at = Some(start);
             while let Some(i) = at {
-                let Some(d) = self.deformers.get(i as usize) else { break };
-                let DeformerKind::Warp(w) = d.kind else { break };
-                chain.push(w as usize);
-                if done[w as usize] {
+                if i >= count || done[i].is_some() || chain.len() > count {
                     break;
                 }
-                at = d.parent;
-                if chain.len() > self.deformers.len() {
-                    break;
-                }
+                chain.push(i);
+                at = self.deformers[i].parent.map(|p| p as usize);
             }
-            // The far end is either a resolved warp or open pixel space.
-            let mut carry = match chain.last() {
-                Some(&w) if done[w] => out[w],
-                _ => (1.0, 1.0),
-            };
-            for &w in chain.iter().rev() {
-                if done[w] {
-                    carry = out[w];
-                    continue;
-                }
-                let (ew, eh) = extent(w).unwrap_or((1.0, 1.0));
-                carry = (ew * carry.0, eh * carry.1);
-                out[w] = carry;
-                done[w] = true;
+            for &i in chain.iter().rev() {
+                let deformer = &self.deformers[i];
+                let parent = deformer.parent.and_then(|p| done.get(p as usize)).and_then(|p| p.as_ref());
+                let resolved = match deformer.kind {
+                    DeformerKind::Warp(w) => {
+                        let shape = self.warp_deformers.get(w as usize);
+                        resolve_warp(warps.get(w as usize), shape.map(|s| s.divisions), parent)
+                    }
+                    DeformerKind::Rotation(r) => resolve_rotation(rotations.get(r as usize), parent),
+                };
+                done[i] = Some(resolved);
             }
         }
-        out
+        done.into_iter().map(|r| r.unwrap_or_else(Resolved::identity)).collect()
     }
+}
+
+/// A deformer resolved into canvas space.
+#[derive(Debug, Clone)]
+struct Resolved {
+    frame: Frame,
+    /// The product of every rotation's scale from the root down to here. A warp
+    /// adds none of its own: it passes its parent's through.
+    total_scale: f32,
+}
+
+#[derive(Debug, Clone)]
+enum Frame {
+    /// A warp, with its grid already carried into canvas space.
+    Warp { grid: Vec<(f32, f32)>, columns: usize, rows: usize },
+    /// A rotation, with its origin in canvas space and its angle in degrees,
+    /// the sum of everything above it.
+    Rotation { origin: (f32, f32), angle: f32 },
+    /// Maps a point to itself: a deformer that could not be found.
+    Identity,
+}
+
+impl Resolved {
+    fn identity() -> Self {
+        Self { frame: Frame::Identity, total_scale: 1.0 }
+    }
+
+    /// Carries a point from this deformer's child space into canvas space.
+    fn map(&self, point: (f32, f32)) -> (f32, f32) {
+        match &self.frame {
+            Frame::Warp { grid, columns, rows } => warp_point(grid, *columns, *rows, point),
+            Frame::Rotation { origin, angle } => rotate_point(*origin, *angle, self.total_scale, point),
+            Frame::Identity => point,
+        }
+    }
+}
+
+fn resolve_warp(grid: Option<&Vec<(f32, f32)>>, divisions: Option<(u32, u32)>, parent: Option<&Resolved>) -> Resolved {
+    // The second division count is the one that runs along a stored row (see
+    // `WarpDeformer::divisions`), so it is the number of columns.
+    let (rows, columns) = divisions.unwrap_or((0, 0));
+    let local: &[(f32, f32)] = grid.map(|g| g.as_slice()).unwrap_or(&[]);
+    let (grid, total_scale) = match parent {
+        Some(p) => (local.iter().map(|g| p.map(*g)).collect(), p.total_scale),
+        None => (local.to_vec(), 1.0),
+    };
+    Resolved { frame: Frame::Warp { grid, columns: columns as usize, rows: rows as usize }, total_scale }
+}
+
+/// How far along a warp's own up axis the probe that reads a rotation's turn
+/// reaches at first, in the warp's unit square.
+const TURN_PROBE: f32 = 0.1;
+
+fn resolve_rotation(key: Option<&RotationKeyform>, parent: Option<&Resolved>) -> Resolved {
+    let Some(key) = key else { return Resolved::identity() };
+    let Some(p) = parent else {
+        return Resolved { frame: Frame::Rotation { origin: key.origin, angle: key.angle }, total_scale: key.scale };
+    };
+    let (origin, angle) = match &p.frame {
+        Frame::Rotation { angle: parent_angle, .. } => (p.map(key.origin), key.angle + parent_angle),
+        Frame::Warp { .. } => {
+            let origin = p.map(key.origin);
+            // Only the warp's position and orientation reach a rotation below
+            // it, so the turn is read off a short probe along the warp's own
+            // up axis and compared with where that probe would point in an
+            // unbent warp. A probe that collapses onto the origin is retried
+            // from the other side, then shorter.
+            let mut reach = TURN_PROBE;
+            let mut found = None;
+            for _ in 0..10 {
+                let forward = p.map((key.origin.0, key.origin.1 - reach));
+                let d = (forward.0 - origin.0, forward.1 - origin.1);
+                if d != (0.0, 0.0) {
+                    found = Some(d);
+                    break;
+                }
+                let back = p.map((key.origin.0, key.origin.1 + reach));
+                let d = (origin.0 - back.0, origin.1 - back.1);
+                if d != (0.0, 0.0) {
+                    found = Some(d);
+                    break;
+                }
+                reach *= 0.1;
+            }
+            // A warp squashed flat has no direction to offer. The rotation then
+            // keeps its place and its own angle and the model keeps posing, as
+            // the SDK does; non-finite results are caught per drawable.
+            match found {
+                Some(d) => (origin, key.angle + d.1.atan2(d.0).to_degrees() + 90.0),
+                None => (origin, key.angle),
+            }
+        }
+        Frame::Identity => (key.origin, key.angle),
+    };
+    Resolved { frame: Frame::Rotation { origin, angle }, total_scale: p.total_scale * key.scale }
 }
 
 /// Where a value falls among a sorted key list.
@@ -688,15 +733,14 @@ fn warp_point(grid: &[(f32, f32)], divisions_x: usize, divisions_y: usize, point
     (top.0 + (bottom.0 - top.0) * ty, top.1 + (bottom.1 - top.1) * ty)
 }
 
-/// Places a point in a rotation deformer's frame.
+/// Places a point in a rotation deformer's frame: `origin + R(angle) * (p * scale)`.
 ///
-/// `unit` converts the turned offset into the parent's units, and is `(1, 1)`
-/// wherever the two already agree.
-fn rotate_point(frame: &RotationKeyform, point: (f32, f32), unit: (f32, f32)) -> (f32, f32) {
-    let (sin, cos) = frame.angle.to_radians().sin_cos();
-    let x = point.0 * frame.scale;
-    let y = point.1 * frame.scale;
-    (frame.origin.0 + (x * cos - y * sin) / unit.0, frame.origin.1 + (x * sin + y * cos) / unit.1)
+/// `scale` is the deformer's total scale, the product down the rotation chain.
+fn rotate_point(origin: (f32, f32), angle: f32, scale: f32, point: (f32, f32)) -> (f32, f32) {
+    let (sin, cos) = angle.to_radians().sin_cos();
+    let x = point.0 * scale;
+    let y = point.1 * scale;
+    (origin.0 + x * cos - y * sin, origin.1 + x * sin + y * cos)
 }
 
 #[cfg(test)]
@@ -1068,8 +1112,7 @@ mod tests {
 
     #[test]
     fn a_rotation_frame_places_turns_and_scales() {
-        let frame = RotationKeyform { origin: (100.0, 50.0), angle: 90.0, scale: 2.0, opacity: 1.0 };
-        let out = rotate_point(&frame, (1.0, 0.0), (1.0, 1.0));
+        let out = rotate_point((100.0, 50.0), 90.0, 2.0, (1.0, 0.0));
         // Two units along x, turned a quarter turn, from the origin.
         assert!((out.0 - 100.0).abs() < 1e-4, "{out:?}");
         assert!((out.1 - 52.0).abs() < 1e-4, "{out:?}");
@@ -1077,8 +1120,255 @@ mod tests {
 
     #[test]
     fn an_identity_frame_leaves_a_point_where_it_was() {
-        let frame = RotationKeyform { origin: (0.0, 0.0), angle: 0.0, scale: 1.0, opacity: 1.0 };
-        let out = rotate_point(&frame, (3.0, -4.0), (1.0, 1.0));
+        let out = rotate_point((0.0, 0.0), 0.0, 1.0, (3.0, -4.0));
         assert!((out.0 - 3.0).abs() < 1e-6 && (out.1 + 4.0).abs() < 1e-6, "{out:?}");
+    }
+
+    // ---- Hand-built deformer trees -------------------------------------------
+
+    enum Node {
+        Warp { parent: Option<u32>, divisions: (u32, u32), grid: Vec<(f32, f32)> },
+        Rotation { parent: Option<u32>, origin: (f32, f32), angle: f32, scale: f32 },
+    }
+
+    /// A model with the given deformer nodes (indexed in order) and one drawable
+    /// carrying `points` under `drawable_parent`. No parameters, so every
+    /// element has exactly its one keyform.
+    fn hand_model(nodes: &[Node], drawable_parent: Option<u32>, points: &[(f32, f32)]) -> CubismIr {
+        use crate::moc3::{Drawable, RotationDeformer, WarpDeformer};
+        let mut moc = CubismIr::default();
+        let mut floats: Vec<f32> = Vec::new();
+        let store = |floats: &mut Vec<f32>, data: &[(f32, f32)]| -> u32 {
+            let offset = floats.len() as u32;
+            for (x, y) in data {
+                floats.push(*x);
+                floats.push(*y);
+            }
+            offset
+        };
+        for node in nodes {
+            let id = format!("d{}", moc.deformers.len());
+            match node {
+                Node::Warp { parent, divisions, grid } => {
+                    let index = moc.warp_deformers.len() as u32;
+                    moc.warp_deformers.push(WarpDeformer {
+                        id: format!("warp{index}"),
+                        divisions: *divisions,
+                        point_count: grid.len() as u32,
+                        keyform_begin: moc.keyforms.warp_offsets.len() as u32,
+                        keyform_count: 1,
+                        keyform_binding: 0,
+                    });
+                    moc.keyforms.warp_offsets.push(store(&mut floats, grid));
+                    moc.deformers.push(Deformer { id, parent: *parent, kind: DeformerKind::Warp(index) });
+                }
+                Node::Rotation { parent, origin, angle, scale } => {
+                    let index = moc.rotation_deformers.len() as u32;
+                    moc.rotation_deformers.push(RotationDeformer {
+                        id: format!("rot{index}"),
+                        keyform_binding: 0,
+                        keyform_begin: moc.rotation_keyforms.len() as u32,
+                        keyform_count: 1,
+                        base_angle: 0.0,
+                    });
+                    moc.rotation_keyforms.push(RotationKeyform {
+                        origin: *origin,
+                        angle: *angle,
+                        scale: *scale,
+                        opacity: 1.0,
+                    });
+                    moc.deformers.push(Deformer { id, parent: *parent, kind: DeformerKind::Rotation(index) });
+                }
+            }
+        }
+        moc.keyforms.drawable_offsets.push(store(&mut floats, points));
+        moc.keyforms.positions = floats;
+        moc.drawables.push(Drawable {
+            id: "mesh".into(),
+            parent_deformer: drawable_parent,
+            uvs: vec![(0.0, 0.0); points.len()],
+            indices: vec![],
+            keyform_begin: 0,
+            keyform_count: 1,
+            keyform_binding: 0,
+            masks: vec![],
+            flags: 0,
+            part: None,
+            texture: 0,
+        });
+        moc
+    }
+
+    fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
+        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+    }
+
+    /// A one-cell warp, a rotation at the cell's centre under it, and a
+    /// right-angled corner with 40-unit edges under that.
+    fn rotation_under_warp(grid: [(f32, f32); 4], scale: f32) -> Pose {
+        let nodes = [
+            Node::Warp { parent: None, divisions: (1, 1), grid: grid.to_vec() },
+            Node::Rotation { parent: Some(0), origin: (0.5, 0.5), angle: 0.0, scale },
+        ];
+        hand_model(&nodes, Some(1), &[(0.0, 0.0), (40.0, 0.0), (0.0, -40.0)]).pose(&[])
+    }
+
+    #[test]
+    fn a_rotation_under_a_warp_moves_and_turns_but_does_not_stretch() {
+        let grid = [(0.0, 0.0), (200.0, 0.0), (0.0, 100.0), (260.0, 140.0)];
+        let pose = rotation_under_warp(grid, 1.0);
+        assert!(pose.is_stable());
+
+        // Pose flips y; work in the file's space.
+        let p: Vec<(f32, f32)> = pose.drawables[0].iter().map(|(x, y)| (*x, -*y)).collect();
+        // The warp maps its centre to the mean of its corners.
+        assert!(close(p[0], (115.0, 60.0)), "{:?}", p[0]);
+        // Edges stay exactly 40 and stay perpendicular.
+        assert!((dist(p[1], p[0]) - 40.0).abs() < 1e-3, "{}", dist(p[1], p[0]));
+        assert!((dist(p[2], p[0]) - 40.0).abs() < 1e-3, "{}", dist(p[2], p[0]));
+        let (e1, e2) = ((p[1].0 - p[0].0, p[1].1 - p[0].1), (p[2].0 - p[0].0, p[2].1 - p[0].1));
+        assert!((e1.0 * e2.0 + e1.1 * e2.1).abs() < 1e-2, "{e1:?} {e2:?}");
+
+        // The turn is the warp's local up axis against an unbent one. By hand
+        // the probe from (0.5, 0.4) lands on (112, 48), so it points along
+        // (-3, -12) from the origin.
+        let turn = (-12.0f32).atan2(-3.0).to_degrees() + 90.0;
+        let (s, c) = turn.to_radians().sin_cos();
+        assert!((e1.0 - 40.0 * c).abs() < 1e-2 && (e1.1 - 40.0 * s).abs() < 1e-2, "{e1:?} vs turn {turn}");
+    }
+
+    #[test]
+    fn a_warp_lends_a_rotation_no_scale() {
+        // A 100 by 300 rectangle turned a quarter so its u axis runs down y.
+        // Under the old rule the 40 by 40 square came out 9:1 (180 by 20).
+        let grid = [(0.0, 0.0), (0.0, 300.0), (100.0, 0.0), (100.0, 300.0)];
+        let pose = rotation_under_warp(grid, 1.5);
+        let p = &pose.drawables[0];
+        assert!((dist(p[1], p[0]) - 60.0).abs() < 1e-3, "{}", dist(p[1], p[0]));
+        assert!((dist(p[2], p[0]) - 60.0).abs() < 1e-3, "{}", dist(p[2], p[0]));
+        assert!(close(p[0], (50.0, -150.0)), "{:?}", p[0]);
+    }
+
+    #[test]
+    fn rotation_scales_multiply_down_a_chain_through_warps() {
+        // The warp is a rectangle three times taller than wide, turned a
+        // quarter so its u axis runs down y. An axis-aligned one would let the
+        // old per-axis unit cancel against the bilinear lookup and hide the
+        // difference; a turned one leaves it 9:1.
+        for size in [10.0f32, 1000.0] {
+            let nodes = [
+                Node::Rotation { parent: None, origin: (0.0, 0.0), angle: 0.0, scale: 0.5 },
+                Node::Warp {
+                    parent: Some(0),
+                    divisions: (1, 1),
+                    grid: vec![(0.0, 0.0), (0.0, 3.0 * size), (size, 0.0), (size, 3.0 * size)],
+                },
+                Node::Rotation { parent: Some(1), origin: (0.5, 0.5), angle: 0.0, scale: 2.0 },
+            ];
+            let pose = hand_model(&nodes, Some(2), &[(0.0, 0.0), (40.0, 0.0), (0.0, -40.0)]).pose(&[]);
+            let p = &pose.drawables[0];
+            assert!((dist(p[1], p[0]) - 40.0).abs() < 1e-2, "grid {size}: {}", dist(p[1], p[0]));
+            assert!((dist(p[2], p[0]) - 40.0).abs() < 1e-2, "grid {size}: {}", dist(p[2], p[0]));
+        }
+    }
+
+    #[test]
+    fn a_rotation_under_a_rotation_composes_as_before() {
+        let nodes = [
+            Node::Rotation { parent: None, origin: (100.0, 50.0), angle: 90.0, scale: 2.0 },
+            Node::Rotation { parent: Some(0), origin: (10.0, 0.0), angle: 30.0, scale: 3.0 },
+        ];
+        let pose = hand_model(&nodes, Some(1), &[(1.0, 0.0)]).pose(&[]);
+        // Origin: the parent's frame sends (10, 0) to (100, 50) + 2 * (0, 10).
+        // Angles add to 120 degrees and scales multiply to 6.
+        let (s, c) = 120f32.to_radians().sin_cos();
+        let expect = (100.0 + 6.0 * c, -(70.0 + 6.0 * s));
+        assert!(close(pose.drawables[0][0], expect), "{:?} vs {expect:?}", pose.drawables[0][0]);
+    }
+
+    #[test]
+    fn a_warp_squashed_flat_leaves_its_rotation_children_posed_at_its_origin() {
+        // Every control point equal: no probe has a direction. The rotation
+        // keeps its origin and its own angle, and the model stays stable.
+        let nodes = [
+            Node::Warp { parent: None, divisions: (1, 1), grid: vec![(5.0, 5.0); 4] },
+            Node::Rotation { parent: Some(0), origin: (0.5, 0.5), angle: 0.0, scale: 1.0 },
+        ];
+        let pose = hand_model(&nodes, Some(1), &[(0.0, 0.0), (40.0, 0.0), (0.0, -40.0)]).pose(&[]);
+        assert!(pose.is_stable(), "{:?}", pose.unstable);
+        let expect = [(5.0, -5.0), (45.0, -5.0), (5.0, 35.0)];
+        for (got, want) in pose.drawables[0].iter().zip(expect) {
+            assert!(close(*got, want), "{:?}", pose.drawables[0]);
+        }
+    }
+
+    #[test]
+    fn a_warp_that_goes_non_finite_reports_what_hangs_below_it_unstable() {
+        let nodes = [
+            Node::Warp { parent: None, divisions: (1, 1), grid: vec![(f32::NAN, 0.0); 4] },
+            Node::Rotation { parent: Some(0), origin: (0.5, 0.5), angle: 0.0, scale: 1.0 },
+        ];
+        let pose = hand_model(&nodes, Some(1), &[(0.0, 0.0), (40.0, 0.0), (0.0, -40.0)]).pose(&[]);
+        assert_eq!(pose.unstable, vec![0]);
+        assert!(pose.drawables.iter().flatten().all(|(x, y)| x.is_finite() && y.is_finite()), "{:?}", pose.drawables);
+    }
+
+    #[test]
+    fn a_collapsed_forward_probe_is_read_from_the_other_side() {
+        // Two cells stacked in v (two row divisions, one column). The lower
+        // cell is squashed flat, the upper one is skewed to the right. The
+        // rotation sits on the seam at (0.5, 0.5), so the forward probe, at
+        // v = 0.4, lands in the flat cell and returns the origin itself.
+        let grid = vec![(0.0, 100.0), (100.0, 100.0), (0.0, 100.0), (100.0, 100.0), (30.0, 200.0), (130.0, 200.0)];
+        let nodes = [
+            Node::Warp { parent: None, divisions: (2, 1), grid },
+            Node::Rotation { parent: Some(0), origin: (0.5, 0.5), angle: 0.0, scale: 1.0 },
+        ];
+        let pose = hand_model(&nodes, Some(1), &[(0.0, 0.0), (40.0, 0.0), (0.0, -40.0)]).pose(&[]);
+        let p: Vec<(f32, f32)> = pose.drawables[0].iter().map(|(x, y)| (*x, -*y)).collect();
+        assert!(close(p[0], (50.0, 100.0)), "{:?}", p[0]);
+        // The back probe at v = 0.6 is 20% up the skewed cell: (56, 120). The
+        // direction is origin - back = (-6, -20), not its negation, so the turn
+        // is atan2(-20, -6) + 90 = -16.7 degrees. A sign slip would give 163.3.
+        let turn = (-20.0f32).atan2(-6.0).to_degrees() + 90.0;
+        assert!((turn + 16.699).abs() < 1e-2, "the expectation itself: {turn}");
+        let (s, c) = turn.to_radians().sin_cos();
+        let e1 = (p[1].0 - p[0].0, p[1].1 - p[0].1);
+        assert!((e1.0 - 40.0 * c).abs() < 1e-2 && (e1.1 - 40.0 * s).abs() < 1e-2, "{e1:?}");
+    }
+
+    #[test]
+    fn a_warp_inside_a_warp_carries_its_grid_through_the_parent() {
+        // The parent is not affine (its far corner is pushed out), and the
+        // child is a distorted patch of its unit square. Carrying the child's
+        // corners through the parent -- (0,0), (50,0), (0,50) and (131.25,
+        // 131.25) -- and interpolating gives (45.3125, 45.3125) for the
+        // child's centre; walking the point through both warps in turn gives
+        // (41.015625, 41.015625). The documented rule is the first.
+        let parent = vec![(0.0, 0.0), (100.0, 0.0), (0.0, 100.0), (200.0, 200.0)];
+        let child = vec![(0.0, 0.0), (0.5, 0.0), (0.0, 0.5), (0.75, 0.75)];
+        let nodes = [
+            Node::Warp { parent: None, divisions: (1, 1), grid: parent },
+            Node::Warp { parent: Some(0), divisions: (1, 1), grid: child },
+        ];
+        let pose = hand_model(&nodes, Some(1), &[(0.5, 0.5)]).pose(&[]);
+        assert!(close(pose.drawables[0][0], (45.3125, -45.3125)), "{:?}", pose.drawables[0]);
+    }
+
+    #[test]
+    fn a_warp_under_a_rotation_lives_in_the_rotations_turned_and_scaled_space() {
+        let nodes = [
+            Node::Rotation { parent: None, origin: (10.0, 20.0), angle: 90.0, scale: 2.0 },
+            Node::Warp {
+                parent: Some(0),
+                divisions: (1, 1),
+                grid: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)],
+            },
+        ];
+        let pose = hand_model(&nodes, Some(1), &[(0.5, 0.5), (1.0, 0.0)]).pose(&[]);
+        // (0.5, 0.5) doubles to (1, 1), a quarter turn makes it (-1, 1).
+        assert!(close(pose.drawables[0][0], (9.0, -21.0)), "{:?}", pose.drawables[0]);
+        // (1, 0) doubles to (2, 0), a quarter turn makes it (0, 2).
+        assert!(close(pose.drawables[0][1], (10.0, -22.0)), "{:?}", pose.drawables[0]);
     }
 }
