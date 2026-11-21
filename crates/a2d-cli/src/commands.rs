@@ -363,10 +363,12 @@ Opening {} in the desktop viewer.",
     writeln!(
         out,
         "
-Presented {} frames in {:.1}s ({:.0} fps).",
+Presented {} frames in {:.1}s ({:.0} fps) on {} with {} alpha.",
         summary.frames,
         summary.elapsed.as_secs_f32(),
-        summary.frames as f32 / summary.elapsed.as_secs_f32().max(f32::MIN_POSITIVE)
+        summary.frames as f32 / summary.elapsed.as_secs_f32().max(f32::MIN_POSITIVE),
+        summary.backend,
+        summary.alpha_mode
     )?;
     Ok(())
 }
@@ -498,10 +500,12 @@ Opening {} in the desktop viewer.",
     writeln!(
         out,
         "
-Presented {} frames in {:.1}s ({:.0} fps).",
+Presented {} frames in {:.1}s ({:.0} fps) on {} with {} alpha.",
         summary.frames,
         summary.elapsed.as_secs_f32(),
-        summary.frames as f32 / summary.elapsed.as_secs_f32().max(f32::MIN_POSITIVE)
+        summary.frames as f32 / summary.elapsed.as_secs_f32().max(f32::MIN_POSITIVE),
+        summary.backend,
+        summary.alpha_mode
     )?;
     Ok(())
 }
@@ -672,10 +676,12 @@ fn open_viewer(out: &mut dyn std::io::Write, package_dir: &Path, flags: ViewerFl
     writeln!(
         out,
         "
-Presented {} frames in {:.1}s ({:.0} fps).",
+Presented {} frames in {:.1}s ({:.0} fps) on {} with {} alpha.",
         summary.frames,
         summary.elapsed.as_secs_f32(),
-        summary.frames as f32 / summary.elapsed.as_secs_f32().max(f32::MIN_POSITIVE)
+        summary.frames as f32 / summary.elapsed.as_secs_f32().max(f32::MIN_POSITIVE),
+        summary.backend,
+        summary.alpha_mode
     )?;
     Ok(())
 }
