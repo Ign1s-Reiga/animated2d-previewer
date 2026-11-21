@@ -19,6 +19,13 @@ pub struct ModelEntry {
     pub display_name: String,
     /// Animation names, in the order the selector cycles through them.
     pub animations: Vec<String>,
+    /// Whether `package` can be opened again from a bare path on the next start.
+    ///
+    /// False for a model the caller decoded itself (a raw bundle, or a package
+    /// only an importer-aware caller can build): its path is not something the
+    /// viewer's own package loader understands, so remembering it would only
+    /// produce a load failure on every later start.
+    pub reopenable: bool,
 }
 
 /// A drag in progress.
@@ -81,6 +88,18 @@ impl ViewerState {
     /// been deleted since last run should not leave a selector entry that
     /// cannot be selected.
     pub fn from_config(config: &Config, models: Vec<ModelEntry>) -> ViewerState {
+        ViewerState::from_config_preferring(config, models, None)
+    }
+
+    /// As [`from_config`](ViewerState::from_config), but a model the caller
+    /// named (on the command line, say) becomes the active one in preference
+    /// to whichever the config remembered. Its remembered settings, if any,
+    /// still apply. A `preferred` that is not among `models` is ignored.
+    pub fn from_config_preferring(
+        config: &Config,
+        models: Vec<ModelEntry>,
+        preferred: Option<&std::path::Path>,
+    ) -> ViewerState {
         let mut state = ViewerState {
             always_on_top: config.window.always_on_top,
             click_through: config.window.click_through,
@@ -90,15 +109,21 @@ impl ViewerState {
 
         // Re-find the active package by path, since the loadable set may be a
         // subset of what the config listed and indices would not line up.
-        if let Some(active) = config.active_model() {
-            if let Some(at) = state.models.iter().position(|m| m.package == active.package) {
+        let wanted = preferred
+            .filter(|p| state.models.iter().any(|m| m.package == *p))
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| config.active_model().map(|m| m.package.clone()));
+        if let Some(wanted) = wanted {
+            if let Some(at) = state.models.iter().position(|m| m.package == wanted) {
                 state.active = at;
             }
-            state.scale = active.scale.clamp(MIN_SCALE, MAX_SCALE);
-            state.offset = Vec2::new(active.offset.0, active.offset.1);
-            state.flip_x = active.flip_x;
-            if let Some(name) = &active.animation {
-                state.select_animation_by_name(name);
+            if let Some(settings) = config.models.iter().find(|m| m.package == wanted) {
+                state.scale = settings.scale.clamp(MIN_SCALE, MAX_SCALE);
+                state.offset = Vec2::new(settings.offset.0, settings.offset.1);
+                state.flip_x = settings.flip_x;
+                if let Some(name) = &settings.animation {
+                    state.select_animation_by_name(name);
+                }
             }
         }
         state.dirty = false;
@@ -110,6 +135,9 @@ impl ViewerState {
         config.window.always_on_top = self.always_on_top;
         config.window.click_through = self.click_through;
         let Some(model) = self.active_model() else { return };
+        if !model.reopenable {
+            return;
+        }
 
         let at = config.add_or_select(&model.package);
         let entry = ModelConfig {
@@ -345,6 +373,7 @@ mod tests {
             package: PathBuf::from(format!("{name}.a2dpack")),
             display_name: name.to_string(),
             animations: animations.iter().map(|a| a.to_string()).collect(),
+            reopenable: true,
         }
     }
 
@@ -602,6 +631,56 @@ mod tests {
     }
 
     #[test]
+    fn a_migrated_relative_entry_matches_its_own_model_and_keeps_its_settings() {
+        use crate::config::absolute_path;
+        let here = absolute_path(std::path::Path::new("hero.a2dpack"));
+        let hero = ModelEntry { package: here.clone(), ..entry("hero", &["idle", "walk"]) };
+        let villain = ModelEntry {
+            package: absolute_path(std::path::Path::new("villain.a2dpack")),
+            ..entry("villain", &["idle"])
+        };
+        let models = vec![villain.clone(), hero.clone()];
+
+        let mut config = Config::default();
+        config.add_or_select(std::path::Path::new("hero.a2dpack"));
+        let remembered = config.active_model_mut().unwrap();
+        remembered.scale = 2.0;
+        remembered.animation = Some("walk".into());
+        assert!(config.migrate_relative_entries(|p| p == here));
+        assert_eq!(config.models.len(), 1, "one entry, not a relative and an absolute twin");
+
+        // No model named: the remembered (formerly relative) one is active.
+        let s = ViewerState::from_config(&config, models.clone());
+        assert_eq!(s.active_model().unwrap().display_name, "hero");
+        assert_eq!((s.scale(), s.animation_name()), (2.0, Some("walk")));
+
+        // Named on the command line: the same entry, same settings.
+        let s = ViewerState::from_config_preferring(&config, models, Some(&here));
+        assert_eq!((s.active_model().unwrap().display_name.as_str(), s.scale()), ("hero", 2.0));
+
+        // Saving does not create a second entry.
+        s.write_into(&mut config);
+        assert_eq!(config.models.len(), 1);
+    }
+
+    #[test]
+    fn a_named_model_is_active_in_preference_to_the_remembered_one() {
+        use std::path::Path;
+        let mut config = Config::default();
+        config.add_or_select(Path::new("hero.a2dpack"));
+        config.active_model_mut().unwrap().scale = 2.0;
+        let models = vec![entry("hero", &["idle"]), entry("villain", &["idle", "laugh"])];
+
+        let s = ViewerState::from_config_preferring(&config, models.clone(), Some(Path::new("villain.a2dpack")));
+        assert_eq!(s.active_model().unwrap().display_name, "villain");
+        assert_eq!(s.scale(), 1.0, "the remembered model's scale belongs to the remembered model");
+
+        let s = ViewerState::from_config_preferring(&config, models, Some(Path::new("gone.a2dpack")));
+        assert_eq!(s.active_model().unwrap().display_name, "hero", "an unloadable preference is ignored");
+        assert_eq!(s.scale(), 2.0);
+    }
+
+    #[test]
     fn a_config_naming_a_model_that_no_longer_loads_falls_back_to_the_first() {
         let mut config = Config::default();
         config.add_or_select(std::path::Path::new("deleted.a2dpack"));
@@ -656,6 +735,17 @@ mod tests {
         state.write_into(&mut round_tripped);
 
         assert_eq!(round_tripped.active_model(), config.active_model());
+    }
+
+    #[test]
+    fn a_model_that_cannot_be_reopened_from_its_path_is_not_remembered() {
+        let mut s = state();
+        s.models[0].reopenable = false;
+        s.toggle_click_through();
+        let mut config = Config::default();
+        s.write_into(&mut config);
+        assert!(config.models.is_empty(), "{:?}", config.models);
+        assert!(config.window.click_through, "window settings are still written");
     }
 
     #[test]

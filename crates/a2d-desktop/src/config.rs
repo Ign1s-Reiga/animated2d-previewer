@@ -149,6 +149,86 @@ impl Config {
         }
     }
 
+    /// Drops remembered models that `is_dead` says can never be opened again.
+    ///
+    /// A dead entry would otherwise be reported as unloadable on every start,
+    /// forever. The predicate must be conservative (see [`is_dead_entry`]):
+    /// forgetting loses the model's scale, offset and animation. An entry that
+    /// is merely unreachable or fails to load stays, with its warning. The
+    /// active selection follows its model, or falls back to the first. Reports
+    /// once, naming every path. Returns whether anything was dropped, i.e.
+    /// whether the config needs saving.
+    pub fn forget_dead_models(&mut self, is_dead: impl Fn(&Path) -> bool, report: &mut LoadReport) -> bool {
+        let active = self.active_model().map(|m| m.package.clone());
+        let mut forgotten = Vec::new();
+        self.models.retain(|m| {
+            let dead = is_dead(&m.package);
+            if dead {
+                forgotten.push(m.package.display().to_string());
+            }
+            !dead
+        });
+        if forgotten.is_empty() {
+            return false;
+        }
+        self.active = active.and_then(|a| self.models.iter().position(|m| m.package == a)).unwrap_or(0);
+        report.note(format!(
+            "forgot {} remembered model(s) that no longer exist or are not packages: {}",
+            forgotten.len(),
+            forgotten.join(", ")
+        ));
+        true
+    }
+
+    /// Rewrites relative entries to absolute ones, once, at load.
+    ///
+    /// Loaded models carry absolute paths, so a relative entry would never
+    /// match its own model: the selector would list it twice and its settings
+    /// would be dropped. An entry is migrated when `is_package` says the path
+    /// it resolves to from the current directory is a package; any other
+    /// relative entry is left as it is, since it may belong to another start
+    /// directory. Entries that become equal are merged, keeping the active
+    /// one's settings, else the first's. The active pointer follows its
+    /// model. Returns whether anything changed, i.e. whether to save.
+    pub fn migrate_relative_entries(&mut self, is_package: impl Fn(&Path) -> bool) -> bool {
+        let active_before = self.active;
+        let mut changed = false;
+        let mut merged: Vec<ModelConfig> = Vec::with_capacity(self.models.len());
+        let mut new_active = None;
+        for (index, model) in std::mem::take(&mut self.models).into_iter().enumerate() {
+            let mut model = model;
+            if !model.package.is_absolute() {
+                let absolute = absolute_path(&model.package);
+                if absolute != model.package && is_package(&absolute) {
+                    model.package = absolute;
+                    changed = true;
+                }
+            }
+            let is_active = index == active_before;
+            match merged.iter().position(|m| m.package == model.package) {
+                Some(at) => {
+                    changed = true;
+                    if is_active {
+                        merged[at] = model;
+                        new_active = Some(at);
+                    }
+                }
+                None => {
+                    if is_active {
+                        new_active = Some(merged.len());
+                    }
+                    merged.push(model);
+                }
+            }
+        }
+        self.models = merged;
+        // An out-of-range pointer is `sanitize`'s to repair, not ours.
+        if let Some(at) = new_active {
+            self.active = at;
+        }
+        changed
+    }
+
     /// Serialises to deterministic pretty JSON with a trailing newline.
     pub fn to_json(&self) -> Result<String, DecodeError> {
         for model in &self.models {
@@ -205,7 +285,18 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| DecodeError::io(parent.display().to_string(), e))?;
         }
-        std::fs::write(path, self.to_json()?).map_err(|e| DecodeError::io(path.display().to_string(), e))
+        // Temp file then rename, so a crash mid-write leaves the old config
+        // intact rather than a truncated one.
+        let json = self.to_json()?;
+        let mut temp = path.as_os_str().to_owned();
+        // The pid keeps two processes saving at once from sharing a temp file.
+        temp.push(format!(".{}.tmp", std::process::id()));
+        let temp = PathBuf::from(temp);
+        std::fs::write(&temp, json).map_err(|e| DecodeError::io(temp.display().to_string(), e))?;
+        std::fs::rename(&temp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            DecodeError::io(path.display().to_string(), e)
+        })
     }
 
     /// Loads from the platform config path.
@@ -224,6 +315,65 @@ impl Config {
     pub fn save(&self) -> Result<(), DecodeError> {
         let path = config_path().ok_or_else(|| DecodeError::corrupt("no writable config directory was found"))?;
         self.save_to(&path)
+    }
+}
+
+/// Makes a path absolute without touching the filesystem, so a remembered
+/// entry means the same place whatever directory the viewer starts from. Falls
+/// back to the path as given if the platform cannot say.
+pub fn absolute_path(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Whether `dir` holds a package manifest: the test for migrating a relative
+/// entry to the absolute path it resolves to.
+pub fn has_manifest(dir: &Path) -> bool {
+    dir.join("manifest.json").is_file()
+}
+
+/// Whether a remembered entry is *definitely* never coming back as a package.
+///
+/// Deliberately conservative, because a wrong "dead" deletes the user's
+/// per-model settings. True only for an absolute path that is
+///
+/// - a regular file (a raw bundle remembered by an older build),
+/// - missing while its parent directory exists and is not empty (deleted; an
+///   empty parent may be the mount point of a volume that is not mounted),
+/// - a directory with no `manifest.json`, or
+/// - a package whose readable manifest names a model type the viewer cannot
+///   open.
+///
+/// Relative paths (they depend on the start directory), unreachable roots
+/// (an unmounted drive, a network share), permission errors, and packages
+/// whose manifest merely fails to parse are all left alone: the load warning
+/// is the right outcome for those.
+pub fn is_dead_entry(path: &Path) -> bool {
+    use std::io::ErrorKind::NotFound;
+
+    if !path.is_absolute() {
+        return false;
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => true,
+        Ok(meta) if meta.is_dir() => {
+            let manifest = path.join("manifest.json");
+            match std::fs::read_to_string(&manifest) {
+                Ok(text) => a2d_pack::Manifest::from_json(&text)
+                    .is_ok_and(|m| !crate::viewer::LoadedModel::can_open(m.model_type)),
+                Err(e) => e.kind() == NotFound,
+            }
+        }
+        Ok(_) => false,
+        // Deleted, as opposed to on a volume that is not mounted: the parent
+        // must exist *and hold something*. An unmounted volume can leave its
+        // mount point (or a reused drive letter) behind as an empty directory,
+        // and that case is kept. The remaining limitation is a mount point that
+        // holds other files; it is accepted.
+        Err(e) if e.kind() == NotFound => path.parent().is_some_and(|parent| {
+            std::fs::metadata(parent).is_ok_and(|m| m.is_dir())
+                && std::fs::read_dir(parent).is_ok_and(|mut entries| entries.next().is_some())
+        }),
+        Err(_) => false,
     }
 }
 
@@ -297,6 +447,197 @@ mod tests {
             ],
             active: 1,
         }
+    }
+
+    #[test]
+    fn missing_models_are_forgotten_once_and_reported_in_one_note() {
+        let mut config = sample();
+        config.models.push(ModelConfig::new("gone.a2dpack"));
+        config.models.insert(0, ModelConfig::new("also-gone.a2dpack"));
+        config.active = 2; // villain
+        let mut report = LoadReport::new();
+        let changed = config.forget_dead_models(|p| p.to_string_lossy().contains("gone"), &mut report);
+        assert!(changed);
+        assert_eq!(config.models.len(), 2);
+        assert_eq!(config.active_model().unwrap().package, PathBuf::from("villain.a2dpack"));
+        assert_eq!(report.len(), 1, "{report}");
+        let text = report.to_string();
+        assert!(text.contains("forgot 2 remembered model(s) that no longer exist or are not packages"), "{text}");
+        assert!(text.contains("also-gone.a2dpack") && text.contains("gone.a2dpack"), "{text}");
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("a2d-cfg-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manifest_of(model_type: a2d_pack::ModelType) -> String {
+        a2d_pack::Manifest::new(model_type, "x").to_json().unwrap()
+    }
+
+    #[test]
+    fn only_definitely_dead_entries_are_forgotten() {
+        let dir = absolute_path(&scratch("dead"));
+        let file = dir.join("bundle.bin");
+        let bare = dir.join("bare.a2dpack");
+        let spine = dir.join("spine.a2dpack");
+        let cubism = dir.join("cubism.a2dpack");
+        let corrupt = dir.join("corrupt.a2dpack");
+        for d in [&bare, &spine, &cubism, &corrupt] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(&file, b"not a package").unwrap();
+        std::fs::write(spine.join("manifest.json"), manifest_of(a2d_pack::ModelType::Spine)).unwrap();
+        std::fs::write(cubism.join("manifest.json"), manifest_of(a2d_pack::ModelType::Cubism)).unwrap();
+        std::fs::write(corrupt.join("manifest.json"), "{ not valid, but present }").unwrap();
+
+        assert!(is_dead_entry(&file), "a regular file is not a package");
+        assert!(is_dead_entry(&bare), "a directory without a manifest is not a package");
+        assert!(is_dead_entry(&dir.join("deleted.a2dpack")), "missing under an existing parent is deleted");
+        assert!(is_dead_entry(&cubism), "a model type the viewer cannot open will never load");
+        assert!(!is_dead_entry(&spine));
+        assert!(!is_dead_entry(&corrupt), "a corrupt manifest is a real problem to warn about");
+
+        let mut config = Config::default();
+        for p in [&file, &bare, &spine, &cubism, &corrupt] {
+            config.add_or_select(p);
+        }
+        let mut report = LoadReport::new();
+        assert!(config.forget_dead_models(is_dead_entry, &mut report));
+        let kept: Vec<_> = config.models.iter().map(|m| m.package.clone()).collect();
+        assert_eq!(kept, vec![spine, corrupt]);
+        assert_eq!(report.len(), 1, "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_package_under_an_empty_parent_is_kept_as_possibly_unmounted() {
+        let dir = absolute_path(&scratch("mountpoint"));
+        assert!(!is_dead_entry(&dir.join("pkg.a2dpack")), "an empty parent may be an unmounted volume");
+        std::fs::write(dir.join("other"), b"x").unwrap();
+        assert!(is_dead_entry(&dir.join("pkg.a2dpack")), "a parent holding other things means it was deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn settled(path: &str, scale: f32) -> ModelConfig {
+        ModelConfig { scale, ..ModelConfig::new(path) }
+    }
+
+    #[test]
+    fn a_relative_entry_that_is_a_package_here_becomes_absolute() {
+        let here = absolute_path(Path::new("hero.a2dpack"));
+        let mut config = Config {
+            models: vec![settled("hero.a2dpack", 2.0), settled("elsewhere.a2dpack", 3.0)],
+            active: 0,
+            ..Config::default()
+        };
+        // Only the first resolves to a package from this directory.
+        let changed = config.migrate_relative_entries(|p| p == here);
+        assert!(changed);
+        assert_eq!(config.models[0].package, here);
+        assert_eq!(config.models[0].scale, 2.0, "settings travel with the entry");
+        assert_eq!(config.models[1].package, PathBuf::from("elsewhere.a2dpack"), "others are left alone");
+        assert_eq!(config.active, 0);
+        assert!(!config.migrate_relative_entries(|p| p == here), "a second pass changes nothing");
+    }
+
+    #[test]
+    fn entries_equal_after_migration_are_merged_keeping_the_active_ones_settings() {
+        let here = absolute_path(Path::new("hero.a2dpack"));
+        let mut config = Config {
+            models: vec![settled("villain.a2dpack", 1.0), settled("hero.a2dpack", 2.0), ModelConfig::new(here.clone())],
+            active: 1,
+            ..Config::default()
+        };
+        let mut abs = settled("x", 9.0);
+        abs.package = here.clone();
+        config.models[2] = abs;
+        assert!(config.migrate_relative_entries(|p| p == here));
+        assert_eq!(config.models.len(), 2);
+        assert_eq!(config.models[1].package, here);
+        assert_eq!(config.models[1].scale, 2.0, "the active entry's settings win");
+        assert_eq!(config.active, 1);
+
+        // Active is the later duplicate: pointer follows the merged entry.
+        let mut config = Config {
+            models: vec![ModelConfig::new(here.clone()), settled("hero.a2dpack", 4.0)],
+            active: 1,
+            ..Config::default()
+        };
+        assert!(config.migrate_relative_entries(|p| p == here));
+        assert_eq!(config.models.len(), 1);
+        assert_eq!((config.active, config.models[0].scale), (0, 4.0));
+
+        // Neither active: the first wins.
+        let mut config = Config {
+            models: vec![
+                settled("villain.a2dpack", 1.0),
+                ModelConfig { scale: 5.0, ..ModelConfig::new(here.clone()) },
+                settled("hero.a2dpack", 4.0),
+            ],
+            active: 0,
+            ..Config::default()
+        };
+        assert!(config.migrate_relative_entries(|p| p == here));
+        assert_eq!(config.models.len(), 2);
+        assert_eq!(config.models[1].scale, 5.0);
+    }
+
+    #[test]
+    fn relative_and_unreachable_entries_are_kept() {
+        // Relative: depends on where the viewer was started.
+        assert!(!is_dead_entry(Path::new("hero.a2dpack")));
+        // Unreachable root: the parent does not exist either (unmounted drive).
+        let dir = absolute_path(&scratch("unreach"));
+        let off = dir.join("no-such-drive").join("pkg.a2dpack");
+        assert!(!is_dead_entry(&off));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absolute_path_is_absolute_and_stable() {
+        let abs = absolute_path(Path::new("hero.a2dpack"));
+        assert!(abs.is_absolute());
+        assert_eq!(absolute_path(&abs), abs);
+    }
+
+    #[test]
+    fn forgetting_the_active_model_falls_back_to_the_first() {
+        let mut config = sample();
+        config.active = 1;
+        let mut report = LoadReport::new();
+        config.forget_dead_models(|p| p == Path::new("villain.a2dpack"), &mut report);
+        assert_eq!(config.active, 0);
+        assert_eq!(config.models.len(), 1);
+    }
+
+    #[test]
+    fn nothing_missing_changes_nothing_and_says_nothing() {
+        let mut config = sample();
+        let before = config.clone();
+        let mut report = LoadReport::new();
+        assert!(!config.forget_dead_models(|_| false, &mut report));
+        assert_eq!(config, before);
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn saving_leaves_no_temp_file_and_replaces_the_old_config() {
+        let dir = std::env::temp_dir().join(format!("a2d-cfg-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "stale").unwrap();
+        sample().save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path).0, sample());
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "no temp file should remain");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

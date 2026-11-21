@@ -86,6 +86,12 @@ fn import_warnings_recorded_in_the_manifest_are_printed() {
     let mut package = cubism_package(true);
     package.manifest.import_warnings.push("a curve was dropped".into());
     let Some((_dir, text)) = export_package(package, "warn") else { return };
+    assert_eq!(
+        text.matches("a curve was dropped").count(),
+        1,
+        "each warning prints exactly once:
+{text}"
+    );
     assert!(text.contains("recorded at import: a curve was dropped"), "{text}");
 }
 

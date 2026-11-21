@@ -16,6 +16,7 @@ use a2d_render::{
 };
 use a2d_runtime::{GenericSpineModel, IdleDirector};
 
+use crate::config::absolute_path;
 use crate::state::ModelEntry;
 
 /// Anything the viewer can fail with.
@@ -34,6 +35,9 @@ pub enum ViewerError {
 /// One package, decoded and ready to play.
 pub struct LoadedModel {
     pub package_path: PathBuf,
+    /// Whether `package_path` can be read back by [`LoadedModel::load`], which
+    /// decides whether the config may remember it.
+    reopenable: bool,
     /// Any runtime family, behind the shared interface (spec §5). The viewer
     /// deliberately cannot name a concrete model type: knowing which family it
     /// is showing is exactly what it must not need.
@@ -102,6 +106,14 @@ impl std::fmt::Debug for LoadedModel {
 }
 
 impl LoadedModel {
+    /// Whether [`LoadedModel::load`] can open a package of this model type.
+    ///
+    /// The one place that knows, so the config can tell a remembered package
+    /// that will never open from one that merely failed this time.
+    pub fn can_open(model_type: a2d_pack::ModelType) -> bool {
+        matches!(model_type, a2d_pack::ModelType::Spine)
+    }
+
     /// Reads and decodes a package.
     pub fn load(path: &Path, report: &mut LoadReport) -> Result<LoadedModel, ViewerError> {
         let package = Package::read_from(path)?;
@@ -154,7 +166,7 @@ impl LoadedModel {
 
         let mut model = model;
         let framing = frame_of(model.as_mut());
-        Ok(LoadedModel { package_path: path.to_path_buf(), model, framing, pages, idle })
+        Ok(LoadedModel { package_path: absolute_path(path), model, framing, pages, idle, reopenable: true })
     }
 
     /// Builds a model the caller has already decoded.
@@ -173,7 +185,9 @@ impl LoadedModel {
         let idle = IdleDirector::from_animations(model.animations(), seed);
         let mut model = model;
         let framing = frame_of(model.as_mut());
-        LoadedModel { package_path: path.to_path_buf(), model, framing, pages, idle }
+        // Not remembered: the caller built this from something `load` cannot
+        // read back from the path (a raw bundle, a Cubism package).
+        LoadedModel { package_path: absolute_path(path), model, framing, pages, idle, reopenable: false }
     }
 
     /// The selector entry describing this model.
@@ -182,6 +196,7 @@ impl LoadedModel {
             package: self.package_path.clone(),
             display_name: self.model.display_name().to_string(),
             animations: self.model.animations().iter().map(|a| a.name.clone()).collect(),
+            reopenable: self.reopenable,
         }
     }
 

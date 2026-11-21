@@ -228,6 +228,13 @@ fn an_out_of_range_config_is_repaired_rather_than_refused() {
     let (config, _) = Config::load_from(&config_file);
     assert!(config.window.size.0 >= 64 && config.window.size.1 <= 8192, "{:?}", config.window.size);
     assert!(config.active < config.models.len(), "the active index should be in range");
+    // A relative legacy entry depends on the start directory, so it is not
+    // provably dead and must survive with its settings.
+    assert!(
+        config.models.iter().any(|m| m.package == Path::new("hero.a2dpack")),
+        "the remembered entry should not be forgotten: {:?}",
+        config.models
+    );
 }
 
 #[test]
@@ -292,4 +299,15 @@ fn a_visible_window_redraws_on_request() {
         "the visible window never redrew:
 {stdout}"
     );
+}
+
+#[test]
+fn an_activation_failure_is_classified_as_environmental() {
+    // `App::activate` failing surfaces as `error: could not start the viewer:
+    // <cause>`. The cause decides: a missing adapter or window is the machine,
+    // while a viewer or runtime failure is our bug and must fail the suite.
+    assert!(is_environmental("error: could not start the viewer: no suitable GPU adapter: none"));
+    assert!(is_environmental("error: could not start the viewer: could not create a window: denied"));
+    assert!(!is_environmental("error: could not start the viewer: no animation named idle"));
+    assert!(!is_environmental("error: the package is corrupt"));
 }

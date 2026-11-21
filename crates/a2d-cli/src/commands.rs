@@ -404,9 +404,27 @@ fn cubism_pages(package: &Package, report: &mut LoadReport) -> Vec<CubismPage> {
     pages
 }
 
-/// Seeds a report with what the importer recorded, as the Spine route does.
-fn seed_report(package: &Package, report: &mut LoadReport) {
-    for warning in &package.manifest.import_warnings {
+/// Whether a package opened from `input` was read back from disk, as opposed
+/// to imported in memory from a Unity bundle right now. Decided from the input
+/// itself (its signature, not its extension), so every preview path agrees.
+fn is_read_back(input: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    let read = std::fs::File::open(input).ok().and_then(|mut f| f.read(&mut head).ok()).unwrap_or(0);
+    !matches!(a2d_import::classify(&head[..read]), a2d_import::AssetKind::UnityBundle { .. })
+}
+
+/// Seeds a report with what the importer recorded in a package read from disk.
+///
+/// A package imported in memory (a bundle opened directly) already has its
+/// warnings in the live import report, and `record_warnings` copied the same
+/// ones into the manifest; seeding from the manifest as well would print each
+/// twice. So the manifest is read back only when the package came from disk.
+fn seed_report(recorded: &[String], report: &mut LoadReport, from_disk: bool) {
+    if !from_disk {
+        return;
+    }
+    for warning in recorded {
         report.note(format!("recorded at import: {warning}"));
     }
 }
@@ -466,6 +484,8 @@ fn cubism_loaded(
 /// Opens a Cubism package in the desktop window, or renders its frames.
 ///
 /// `report` carries whatever produced the package (a bundle import, say).
+/// `path` is the input the user gave; whether it was a bundle or a package on
+/// disk decides if the recorded import warnings are the only copy.
 fn preview_cubism(
     out: &mut dyn std::io::Write,
     path: &Path,
@@ -474,7 +494,7 @@ fn preview_cubism(
     frames_dir: Option<&Path>,
     flags: ViewerFlags,
 ) -> Result<(), CliError> {
-    seed_report(package, &mut report);
+    seed_report(&package.manifest.import_warnings, &mut report, is_read_back(path));
     if let Some(dir) = frames_dir {
         return render_cubism_frames(out, path, package, dir, report);
     }
@@ -1062,5 +1082,51 @@ mod tests {
     #[test]
     fn classifying_a_missing_path_yields_nothing_rather_than_failing() {
         assert!(classify_path(Path::new("no/such/file")).is_empty());
+    }
+
+    #[test]
+    fn a_bundle_import_does_not_repeat_its_warnings_as_recorded_ones() {
+        let recorded = vec!["a curve was dropped".to_string()];
+        let mut report = LoadReport::new();
+        report.note("a curve was dropped");
+        seed_report(&recorded, &mut report, false);
+        assert_eq!(report.len(), 1, "{report}");
+        assert!(!report.to_string().contains("recorded at import"), "{report}");
+    }
+
+    #[test]
+    fn a_bundle_input_is_not_read_back_but_a_package_directory_is() {
+        let dir = std::env::temp_dir().join(format!("a2d-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle = dir.join("model.bundle");
+        let mut bytes = b"UnityFS\0".to_vec();
+        bytes.extend_from_slice(&[0u8; 32]);
+        std::fs::write(&bundle, &bytes).unwrap();
+        let package = dir.join("model.a2dpack");
+        std::fs::create_dir_all(&package).unwrap();
+
+        // The decision `preview` really makes, end to end: input kind to
+        // whether recorded warnings are printed. Passing "from disk" for a
+        // bundle would double every warning.
+        let recorded = vec!["a curve was dropped".to_string()];
+        for (input, expected) in [(&bundle, 0), (&package, 1)] {
+            let mut report = LoadReport::new();
+            seed_report(&recorded, &mut report, is_read_back(input));
+            assert_eq!(report.len(), expected, "{}: {report}", input.display());
+        }
+        assert!(!is_read_back(&bundle));
+        assert!(is_read_back(&package));
+        assert!(is_read_back(&dir.join("missing")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_package_from_disk_prints_its_recorded_warnings_once() {
+        let recorded = vec!["a curve was dropped".to_string()];
+        let mut report = LoadReport::new();
+        seed_report(&recorded, &mut report, true);
+        assert_eq!(report.len(), 1);
+        assert!(report.to_string().contains("recorded at import: a curve was dropped"), "{report}");
     }
 }
