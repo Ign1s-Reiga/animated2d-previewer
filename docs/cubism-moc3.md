@@ -160,17 +160,37 @@ gap of about 0.011 units between two torso meshes at a single parameter value,
 and the worst gap over all five of that model's motions is 0.0126 units. With it
 the gap is closed to float noise.
 
-Not yet exercised by any model seen: an intensity other than 1, a binding with
-more than one keyform, and a *vertex* named by more than one glue (glues are
-applied in file order, each seeing the result of the earlier ones). Meshes in
-several glues are common (59 on the real model), but no single vertex is in
-more than one, so application order has never mattered. The synthetic tests
-cover the first two by construction; the rule for the third is a guess.
+Not yet exercised by any model seen: an intensity other than 1 and a binding
+with more than one keyform. The synthetic tests cover both by construction.
 
-Also unverified: **which weight belongs to which mesh.** On the real model every
-weight pair sums to 1 with intensity 1, so the swapped rule (weight A pulling
-B, and the reverse) closes every gap just as well. Only a reference runtime, or
-a case with an uneven sum or an intensity other than 1, would settle it.
+**Weights need not sum to 1.** On the first real model every pair did, but on
+two of three models measured some pairs sum below 1 (down to 0 for a fully
+released pair). The Cubism Editor lets an artist partly or fully "release"
+glued vertices (<https://docs.live2d.com/en/cubism-editor-manual/glue>), so
+such a pair is meant to stay open: with intensity `I` its gap after glue is
+`|1 - I(wa + wb)|` times its gap before, whichever weight belongs to which
+mesh. That is a feature of the data, not a decoding error; the real-asset test
+checks it as an identity rather than asserting closure.
+
+**A vertex can be in two glues.** One was seen in one model (a vertex of a
+chain mesh named by two neighbouring glues). Glues apply in file order, each
+seeing the earlier result; no one-pass order closes both glues there (file
+order leaves 0.024 canvas units on the first, reverse order 0.062 on the
+second, simultaneous reads 0.006 and 0.061). The order is a guess and is pinned
+by a synthetic test marked unverified.
+
+**Which weight belongs to which mesh** is supported, not settled. A pair's
+share `wa / (wa + wb)` rises along the line from mesh A's rest centroid to
+mesh B's in all 282 glues (across the three models) whose weights vary and in
+none the other way, and swapping the weights increases triangle flips caused by
+glue (from 0 to 43 over motions on one model). That is evidence from seam
+geometry, not a reference runtime.
+
+**Open: a hidden partner.** One glue pulls a visible mesh by 0.6 canvas units
+towards a partner that is fully transparent and static in that pose. It is
+applied as decoded. Whether Cubism skips a glue toward a transparent mesh is
+unknown; no opacity rule is added on one case. A cross-check in the official
+free viewer would settle it.
 
 ## 3. What was confirmed, and against what
 
@@ -616,6 +636,7 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
 - **Multiple texture pages.** Section 41 gives each drawable a texture index and
   is read, but the emitter still puts every mesh on one page, because nothing
   loads a second one yet. It is all zero on every model seen.
-- **Glue.** Decoded and applied (§2). Unverified: intensities other than 1,
-  which weight belongs to which mesh, and the order of application when one
-  vertex is in several glues.
+- **Glue.** Decoded and applied (§2). Weights may sum below 1 (partial release,
+  seen on two of three models). Unverified: intensities other than 1, which
+  weight belongs to which mesh, the order of application when one vertex is in
+  several glues, and whether a glue toward a fully transparent mesh is skipped.
