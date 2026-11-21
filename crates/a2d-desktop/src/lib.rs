@@ -48,6 +48,7 @@ pub mod app;
 #[cfg(windows)]
 mod composition;
 pub mod config;
+pub mod pacing;
 pub mod state;
 pub mod tray;
 pub mod viewer;

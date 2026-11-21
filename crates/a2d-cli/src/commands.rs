@@ -370,6 +370,7 @@ Presented {} frames in {:.1}s ({:.0} fps) on {} with {} alpha.",
         summary.backend,
         summary.alpha_mode
     )?;
+    writeln!(out, "{}", summary.pacing_line())?;
     Ok(())
 }
 
@@ -507,6 +508,7 @@ Presented {} frames in {:.1}s ({:.0} fps) on {} with {} alpha.",
         summary.backend,
         summary.alpha_mode
     )?;
+    writeln!(out, "{}", summary.pacing_line())?;
     Ok(())
 }
 
@@ -683,6 +685,7 @@ Presented {} frames in {:.1}s ({:.0} fps) on {} with {} alpha.",
         summary.backend,
         summary.alpha_mode
     )?;
+    writeln!(out, "{}", summary.pacing_line())?;
     Ok(())
 }
 

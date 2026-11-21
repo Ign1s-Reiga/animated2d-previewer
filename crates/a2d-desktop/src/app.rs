@@ -20,6 +20,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::config::Config;
+use crate::pacing::{FrameClock, PacingStats};
 use crate::state::{Action, ViewerState};
 use crate::tray::{Tray, TrayCommand};
 use crate::viewer::{LoadedModel, Viewer, ViewerError};
@@ -72,6 +73,32 @@ pub struct RunSummary {
     /// The composite alpha mode the surface was configured with, e.g.
     /// `PreMultiplied`. `Opaque` means the window background is not transparent.
     pub alpha_mode: String,
+    /// Display refresh period the run was paced against, if the platform said.
+    pub refresh_period: Option<Duration>,
+    /// Presented frames that arrived more than 1.5 refresh periods after the
+    /// previous one. Zero, and not measured, when `refresh_period` is `None`
+    /// (unknown, or a hidden run with no display behind it).
+    pub late_frames: u64,
+    /// The longest gap between two presented frames.
+    pub worst_interval: Duration,
+}
+
+impl RunSummary {
+    /// One line describing frame pacing, for the CLI summary.
+    pub fn pacing_line(&self) -> String {
+        let worst = self.worst_interval.as_secs_f64() * 1000.0;
+        match self.refresh_period {
+            None => {
+                format!("Frame pacing: late frames not measured (refresh rate unknown), worst interval {worst:.1} ms.")
+            }
+            Some(p) => format!(
+                "Frame pacing: {} late {} (interval over 1.5x the {:.1} Hz period), worst interval {worst:.1} ms.",
+                self.late_frames,
+                if self.late_frames == 1 { "frame" } else { "frames" },
+                1.0 / p.as_secs_f64()
+            ),
+        }
+    }
 }
 
 /// Runs the viewer until the user quits.
@@ -129,6 +156,10 @@ pub fn run_with(
         active: None,
         tray: None,
         last_frame: Instant::now(),
+        clock: FrameClock::default(),
+        stats: PacingStats::default(),
+        last_present: None,
+        refresh_period: None,
         cursor: Vec2::ZERO,
         report: std::mem::take(report),
         exit_after: options.exit_after,
@@ -149,7 +180,15 @@ pub fn run_with(
     // Time spent drawing, falling back to the whole run if a window never came
     // up. Counting start-up would report a frame rate the viewer never had.
     let elapsed = app.active_since.map_or_else(|| started.elapsed(), |at| at.elapsed());
-    Ok(RunSummary { frames: app.frames, elapsed, backend: app.backend, alpha_mode: app.alpha_mode })
+    Ok(RunSummary {
+        frames: app.frames,
+        elapsed,
+        backend: app.backend,
+        alpha_mode: app.alpha_mode,
+        refresh_period: app.refresh_period,
+        late_frames: app.stats.late_frames,
+        worst_interval: app.stats.worst_interval,
+    })
 }
 
 fn unsupported(message: String) -> ViewerError {
@@ -219,6 +258,12 @@ fn configure_first(target: &Target) -> Result<(wgpu::TextureFormat, wgpu::Surfac
         width: size.width.max(1),
         height: size.height.max(1),
         present_mode: wgpu::PresentMode::AutoVsync,
+        // Two frames in flight, kept after measuring three on a 60 Hz DX12
+        // composition swapchain: 60 s runs of 3592 frames showed 2 late
+        // frames at 2 and 6 at 3 without smoothing, 1 and 1 with it, which is
+        // inside run-to-run noise. A third frame buys no measurable slack and
+        // adds a frame (16.7 ms) of lag between a drag and the window
+        // following it. Smoothing, not queue depth, is what evens out pacing.
         desired_maximum_frame_latency: 2,
         alpha_mode,
         view_formats: vec![],
@@ -270,6 +315,13 @@ struct App {
     active: Option<Active>,
     tray: Option<Tray>,
     last_frame: Instant,
+    /// Smooths the measured frame delta against the display refresh period.
+    clock: FrameClock,
+    stats: PacingStats,
+    /// When the previous frame was presented, for the late-frame statistics.
+    last_present: Option<Instant>,
+    /// Refresh period of the monitor the window is on, when known.
+    refresh_period: Option<Duration>,
     /// Cursor position in physical pixels. Tracked because a drag needs it and
     /// button events do not carry it.
     cursor: Vec2,
@@ -299,6 +351,27 @@ struct App {
 }
 
 impl App {
+    /// Re-reads the refresh period of the monitor the window is on.
+    ///
+    /// Smoothing is off for hidden runs: they draw from `about_to_wait` with no
+    /// display behind them, so there is no vsync to smooth against.
+    fn update_refresh(&mut self) {
+        let Some(active) = &self.active else { return };
+        let period = active
+            .window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            // Windows reports 0 or 1 for "hardware default"; anything outside a
+            // plausible range is treated as unknown rather than believed.
+            .filter(|mhz| (20_000..=1_000_000).contains(mhz))
+            .map(|mhz| Duration::from_secs_f64(1000.0 / f64::from(mhz)));
+        // A hidden run draws with no display behind it: nothing to smooth
+        // against and no meaningful late-frame count.
+        let period = if self.hidden { None } else { period };
+        self.refresh_period = period;
+        self.clock.set_period(period);
+    }
+
     /// Brings up the window, the device and the viewer, in that order.
     fn open_window(
         &self,
@@ -467,7 +540,8 @@ impl App {
 
     fn redraw(&mut self) {
         let now = Instant::now();
-        let dt = now.duration_since(self.last_frame).min(MAX_FRAME_STEP);
+        let measured = now.duration_since(self.last_frame);
+        let dt = self.clock.step(measured, MAX_FRAME_STEP).min(MAX_FRAME_STEP);
         self.last_frame = now;
 
         let paused = self.state.is_paused();
@@ -520,6 +594,10 @@ impl App {
         }
         frame.present();
         self.frames += 1;
+        let presented = Instant::now();
+        if let Some(previous) = self.last_present.replace(presented) {
+            self.stats.record(presented.duration_since(previous), self.refresh_period);
+        }
     }
 
     /// Applies the current state to the window.
@@ -647,8 +725,10 @@ impl ApplicationHandler for App {
             // keyboard shortcuts still work.
             Err(e) => self.report.note(format!("the tray icon is unavailable: {e}")),
         }
+        self.update_refresh();
         let now = Instant::now();
         self.last_frame = now;
+        self.clock.reset();
         self.active_since = Some(now);
         self.deadline = self.exit_after.map(|d| now + d);
     }
@@ -663,6 +743,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
             WindowEvent::RedrawRequested => self.redraw(),
+            // The window may now be on a display with another refresh rate.
+            WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Moved(_) => self.update_refresh(),
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = Vec2::new(position.x as f32, position.y as f32);
