@@ -27,10 +27,26 @@
 //!
 //! Everything above is also in the tray menu, which stays reachable when
 //! click-through is on and the window receives no mouse events.
+//!
+//! # Transparency on Windows
+//!
+//! A swapchain bound to a window handle is opaque on Windows: wgpu's DX12
+//! backend only offers `Opaque` for it, and the Vulkan and GL backends offer
+//! only what the driver says, which on NVIDIA is also `Opaque`. So on Windows
+//! the viewer creates its window with `WS_EX_NOREDIRECTIONBITMAP` and presents
+//! through a DirectComposition visual on DX12, which offers premultiplied
+//! alpha. If that cannot be set up the viewer falls back to the plain window
+//! handle path and says why in its report; the window then has an opaque
+//! background. Other platforms use the ordinary surface path unchanged.
+//!
+//! That setup is the one place this crate uses `unsafe` (the `composition`
+//! module, Windows only). Everything else is `deny(unsafe_code)`.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod app;
+#[cfg(windows)]
+mod composition;
 pub mod config;
 pub mod state;
 pub mod tray;

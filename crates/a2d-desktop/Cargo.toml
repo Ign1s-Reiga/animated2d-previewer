@@ -27,3 +27,9 @@ raw-window-handle = "0.6"
 # Rendering into a window surface needs the same wgpu the renderer uses.
 wgpu = "26"
 pollster = "1"
+
+# Windows only: a swapchain bound to a window handle cannot be transparent, so
+# the viewer presents through a DirectComposition visual. Same version wgpu-hal
+# already resolves, so no second copy is built.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_DirectComposition"] }

@@ -61,12 +61,17 @@ pub struct RunOptions {
 }
 
 /// What a run did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSummary {
     /// Frames actually presented. Zero means the window never drew, which is a
     /// failure even when nothing errored.
     pub frames: u64,
     pub elapsed: Duration,
+    /// The graphics backend that drew, e.g. `Dx12`. `none` if no window came up.
+    pub backend: String,
+    /// The composite alpha mode the surface was configured with, e.g.
+    /// `PreMultiplied`. `Opaque` means the window background is not transparent.
+    pub alpha_mode: String,
 }
 
 /// Runs the viewer until the user quits.
@@ -132,6 +137,8 @@ pub fn run_with(
         active_since: None,
         frames: 0,
         saved: false,
+        backend: "none".to_string(),
+        alpha_mode: "none".to_string(),
     };
     let result = event_loop.run_app(&mut app);
     *report = std::mem::take(&mut app.report);
@@ -142,7 +149,7 @@ pub fn run_with(
     // Time spent drawing, falling back to the whole run if a window never came
     // up. Counting start-up would report a frame rate the viewer never had.
     let elapsed = app.active_since.map_or_else(|| started.elapsed(), |at| at.elapsed());
-    Ok(RunSummary { frames: app.frames, elapsed })
+    Ok(RunSummary { frames: app.frames, elapsed, backend: app.backend, alpha_mode: app.alpha_mode })
 }
 
 fn unsupported(message: String) -> ViewerError {
@@ -154,13 +161,106 @@ fn unsupported(message: String) -> ViewerError {
 /// The device is requested *from* the surface rather than before it: an adapter
 /// chosen without knowing the surface may not be able to present to it, and a
 /// surface made by a different `Instance` than the device cannot be used at all.
+///
+/// Field order is drop order. The surface goes first, then the composition it
+/// was made from, and the window last, which is what DirectComposition needs.
 struct Active {
-    window: Arc<Window>,
     surface: wgpu::Surface<'static>,
+    composition: Option<CompositionGuard>,
+    window: Arc<Window>,
     format: wgpu::TextureFormat,
     surface_config: wgpu::SurfaceConfiguration,
     viewer: Viewer,
 }
+
+/// A window, the surface presenting into it, and a device that can draw there.
+struct Target {
+    surface: wgpu::Surface<'static>,
+    composition: Option<CompositionGuard>,
+    window: Arc<Window>,
+    gpu: GpuContext,
+}
+
+/// A [`Target`] whose surface has been configured once.
+struct Opened {
+    target: Target,
+    format: wgpu::TextureFormat,
+    surface_config: wgpu::SurfaceConfiguration,
+}
+
+/// Picks a format and alpha mode and configures the surface for the first time.
+///
+/// Errors are captured with error scopes and returned: left alone, wgpu sends
+/// them to its uncaptured-error handler, which panics. On the composition path
+/// this configure is where the swapchain is really created, so a failure here
+/// has to reach the caller as a value for the fallback to run.
+fn configure_first(target: &Target) -> Result<(wgpu::TextureFormat, wgpu::SurfaceConfiguration), String> {
+    let caps = target.surface.get_capabilities(&target.gpu.adapter);
+    if caps.formats.is_empty() {
+        return Err("the surface offers no usable texture format".into());
+    }
+    // An sRGB target keeps on-screen output matching the offscreen path;
+    // without one the character would render noticeably too bright.
+    let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+
+    // The renderer writes premultiplied alpha, so ask the compositor to
+    // treat it that way. Falling back to opaque loses transparency but is
+    // better than refusing to open at all.
+    let alpha_mode = [wgpu::CompositeAlphaMode::PreMultiplied, wgpu::CompositeAlphaMode::PostMultiplied]
+        .into_iter()
+        .find(|m| caps.alpha_modes.contains(m))
+        .or_else(|| caps.alpha_modes.first().copied())
+        .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+
+    let size = target.window.inner_size();
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: wgpu::PresentMode::AutoVsync,
+        desired_maximum_frame_latency: 2,
+        alpha_mode,
+        view_formats: vec![],
+    };
+
+    let device = &target.gpu.device;
+    let filters = [wgpu::ErrorFilter::Validation, wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Internal];
+    for filter in filters {
+        device.push_error_scope(filter);
+    }
+    target.surface.configure(device, &config);
+    // One pop per push. Native wgpu resolves these immediately; blocking is how
+    // the rest of this crate already waits on wgpu futures.
+    let mut failure = None;
+    for _ in filters {
+        if let Some(e) = pollster::block_on(device.pop_error_scope()) {
+            failure.get_or_insert(e.to_string());
+        }
+    }
+    match failure {
+        Some(e) => Err(format!("configuring the surface failed: {e}")),
+        None => Ok((format, config)),
+    }
+}
+
+#[cfg(windows)]
+type CompositionGuard = crate::composition::Composition;
+/// Only Windows has a composition step; elsewhere this is never `Some`.
+#[cfg(not(windows))]
+type CompositionGuard = std::convert::Infallible;
+
+/// Publishes a DirectComposition tree after a (re)configure. wgpu never does,
+/// and without it the first frame, or the new size, does not show.
+#[cfg(windows)]
+fn commit(composition: &Option<CompositionGuard>, report: &mut LoadReport) {
+    if let Some(Err(e)) = composition.as_ref().map(crate::composition::Composition::commit) {
+        report.note(e);
+    }
+}
+
+#[cfg(not(windows))]
+fn commit(_composition: &Option<CompositionGuard>, _report: &mut LoadReport) {}
 
 struct App {
     /// Decoded models, moved into the viewer once a device exists.
@@ -193,11 +293,18 @@ struct App {
     /// Whether settings have already been written, so the belt-and-braces save
     /// after the loop does not overwrite them with a torn-down state.
     saved: bool,
+    /// Backend and alpha mode of the surface in use, for the run summary.
+    backend: String,
+    alpha_mode: String,
 }
 
 impl App {
     /// Brings up the window, the device and the viewer, in that order.
-    fn activate(&mut self, event_loop: &ActiveEventLoop) -> Result<Active, ViewerError> {
+    fn open_window(
+        &self,
+        event_loop: &ActiveEventLoop,
+        no_redirection_bitmap: bool,
+    ) -> Result<Arc<Window>, ViewerError> {
         let (w, h) = self.config.window.size;
         let attributes = Window::default_attributes()
             .with_title("animated2d")
@@ -210,6 +317,13 @@ impl App {
             .with_visible(!self.hidden)
             .with_active(!self.hidden)
             .with_inner_size(LogicalSize::new(w, h));
+        #[cfg(windows)]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes.with_no_redirection_bitmap(no_redirection_bitmap)
+        };
+        #[cfg(not(windows))]
+        let _ = no_redirection_bitmap;
 
         let window = Arc::new(
             event_loop.create_window(attributes).map_err(|e| unsupported(format!("could not create a window: {e}")))?,
@@ -217,7 +331,12 @@ impl App {
         if let Some((x, y)) = self.config.window.position {
             window.set_outer_position(PhysicalPosition::new(x, y));
         }
+        Ok(window)
+    }
 
+    /// The ordinary route: a surface bound to the window handle.
+    fn open_plain(&self, event_loop: &ActiveEventLoop) -> Result<Opened, ViewerError> {
+        let window = self.open_window(event_loop, false)?;
         // One instance for both: a surface is only valid with a device from
         // the same instance, and mismatching them fails at the first draw with
         // a bare "surface does not exist" rather than at creation.
@@ -225,51 +344,105 @@ impl App {
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| unsupported(format!("could not create a window surface: {e}")))?;
-        let gpu = GpuContext::for_surface(instance.clone(), &surface)?;
+        let gpu = GpuContext::for_surface(instance, &surface)?;
+        let target = Target { surface, composition: None, window, gpu };
+        let (format, surface_config) = configure_first(&target).map_err(unsupported)?;
+        Ok(Opened { target, format, surface_config })
+    }
 
-        let caps = surface.get_capabilities(&gpu.adapter);
-        if caps.formats.is_empty() {
-            return Err(unsupported("the surface offers no usable texture format".into()));
+    /// Windows: a surface presenting through a DirectComposition visual, the
+    /// only way to a premultiplied-alpha swapchain there. The error says which
+    /// step failed, for the report; the caller falls back to [`Self::open_plain`].
+    ///
+    /// The first configure happens here, not in the caller, because that is
+    /// where wgpu actually creates the composition swapchain. Its failure must
+    /// come back as an `Err` so the fallback runs, not panic in wgpu's
+    /// uncaptured-error handler.
+    #[cfg(windows)]
+    fn open_composited(&self, event_loop: &ActiveEventLoop) -> Result<Opened, String> {
+        let window = self.open_window(event_loop, true).map_err(|e| e.to_string())?;
+        let instance = GpuContext::new_instance();
+        let (surface, composition) = crate::composition::create_surface(&instance, &window)?;
+        let gpu = match GpuContext::for_surface(instance, &surface) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                // Surface, then composition, then the window (dropped last as
+                // the earliest local): the order DirectComposition needs.
+                drop(surface);
+                drop(composition);
+                return Err(e.to_string());
+            }
+        };
+        // From here the fields of `Target` drop in declaration order on any
+        // early return: surface, composition, window.
+        let target = Target { surface, composition: Some(composition), window, gpu };
+        if target.gpu.backend != "Dx12" {
+            return Err(format!("the composition surface was given a {} adapter, not Dx12", target.gpu.backend));
         }
-        // An sRGB target keeps on-screen output matching the offscreen path;
-        // without one the character would render noticeably too bright.
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        let (format, surface_config) = configure_first(&target)?;
+        Ok(Opened { target, format, surface_config })
+    }
+
+    /// Brings up the window, the device and the viewer, in that order.
+    fn activate(&mut self, event_loop: &ActiveEventLoop) -> Result<Active, ViewerError> {
+        #[cfg(windows)]
+        let (opened, fallback_reason) = match self.open_composited(event_loop) {
+            Ok(opened) => (opened, None),
+            // The failed window and composition were dropped inside, so the
+            // fallback starts from nothing: a window created *without* the
+            // no-redirection-bitmap flag, which an HWND swapchain needs.
+            Err(reason) => match self.open_plain(event_loop) {
+                Ok(opened) => (opened, Some(reason)),
+                Err(e) => {
+                    // Do not lose why the better path was abandoned.
+                    self.report.note(format!("DirectComposition was unavailable ({reason})"));
+                    return Err(e);
+                }
+            },
+        };
+        #[cfg(not(windows))]
+        let (opened, fallback_reason): (Opened, Option<String>) = (self.open_plain(event_loop)?, None);
+        let Opened { target, format, surface_config } = opened;
+        let alpha_mode = surface_config.alpha_mode;
+
         if !format.is_srgb() {
             self.report.note("this surface offers no sRGB format; colours may look brighter than intended");
         }
-
-        // The renderer writes premultiplied alpha, so ask the compositor to
-        // treat it that way. Falling back to opaque loses transparency but is
-        // better than refusing to open at all.
-        let alpha_mode = [wgpu::CompositeAlphaMode::PreMultiplied, wgpu::CompositeAlphaMode::PostMultiplied]
-            .into_iter()
-            .find(|m| caps.alpha_modes.contains(m))
-            .unwrap_or(caps.alpha_modes[0]);
-        if alpha_mode == wgpu::CompositeAlphaMode::Opaque {
-            self.report
-                .note("this compositor offers no transparent surface mode; the window background will be opaque");
+        if let Some(reason) = &fallback_reason {
+            self.report.note(format!("DirectComposition was unavailable ({reason}); using a plain window surface"));
         }
+        if alpha_mode == wgpu::CompositeAlphaMode::Opaque {
+            let why = match &fallback_reason {
+                Some(reason) => format!("DirectComposition unavailable: {reason}"),
+                None => "the platform offers nothing else".to_string(),
+            };
+            self.report.note(format!(
+                "this compositor offers no transparent surface mode on {} ({why}); the window background will be opaque",
+                target.gpu.backend
+            ));
+        }
+        self.backend = target.gpu.backend.clone();
+        self.alpha_mode = format!("{alpha_mode:?}");
+        commit(&target.composition, &mut self.report);
 
-        let size = window.inner_size();
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
-            alpha_mode,
-            view_formats: vec![],
-        };
-        surface.configure(&gpu.device, &surface_config);
-
-        let mut viewer = Viewer::new(gpu, std::mem::take(&mut self.models))?;
+        // `target` is not destructured into locals, because locals drop in
+        // reverse order. Only the device moves out (a partial move), into the
+        // viewer; the other fields stay in `target` and an early return drops
+        // them in declaration order: surface, composition, window.
+        let mut viewer = Viewer::new(target.gpu, std::mem::take(&mut self.models))?;
         viewer.set_active(self.state.active_index())?;
         if let Some(name) = self.state.animation_name() {
             viewer.play(name, Duration::ZERO)?;
         }
 
-        Ok(Active { window, surface, format, surface_config, viewer })
+        Ok(Active {
+            surface: target.surface,
+            composition: target.composition,
+            window: target.window,
+            format,
+            surface_config,
+            viewer,
+        })
     }
 
     fn viewport(&self) -> Viewport {
@@ -289,6 +462,7 @@ impl App {
         active.surface_config.width = width;
         active.surface_config.height = height;
         active.surface.configure(&active.viewer.gpu().device, &active.surface_config);
+        commit(&active.composition, &mut self.report);
     }
 
     fn redraw(&mut self) {

@@ -227,3 +227,28 @@ redraw path:
 ```bash
 A2D_VISIBLE_VIEWER_TESTS=1 cargo test -p a2d-cli --test viewer_process -- --ignored
 ```
+
+### Windows transparency
+
+On Windows the viewer is transparent only when it presents through a
+DirectComposition visual on DX12 (a swapchain bound to a window handle is opaque
+there; see the `a2d-desktop` crate doc). The default, hidden test
+`the_windows_viewer_presents_through_directcomposition_with_premultiplied_alpha`
+asserts the summary line reports `on Dx12 with PreMultiplied alpha` and that the
+"no transparent surface mode" note is absent. Like the other viewer tests it
+only skips when the viewer *exits non-zero* with an environmental message (no
+adapter, no window). A viewer that fails to start currently exits 0 with
+`Presented 0 frames`, so on a machine with no GPU or desktop this test fails on
+its assertions rather than skipping; `A2D_REQUIRE_GPU` only makes the non-zero
+exit case a failure too.
+
+If the DirectComposition swapchain cannot be created or configured (the
+configure is checked with wgpu error scopes), the viewer falls back to the
+plain window surface and this test fails, which is the intent.
+
+That a hidden window reports `PreMultiplied` does not prove the pixels are
+see-through. There is no automated pixel test: it needs a visible window over a
+known backdrop. The manual check is to fill a borderless window with magenta,
+open the viewer over it (position it with `config.json`, using `A2D_CONFIG_DIR`),
+and read a pixel of the viewer window away from the character with `GetPixel`:
+magenta (255, 0, 255) means transparent, black means the opaque fallback.

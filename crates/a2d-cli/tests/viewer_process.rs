@@ -254,6 +254,27 @@ fn a_nonsense_exit_deadline_is_refused_before_anything_opens() {
     assert!(stderr.contains("positive number of seconds"), "{stderr}");
 }
 
+#[cfg(windows)]
+#[test]
+fn the_windows_viewer_presents_through_directcomposition_with_premultiplied_alpha() {
+    // The bug this guards: a swapchain bound to a window handle is opaque on
+    // Windows, so the "transparent" window was a black rectangle and the viewer
+    // logged "no transparent surface mode". Presenting through a
+    // DirectComposition visual on DX12 is what makes PreMultiplied available.
+    // A hidden window is enough to prove the surface and its alpha mode; that
+    // the pixels really are see-through needs a visible window and a backdrop
+    // (see `tests/README.md`).
+    let (_dir, package, config_dir) = prepare("dcomp");
+    let Some(stdout) = run_or_skip(&package, &config_dir) else { return };
+
+    assert!(presented_frames(&stdout) > 0, "{stdout}");
+    assert!(!stdout.contains("no transparent surface mode"), "the window fell back to an opaque surface:\n{stdout}");
+    assert!(
+        stdout.contains("on Dx12 with PreMultiplied alpha"),
+        "expected the DX12 composition path with premultiplied alpha:\n{stdout}"
+    );
+}
+
 #[test]
 #[ignore = "opens a visible window; set A2D_VISIBLE_VIEWER_TESTS=1 and run with --ignored"]
 fn a_visible_window_redraws_on_request() {
