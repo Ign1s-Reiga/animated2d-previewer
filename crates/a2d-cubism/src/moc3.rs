@@ -225,6 +225,15 @@ mod section {
     /// about a default of 500, so this is the animated order, distinct from the
     /// fixed one in [`DRAWABLE_DRAW_ORDER`].
     pub const DRAWABLE_KEYFORM_DRAW_ORDER: usize = 69;
+    /// Opacity carried by each *warp* deformer keyform.
+    ///
+    /// Identified like [`DRAWABLE_KEYFORM_OPACITY`]: one float per warp
+    /// keyform (the count is the number of warp keyforms, and the room before
+    /// the next section holds exactly that many after padding), every value
+    /// inside `[0, 1]`, two or three distinct values per model with a few
+    /// hundred zeros. It is the warp counterpart of
+    /// [`ROTATION_KEYFORM_OPACITY`].
+    pub const WARP_KEYFORM_OPACITY: usize = 59;
 
     /// Where each *warp* keyform's coordinates begin, in floats. Drawable
     /// keyforms are not listed; they follow the same rule after the warps.
@@ -286,6 +295,9 @@ pub struct Moc3 {
     pub sections: Vec<u32>,
     /// The model, in the shape everything downstream of `formats/` uses.
     pub model: CubismIr,
+    /// What the file did not carry that the model would have used, for the
+    /// caller to report. Empty for a complete file.
+    pub notes: Vec<String>,
 }
 
 impl std::ops::Deref for Moc3 {
@@ -401,11 +413,31 @@ impl Moc3 {
         };
         let drawable_keyform_opacities = optional(section::DRAWABLE_KEYFORM_OPACITY, "drawable opacity");
         let drawable_keyform_draw_orders = optional(section::DRAWABLE_KEYFORM_DRAW_ORDER, "drawable draw order");
+        // Warp opacity is held to a stricter standard than the two above: it
+        // hides whole subtrees, so a section that is present but runs past the
+        // data, or holds a value outside [0, 1], is an error. Only a section
+        // the file does not have at all is tolerated, and reported.
+        let mut notes = Vec::new();
+        let warp_keyform_count = keyforms.warp_offsets.len() as u32;
+        let warp_keyform_opacities = if warp_keyform_count == 0 {
+            Vec::new()
+        } else if section_offset(&sections, section::WARP_KEYFORM_OPACITY, "warp opacity").is_err() {
+            notes.push("the source has no warp opacity track; warps are drawn opaque".to_string());
+            Vec::new()
+        } else {
+            let values =
+                read_floats(bytes, &sections, section::WARP_KEYFORM_OPACITY, warp_keyform_count, "warp opacity")?;
+            if let Some(bad) = values.iter().find(|v| !is_opacity(**v)) {
+                return Err(DecodeError::corrupt(format!("a warp keyform opacity of {bad} is outside [0, 1]")));
+            }
+            values
+        };
 
         Ok(Moc3 {
             version,
             counts,
             sections,
+            notes,
             model: CubismIr {
                 canvas,
                 parameters,
@@ -425,6 +457,7 @@ impl Moc3 {
                 keyforms,
                 draw_order,
                 drawable_keyform_opacities,
+                warp_keyform_opacities,
                 drawable_keyform_draw_orders,
                 // A MOC3 holds no motions; they live in separate files.
                 motions: Vec::new(),
@@ -448,6 +481,11 @@ fn u32_at(bytes: &[u8], at: usize) -> Result<u32, DecodeError> {
         DecodeError::corrupt_at(format!("wanted four bytes, the file holds {}", bytes.len()), at as u64)
     })?;
     Ok(u32::from_le_bytes(slice.try_into().unwrap_or([0; 4])))
+}
+
+/// Whether a value can be an opacity: finite and within `[0, 1]`.
+fn is_opacity(v: f32) -> bool {
+    (0.0..=1.0).contains(&v)
 }
 
 fn f32_at(bytes: &[u8], at: usize) -> Result<f32, DecodeError> {
@@ -994,6 +1032,12 @@ fn read_rotation_deformers(
         if !(k.origin.0.is_finite() && k.origin.1.is_finite() && k.angle.is_finite() && k.scale.is_finite()) {
             return Err(DecodeError::corrupt(format!("rotation keyform {i} holds a non-finite value")));
         }
+        if !is_opacity(k.opacity) {
+            return Err(DecodeError::corrupt(format!(
+                "rotation keyform {i} has an opacity of {}, outside [0, 1]",
+                k.opacity
+            )));
+        }
         keyforms.push(k);
     }
     Ok((deformers, keyforms))
@@ -1458,6 +1502,54 @@ pub(crate) mod tests {
     use crate::CubismEval;
 
     #[test]
+    fn warp_keyform_opacities_are_read_in_keyform_order() {
+        // One warp over a two-key and a three-key axis: six keyforms, each a
+        // different value so a wrong stride or offset cannot pass.
+        let wanted = [1.0, 0.0, 0.5, 0.25, 0.75, 0.125];
+        let bytes = Builder::new().two_axis().warp_opacities(&wanted).build();
+        let moc = Moc3::parse(&bytes).expect("fixture");
+        assert_eq!(moc.warp_keyform_opacities, wanted);
+        assert_eq!(moc.warp_keyform_opacities.len(), moc.keyforms.warp_offsets.len());
+    }
+
+    #[test]
+    fn a_layout_without_the_warp_opacity_section_reads_an_empty_track_and_says_so() {
+        let bytes = Builder::new().without_warp_opacity().build();
+        let moc = Moc3::parse(&bytes).expect("a model without the section still loads");
+        assert!(moc.warp_keyform_opacities.is_empty());
+        assert_eq!(moc.notes.len(), 1, "{:?}", moc.notes);
+        assert!(moc.notes[0].contains("warp opacity"), "{:?}", moc.notes);
+        let complete = Moc3::parse(&Builder::new().build()).expect("fixture");
+        assert!(complete.notes.is_empty(), "{:?}", complete.notes);
+    }
+
+    #[test]
+    fn a_warp_opacity_section_that_runs_past_the_data_is_an_error() {
+        let bytes = Builder::new().build();
+        let moc = Moc3::parse(&bytes).expect("fixture");
+        let mut bad = bytes.clone();
+        // Point section 59 at the last four bytes: three floats cannot fit.
+        let slot = 0x40 + section::WARP_KEYFORM_OPACITY * 4;
+        bad[slot..slot + 4].copy_from_slice(&((bytes.len() - 4) as u32).to_le_bytes());
+        let err = Moc3::parse(&bad).expect_err("a section past the end must not read as empty");
+        assert!(!err.to_string().is_empty());
+        assert!(moc.notes.is_empty());
+    }
+
+    #[test]
+    fn opacities_outside_zero_to_one_are_refused() {
+        for (builder, what) in [
+            (Builder::new().warp_opacities(&[1.0, 1.5, 0.0]), "warp keyform opacity"),
+            (Builder::new().warp_opacities(&[1.0, f32::NAN, 0.0]), "warp keyform opacity"),
+            (Builder::new().rotation_opacities(&[1.0, -0.5, 0.0]), "rotation keyform"),
+            (Builder::new().rotation_opacities(&[1.0, f32::INFINITY, 0.0]), "rotation keyform"),
+        ] {
+            let err = Moc3::parse(&builder.build()).expect_err(what);
+            assert!(err.to_string().contains(what), "{what}: {err}");
+        }
+    }
+
+    #[test]
     fn posing_turns_the_file_s_downward_y_into_the_upward_y_used_downstream() {
         // A drawable with no parent deformer is posed from its keyforms alone,
         // so the only thing between the stored numbers and the result is the
@@ -1692,6 +1784,12 @@ pub(crate) mod tests {
         glue_intensities: Vec<f32>,
         /// Angle of each rotation keyform, or none for all zero.
         rotation_angles: Option<Vec<f32>>,
+        /// Opacity of each warp keyform, or none for all one.
+        warp_opacities: Option<Vec<f32>>,
+        /// Leaves the warp opacity section out, as a layout without it would.
+        omit_warp_opacity: bool,
+        /// Opacity of each rotation keyform, or none for all one.
+        rotation_opacities: Option<Vec<f32>>,
     }
 
     impl Builder {
@@ -1711,7 +1809,29 @@ pub(crate) mod tests {
                 glue: false,
                 glue_intensities: vec![1.0; 3],
                 rotation_angles: None,
+                warp_opacities: None,
+                omit_warp_opacity: false,
+                rotation_opacities: None,
             }
+        }
+
+        /// Gives every warp keyform an opacity, in keyform order. Without it
+        /// the section is written with every value one.
+        pub(crate) fn warp_opacities(mut self, values: &[f32]) -> Self {
+            self.warp_opacities = Some(values.to_vec());
+            self
+        }
+
+        /// Writes no warp opacity section at all.
+        pub(crate) fn without_warp_opacity(mut self) -> Self {
+            self.omit_warp_opacity = true;
+            self
+        }
+
+        /// Gives every rotation keyform an opacity, in keyform order.
+        pub(crate) fn rotation_opacities(mut self, values: &[f32]) -> Self {
+            self.rotation_opacities = Some(values.to_vec());
+            self
         }
 
         /// Adds one glue joining the first two drawables, with the given
@@ -1947,7 +2067,18 @@ pub(crate) mod tests {
             offsets[section::ROTATION_KEYFORM_BEGIN] = place(&mut body, &u32_array(&[0]));
             offsets[section::ROTATION_KEYFORM_COUNT] = place(&mut body, &u32_array(&[per_element as u32]));
             let f_array = |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
-            offsets[section::ROTATION_KEYFORM_OPACITY] = place(&mut body, &f_array(&vec![1.0; per_element]));
+            let mut rotation_opacity = vec![1.0f32; per_element];
+            for (slot, v) in rotation_opacity.iter_mut().zip(self.rotation_opacities.iter().flatten()) {
+                *slot = *v;
+            }
+            offsets[section::ROTATION_KEYFORM_OPACITY] = place(&mut body, &f_array(&rotation_opacity));
+            let mut warp_opacity = vec![1.0f32; warps * per_element];
+            for (slot, v) in warp_opacity.iter_mut().zip(self.warp_opacities.iter().flatten()) {
+                *slot = *v;
+            }
+            if !self.omit_warp_opacity {
+                offsets[section::WARP_KEYFORM_OPACITY] = place(&mut body, &f_array(&warp_opacity));
+            }
             let angles = self.rotation_angles.clone().unwrap_or_else(|| vec![0.0; per_element]);
             offsets[section::ROTATION_KEYFORM_ANGLE] = place(&mut body, &f_array(&angles));
             offsets[section::ROTATION_KEYFORM_ORIGIN_X] = place(&mut body, &f_array(&vec![0.0; per_element]));

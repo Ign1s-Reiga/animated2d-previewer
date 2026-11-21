@@ -268,7 +268,7 @@ character.a2dpack/
 
 ```json
 {
-  "formatVersion": 3,
+  "formatVersion": 4,
   "modelType": "spine",
   "sourceGame": "spine_bytes",
   "sourceFormat": "spine-3.8",

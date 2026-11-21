@@ -203,6 +203,27 @@ mod tests {
     }
 
     #[test]
+    fn a_drawable_hidden_by_its_deformer_is_not_drawn_but_still_masks() {
+        // Drawable 0 hangs off the warp, whose every keyform is transparent, and
+        // is the mask of drawable 1, which hangs off nothing. Hiding the mask's
+        // own drawable must not stop it clipping the one that shows.
+        let bytes = crate::moc3::tests::Builder::new()
+            .masked()
+            .drawable_parents(&[1, u32::MAX])
+            .warp_opacities(&[0.0, 0.0, 0.0])
+            .build();
+        let moc = Moc3::parse(&bytes).expect("should parse");
+        let pose = moc.pose(&[]);
+        assert_eq!(pose.opacities, [0.0, 1.0]);
+        let mut list = RenderList::new();
+        moc.emit(&pose, TextureId(0), &mut list);
+        assert_eq!(list.meshes().len(), 1, "only the drawable whose deformer is opaque is drawn");
+        let id = list.meshes()[0].clipping_mask.expect("the survivor is still clipped");
+        let mask = list.mask(id).expect("registered");
+        assert_eq!(mask.indices.len(), moc.drawables[0].indices.len());
+    }
+
+    #[test]
     fn an_unmasked_model_registers_no_masks() {
         let moc = Moc3::parse(&crate::moc3::tests::Builder::new().build()).expect("should parse");
         let pose = moc.pose(&[]);

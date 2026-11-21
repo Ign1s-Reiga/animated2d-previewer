@@ -14,6 +14,9 @@
 //!   then `pairs: seq` of `vertex_a, vertex_b: u32, weight_a, weight_b: f32`.
 //!   A version 2 model reads with no glue; its package validates with a note
 //!   telling the user to re-import.
+//! * Version 4: appends `warp_keyform_opacities: f32 seq`. A version 3 model
+//!   reads with an empty track, which draws as if no warp were ever faded; its
+//!   package validates with a note telling the user to re-import.
 //!
 //! A motion is `name: str, duration: f32, fade_in: f32, fade_out: f32,
 //! curves: seq`. A curve is `target: str, fade_in: opt f32, fade_out: opt f32,
@@ -60,6 +63,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
         validate_motion(m)?;
     }
     validate_glues(ir)?;
+    validate_warp_opacities(ir)?;
     write_canvas(w, &ir.canvas);
     w.seq(&ir.parameters, write_parameter);
     write_ids(w, &ir.part_ids);
@@ -84,6 +88,8 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     // is a prefix of a version 3 one.
     w.seq(&ir.glues, write_glue);
     w.f32_seq(&ir.glue_intensities);
+    // Added in format version 4.
+    w.f32_seq(&ir.warp_keyform_opacities);
     Ok(())
 }
 
@@ -91,7 +97,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
 ///
 /// `version` is the format version from the `model.bin` header. A version 1
 /// model ends after the draw-order tracks and has no motions; version 2 adds
-/// the motion table and version 3 the glue table. The layout is chosen by the header, never inferred from
+/// the motion table, version 3 the glue table and version 4 the warp opacities. The layout is chosen by the header, never inferred from
 /// how many bytes happen to remain.
 pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     let mut ir = CubismIr {
@@ -103,6 +109,7 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
         glue_ids: read_ids(r, "glue id")?,
         glues: Vec::new(),
         glue_intensities: Vec::new(),
+        warp_keyform_opacities: Vec::new(),
         drawables: r.seq("drawable", 32, read_drawable)?,
         warp_deformers: r.seq("warp deformer", 24, read_warp)?,
         rotation_deformers: r.seq("rotation deformer", 20, read_rotation)?,
@@ -123,9 +130,39 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
         ir.glues = r.seq("glue", 24, read_glue)?;
         ir.glue_intensities = r.f32_seq()?;
     }
+    if version >= 4 {
+        ir.warp_keyform_opacities = r.f32_seq()?;
+    }
     validate_references(&ir)?;
     validate_glues(&ir)?;
+    validate_warp_opacities(&ir)?;
     Ok(ir)
+}
+
+/// The warp opacity track is empty or holds one opacity per warp keyform, each
+/// finite and within `[0, 1]`. It is multiplied into every drawable below a
+/// warp, so a stray value would hide or flare a whole subtree.
+fn validate_warp_opacities(ir: &CubismIr) -> Result<(), DecodeError> {
+    // A rotation's opacity multiplies into everything below it, the same as a
+    // warp's, so it is held to the same range.
+    if let Some(bad) = ir.rotation_keyforms.iter().map(|k| k.opacity).find(|v| !(0.0..=1.0).contains(v)) {
+        return Err(DecodeError::corrupt(format!("a rotation keyform opacity of {bad} is outside [0, 1]")));
+    }
+    let track = &ir.warp_keyform_opacities;
+    if track.is_empty() {
+        return Ok(());
+    }
+    if track.len() != ir.keyforms.warp_offsets.len() {
+        return Err(DecodeError::corrupt(format!(
+            "{} warp keyform opacities for {} warp keyforms",
+            track.len(),
+            ir.keyforms.warp_offsets.len()
+        )));
+    }
+    if let Some(bad) = track.iter().find(|v| !(0.0..=1.0).contains(*v)) {
+        return Err(DecodeError::corrupt(format!("a warp keyform opacity of {bad} is outside [0, 1]")));
+    }
+    Ok(())
 }
 
 /// The one set of rules for glue, applied by the writer before it emits a byte
@@ -641,6 +678,7 @@ mod tests {
             glue_ids: vec![],
             glues: vec![],
             glue_intensities: vec![],
+            warp_keyform_opacities: vec![],
             drawables: vec![
                 Drawable {
                     id: "ArtMesh1".into(),
@@ -981,9 +1019,9 @@ mod tests {
     #[test]
     fn an_implausible_motion_count_is_refused_before_allocating() {
         let mut bytes = Package::from_cubism(model(), "test", "x").encode_model().unwrap();
-        // The motion count is followed by the two empty glue tables, a count
-        // each.
-        let at = bytes.len() - 12;
+        // The motion count is followed by the two empty glue tables and the
+        // empty warp opacity track, a count each.
+        let at = bytes.len() - 16;
         bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("a huge count should be refused");
         assert!(err.to_string().contains("motion count"), "{err}");
@@ -1048,7 +1086,115 @@ mod tests {
             ],
         }];
         ir.glue_intensities = vec![1.0, 0.5, 0.25];
+        ir.warp_keyform_opacities = vec![1.0, 0.5, 0.0];
         ir
+    }
+
+    /// `with_glue()` as a version 3 writer knew it: no warp opacity track.
+    fn with_glue_v3() -> CubismIr {
+        let mut ir = with_glue();
+        ir.warp_keyform_opacities.clear();
+        ir
+    }
+
+    #[test]
+    fn a_version_3_model_reads_with_an_empty_warp_opacity_track() {
+        // Generated by the version 3 layout from `with_glue_v3()`: glue is kept
+        // and the file ends exactly where the opacity track now begins.
+        let bytes = include_bytes!("../tests/fixtures/cubism_v3.model.bin");
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 3);
+        let PackageModel::Cubism(ir) = Package::decode_model(bytes).expect("v3 must still load") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert!(ir.warp_keyform_opacities.is_empty());
+        assert_eq!(ir, with_glue_v3());
+    }
+
+    #[test]
+    fn a_version_4_header_over_version_3_bytes_is_refused() {
+        let mut bytes = include_bytes!("../tests/fixtures/cubism_v3.model.bin").to_vec();
+        bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+        assert!(Package::decode_model(&bytes).is_err());
+    }
+
+    #[test]
+    fn warp_opacities_round_trip_and_re_encode_to_identical_bytes() {
+        let ir = with_glue();
+        let first = Package::from_cubism(ir.clone(), "test", "x").encode_model().unwrap();
+        let PackageModel::Cubism(back) = Package::decode_model(&first).expect("should decode") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert_eq!(back.warp_keyform_opacities, [1.0, 0.5, 0.0]);
+        assert_eq!(back, ir);
+        assert_eq!(Package::from_cubism(back, "test", "x").encode_model().unwrap(), first);
+    }
+
+    #[test]
+    fn a_bad_warp_opacity_track_is_refused_by_the_writer_and_the_reader_alike() {
+        type Damage = fn(&mut CubismIr);
+        let cases: [(&str, Damage); 4] = [
+            ("outside [0, 1]", |ir| ir.warp_keyform_opacities[1] = 1.5),
+            ("outside [0, 1]", |ir| ir.warp_keyform_opacities[1] = -0.1),
+            ("outside [0, 1]", |ir| ir.warp_keyform_opacities[2] = f32::NAN),
+            ("warp keyform opacities for", |ir| ir.warp_keyform_opacities.truncate(2)),
+        ];
+        for (what, damage) in cases {
+            let mut ir = with_glue();
+            damage(&mut ir);
+            let err = Package::from_cubism(ir.clone(), "test", "x").encode_model().expect_err(what);
+            assert!(err.to_string().contains(what), "{what}: {err}");
+            // Bypass the writer's check to prove the reader holds the same line.
+            let mut w = Writer::new();
+            let mut good = with_glue();
+            good.warp_keyform_opacities.clear();
+            write(&mut w, &good).unwrap();
+            let mut bytes = w.into_bytes();
+            bytes.truncate(bytes.len() - 4);
+            let mut tail = Writer::new();
+            tail.f32_seq(&ir.warp_keyform_opacities);
+            bytes.extend(tail.into_bytes());
+            let mut r = Reader::new(&bytes);
+            let err = read(&mut r, 4).expect_err(what);
+            assert!(err.to_string().contains(what), "{what}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_rotation_opacity_outside_zero_to_one_is_refused_on_write_and_on_read() {
+        for bad in [1.5f32, -0.25, f32::NAN, f32::INFINITY] {
+            let mut ir = with_glue();
+            ir.rotation_keyforms[1].opacity = bad;
+            let err = Package::from_cubism(ir, "test", "x").encode_model().expect_err("the writer must refuse");
+            assert!(err.to_string().contains("rotation keyform opacity"), "{bad}: {err}");
+        }
+        // Reading: write a model whose rotation opacity is a value no other
+        // float in it shares, then patch those four bytes to 7.0.
+        let mut ir = with_glue();
+        ir.rotation_keyforms[1].opacity = 0.123;
+        let mut bytes = Package::from_cubism(ir, "test", "x").encode_model().unwrap();
+        let needle = 0.123f32.to_le_bytes();
+        let at = bytes.windows(4).position(|w| w == needle).expect("the opacity is in the file");
+        bytes[at..at + 4].copy_from_slice(&7.0f32.to_le_bytes());
+        let err = Package::decode_model(&bytes).expect_err("the reader must refuse");
+        assert!(err.to_string().contains("rotation keyform opacity"), "{err}");
+    }
+
+    #[test]
+    fn a_package_without_warp_opacities_says_to_re_import() {
+        let notes = |ir: CubismIr| {
+            Package::from_cubism(ir, "test", "x")
+                .validate()
+                .warnings()
+                .iter()
+                .map(|w| w.to_string())
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                )
+        };
+        assert!(notes(with_glue_v3()).contains("warp opacity"));
+        assert!(!notes(with_glue()).contains("warp opacity"));
     }
 
     #[test]

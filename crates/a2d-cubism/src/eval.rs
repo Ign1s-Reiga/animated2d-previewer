@@ -34,6 +34,17 @@
 //!   If the warp is squashed so flat that no probe has a direction, the rotation
 //!   keeps its origin and its own angle and the model keeps posing.
 //!
+//! ## Opacity
+//!
+//! Every deformer keyform carries an opacity (warps in MOC3 section 59,
+//! rotations in 61), blended with the same weights as its geometry. A deformer's
+//! resolved opacity is its parent's times its own, one at the root, and a
+//! drawable's final opacity is its own blended opacity times its parent
+//! deformer's resolved one. This is how an artist hides an alternate piece: by
+//! fading the deformer it hangs off. It changes no vertex, and glue and masks
+//! are unaffected. A model with no warp opacity track (`warp_keyform_opacities`
+//! empty) fades no warp. See `docs/cubism-moc3.md` section 6.
+//!
 //! A point in a rotation's frame lands at `origin + R(angle) * (p * total
 //! scale)`. A rotation's total scale is the product of every rotation scale
 //! from the root down to it, with warps contributing one.
@@ -83,9 +94,14 @@
 //!   closes the worst one. Glue pulls such a pair together, which can still
 //!   stretch a mesh. Whether Cubism shows the same pull needs a reference.
 //! * Glue toward a hidden mesh. A glue is applied whatever the opacity of
-//!   either mesh. On one model that drags a visible mesh 0.6 canvas units
-//!   towards a fully transparent, static partner. Whether Cubism skips it is
-//!   unknown.
+//!   either mesh. The large pulls toward a transparent partner that once showed
+//!   were alternate pieces hidden by deformer opacity (below), which is now
+//!   applied; what remains is a pull of up to `0.3` canvas units during a
+//!   crossfade, taken as authored.
+//! * Deformer opacity. Ancestors are combined by multiplication, which rests
+//!   on the editor manual's wording and renders, not on a reference; a partial
+//!   opacity has not been compared; the deformers' visibility and enabled
+//!   flags are not read; and part opacity is not applied.
 //!
 //! # The grid orientation, and how it was found
 //!
@@ -308,7 +324,12 @@ pub trait CubismEval {
 trait EvalInternals {
     fn resolve_values(&self, values: &[f32]) -> Vec<f32>;
     fn weights_for(&self, binding: u32, values: &[f32]) -> Vec<(usize, f32)>;
-    fn resolve_deformers(&self, warps: &[Vec<(f32, f32)>], rotations: &[RotationKeyform]) -> Vec<Resolved>;
+    fn resolve_deformers(
+        &self,
+        warps: &[Vec<(f32, f32)>],
+        warp_opacities: &[f32],
+        rotations: &[RotationKeyform],
+    ) -> Vec<Resolved>;
     fn apply_glue(&self, drawables: &mut [Vec<(f32, f32)>], unstable: &[usize], values: &[f32]);
 }
 
@@ -323,13 +344,20 @@ impl CubismEval for CubismIr {
 
         // Each element's keyforms are blended first, then the tree is walked,
         // because a deformer's own shape has to exist before it can move a child.
+        let mut warp_opacities = Vec::with_capacity(self.warp_deformers.len());
         let warps: Vec<Vec<(f32, f32)>> = self
             .warp_deformers
             .iter()
             .map(|w| {
                 let weights = self.weights_for(w.keyform_binding, &resolved);
                 let mut grid = vec![(0.0f32, 0.0f32); w.point_count as usize];
+                // No track at all means the source never faded a warp, which
+                // is fully opaque rather than fully transparent.
+                let mut opacity = if self.warp_keyform_opacities.is_empty() { 1.0 } else { 0.0 };
                 for (keyform, weight) in &weights {
+                    if let Some(o) = self.warp_keyform_opacities.get(w.keyform_begin as usize + keyform) {
+                        opacity += o * weight;
+                    }
                     let Some(source) = self.keyforms.warp(w.keyform_begin as usize + keyform, grid.len()) else {
                         continue;
                     };
@@ -338,6 +366,7 @@ impl CubismEval for CubismIr {
                         out.1 += pair[1] * weight;
                     }
                 }
+                warp_opacities.push(opacity);
                 grid
             })
             .collect();
@@ -365,7 +394,7 @@ impl CubismEval for CubismIr {
             })
             .collect();
 
-        let resolved_deformers = self.resolve_deformers(&warps, &rotations);
+        let resolved_deformers = self.resolve_deformers(&warps, &warp_opacities, &rotations);
 
         let mut unstable = Vec::new();
         let mut drawables = Vec::with_capacity(self.drawables.len());
@@ -394,14 +423,21 @@ impl CubismEval for CubismIr {
                     out.1 += pair[1] * weight;
                 }
             }
-            opacities.push(opacity.clamp(0.0, 1.0));
+            let parent = d.parent_deformer.and_then(|p| resolved_deformers.get(p as usize));
+            // What the artist hid by fading a deformer is hidden here too: the
+            // drawable shows its own opacity times its parent's, which already
+            // carries every ancestor's.
+            let inherited = parent.map_or(1.0, |p| p.opacity);
+            // A non-finite factor must not reach a renderer as a NaN alpha, so
+            // it counts as fully faded.
+            let product = opacity * inherited;
+            opacities.push(if product.is_finite() { product.clamp(0.0, 1.0) } else { 0.0 });
             draw_orders.push(order);
 
             // Keep the un-deformed coordinates: if the chain produces something
             // unusable they are what is reported, so a caller never receives a
             // non-finite vertex to hand to a renderer.
             let local = points.clone();
-            let parent = d.parent_deformer.and_then(|p| resolved_deformers.get(p as usize));
             if let Some(parent) = parent {
                 for point in points.iter_mut() {
                     *point = parent.map(*point);
@@ -571,7 +607,12 @@ impl EvalInternals for CubismIr {
     /// See the module doc for the rule. The result is indexed like
     /// `self.deformers`. A deformer whose parent index points nowhere is
     /// resolved as a root, the same as one with no parent.
-    fn resolve_deformers(&self, warps: &[Vec<(f32, f32)>], rotations: &[RotationKeyform]) -> Vec<Resolved> {
+    fn resolve_deformers(
+        &self,
+        warps: &[Vec<(f32, f32)>],
+        warp_opacities: &[f32],
+        rotations: &[RotationKeyform],
+    ) -> Vec<Resolved> {
         let count = self.deformers.len();
         let mut done: Vec<Option<Resolved>> = (0..count).map(|_| None).collect();
         for start in 0..count {
@@ -596,7 +637,12 @@ impl EvalInternals for CubismIr {
                 let resolved = match deformer.kind {
                     DeformerKind::Warp(w) => {
                         let shape = self.warp_deformers.get(w as usize);
-                        resolve_warp(warps.get(w as usize), shape.map(|s| s.divisions), parent)
+                        resolve_warp(
+                            warps.get(w as usize),
+                            warp_opacities.get(w as usize).copied().unwrap_or(1.0),
+                            shape.map(|s| s.divisions),
+                            parent,
+                        )
                     }
                     DeformerKind::Rotation(r) => resolve_rotation(rotations.get(r as usize), parent),
                 };
@@ -614,6 +660,9 @@ struct Resolved {
     /// The product of every rotation's scale from the root down to here. A warp
     /// adds none of its own: it passes its parent's through.
     total_scale: f32,
+    /// The product of every deformer's opacity from the root down to here,
+    /// this one included. `1.0` is fully opaque.
+    opacity: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -629,7 +678,7 @@ enum Frame {
 
 impl Resolved {
     fn identity() -> Self {
-        Self { frame: Frame::Identity, total_scale: 1.0 }
+        Self { frame: Frame::Identity, total_scale: 1.0, opacity: 1.0 }
     }
 
     /// Carries a point from this deformer's child space into canvas space.
@@ -642,7 +691,12 @@ impl Resolved {
     }
 }
 
-fn resolve_warp(grid: Option<&Vec<(f32, f32)>>, divisions: Option<(u32, u32)>, parent: Option<&Resolved>) -> Resolved {
+fn resolve_warp(
+    grid: Option<&Vec<(f32, f32)>>,
+    opacity: f32,
+    divisions: Option<(u32, u32)>,
+    parent: Option<&Resolved>,
+) -> Resolved {
     // The second division count is the one that runs along a stored row (see
     // `WarpDeformer::divisions`), so it is the number of columns.
     let (rows, columns) = divisions.unwrap_or((0, 0));
@@ -651,7 +705,8 @@ fn resolve_warp(grid: Option<&Vec<(f32, f32)>>, divisions: Option<(u32, u32)>, p
         Some(p) => (local.iter().map(|g| p.map(*g)).collect(), p.total_scale),
         None => (local.to_vec(), 1.0),
     };
-    Resolved { frame: Frame::Warp { grid, columns: columns as usize, rows: rows as usize }, total_scale }
+    let opacity = parent.map_or(1.0, |p| p.opacity) * opacity;
+    Resolved { frame: Frame::Warp { grid, columns: columns as usize, rows: rows as usize }, total_scale, opacity }
 }
 
 /// How far along a warp's own up axis the probe that reads a rotation's turn
@@ -661,7 +716,11 @@ const TURN_PROBE: f32 = 0.1;
 fn resolve_rotation(key: Option<&RotationKeyform>, parent: Option<&Resolved>) -> Resolved {
     let Some(key) = key else { return Resolved::identity() };
     let Some(p) = parent else {
-        return Resolved { frame: Frame::Rotation { origin: key.origin, angle: key.angle }, total_scale: key.scale };
+        return Resolved {
+            frame: Frame::Rotation { origin: key.origin, angle: key.angle },
+            total_scale: key.scale,
+            opacity: key.opacity,
+        };
     };
     let (origin, angle) = match &p.frame {
         Frame::Rotation { angle: parent_angle, .. } => (p.map(key.origin), key.angle + parent_angle),
@@ -699,7 +758,11 @@ fn resolve_rotation(key: Option<&RotationKeyform>, parent: Option<&Resolved>) ->
         }
         Frame::Identity => (key.origin, key.angle),
     };
-    Resolved { frame: Frame::Rotation { origin, angle }, total_scale: p.total_scale * key.scale }
+    Resolved {
+        frame: Frame::Rotation { origin, angle },
+        total_scale: p.total_scale * key.scale,
+        opacity: p.opacity * key.opacity,
+    }
 }
 
 /// Where a value falls among a sorted key list.
@@ -1472,5 +1535,102 @@ mod tests {
         assert!(close(pose.drawables[0][0], (9.0, -21.0)), "{:?}", pose.drawables[0]);
         // (1, 0) doubles to (2, 0), a quarter turn makes it (0, 2).
         assert!(close(pose.drawables[0][1], (10.0, -22.0)), "{:?}", pose.drawables[0]);
+    }
+
+    fn warp_node(parent: Option<u32>) -> Node {
+        Node::Warp { parent, divisions: (1, 1), grid: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] }
+    }
+
+    fn rotation_node(parent: Option<u32>) -> Node {
+        Node::Rotation { parent, origin: (0.0, 0.0), angle: 0.0, scale: 1.0 }
+    }
+
+    #[test]
+    fn a_rotation_deformers_opacity_reaches_the_drawables_below_it() {
+        let nodes = [rotation_node(None)];
+        let opaque = hand_model(&nodes, Some(0), &[(1.0, 2.0), (3.0, 4.0)]);
+        let mut faded = opaque.clone();
+        faded.rotation_keyforms[0].opacity = 0.5;
+        let (before, after) = (opaque.pose(&[]), faded.pose(&[]));
+        assert_eq!(before.opacities, [1.0]);
+        assert!((after.opacities[0] - 0.5).abs() < 1e-6, "{:?}", after.opacities);
+        // Opacity is not geometry: nothing moves.
+        assert_eq!(before.drawables, after.drawables);
+    }
+
+    #[test]
+    fn opacity_multiplies_down_the_whole_chain() {
+        // rotation 0.5, then a warp 0.4 under it, then the drawable's own 0.5.
+        let nodes = [rotation_node(None), warp_node(Some(0))];
+        let mut moc = hand_model(&nodes, Some(1), &[(0.5, 0.5)]);
+        moc.rotation_keyforms[0].opacity = 0.5;
+        moc.warp_keyform_opacities = vec![0.4];
+        moc.drawable_keyform_opacities = vec![0.5];
+        let pose = moc.pose(&[]);
+        assert!((pose.opacities[0] - 0.1).abs() < 1e-6, "0.5 * 0.4 * 0.5 is 0.1, got {:?}", pose.opacities);
+    }
+
+    #[test]
+    fn a_drawable_with_no_parent_deformer_keeps_its_own_opacity() {
+        let mut moc = hand_model(&[], None, &[(0.5, 0.5)]);
+        moc.drawable_keyform_opacities = vec![0.25];
+        assert!((moc.pose(&[]).opacities[0] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_fully_transparent_ancestor_hides_a_deformer_chain_whatever_is_below() {
+        let nodes = [warp_node(None), rotation_node(Some(0)), warp_node(Some(1))];
+        let mut moc = hand_model(&nodes, Some(2), &[(0.5, 0.5)]);
+        moc.warp_keyform_opacities = vec![0.0, 1.0];
+        assert_eq!(moc.pose(&[]).opacities, [0.0]);
+    }
+
+    #[test]
+    fn a_warp_keyform_opacity_blends_like_its_grid() {
+        // Keys at -30, 0 and 30: the warp is opaque at the first two and
+        // transparent at the third, so 15 is halfway between 1 and 0.
+        let bytes = crate::moc3::tests::Builder::new().warp_opacities(&[1.0, 1.0, 0.0]).build();
+        let moc = crate::Moc3::parse(&bytes).expect("should parse");
+        let at = |value: f32| {
+            let mut values: Vec<f32> = moc.parameters.iter().map(|p| p.default).collect();
+            values[0] = value;
+            moc.pose(&values).opacities[0]
+        };
+        assert!((at(0.0) - 1.0).abs() < 1e-5, "{}", at(0.0));
+        assert!((at(15.0) - 0.5).abs() < 1e-5, "{}", at(15.0));
+        assert!(at(30.0).abs() < 1e-5, "{}", at(30.0));
+    }
+
+    #[test]
+    fn a_rotation_keyform_opacity_blends_like_its_angle() {
+        let bytes = crate::moc3::tests::Builder::new().rotation_opacities(&[1.0, 1.0, 0.0]).build();
+        let moc = crate::Moc3::parse(&bytes).expect("should parse");
+        let mut values: Vec<f32> = moc.parameters.iter().map(|p| p.default).collect();
+        values[0] = 15.0;
+        // The drawable hangs off the warp, which hangs off the rotation.
+        assert!((moc.pose(&values).opacities[0] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_model_without_a_warp_opacity_track_draws_as_before() {
+        let bytes = crate::moc3::tests::Builder::new().without_warp_opacity().build();
+        let moc = crate::Moc3::parse(&bytes).expect("should parse");
+        assert!(moc.warp_keyform_opacities.is_empty());
+        assert_eq!(moc.pose(&[]).opacities, [1.0]);
+    }
+
+    #[test]
+    fn a_non_finite_deformer_opacity_never_reaches_a_renderer_as_nan() {
+        use crate::CubismEmit;
+        for bad in [f32::NAN, f32::INFINITY] {
+            let mut moc = crate::Moc3::parse(&crate::moc3::tests::Builder::new().build()).expect("should parse");
+            moc.rotation_keyforms[0].opacity = bad;
+            moc.warp_keyform_opacities = vec![bad; moc.keyforms.warp_offsets.len()];
+            let pose = moc.pose(&[]);
+            assert!(pose.opacities.iter().all(|o| o.is_finite() && (0.0..=1.0).contains(o)), "{:?}", pose.opacities);
+            let mut list = a2d_core::RenderList::new();
+            moc.emit(&pose, a2d_core::TextureId(0), &mut list);
+            assert!(list.meshes().iter().all(|m| !m.color.a.is_nan()));
+        }
     }
 }
