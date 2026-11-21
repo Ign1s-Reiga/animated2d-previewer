@@ -290,6 +290,9 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
             "{source_format} is newer than any layout checked against a real model; it is read on the same layout rather than refused"
         )));
     }
+    for note in &parsed.notes {
+        report.warn(Degradation::Note(note.clone()));
+    }
     let mut model: a2d_core::ir::cubism::CubismIr = parsed.into();
 
     let bundle = Bundle::parse(bytes)?;

@@ -345,6 +345,12 @@ pub struct CubismIr {
     /// [`Keyforms::drawable_offsets`]. Empty when the source carried none, in
     /// which case the model draws fully opaque.
     pub drawable_keyform_opacities: Vec<f32>,
+    /// Opacity of each warp deformer keyform, in the same order as
+    /// [`Keyforms::warp_offsets`]. Empty when the source carried none (or a
+    /// package written before this was stored is read), in which case no warp
+    /// takes anything away from the drawables below it. A rotation's opacity is
+    /// stored in its [`RotationKeyform`].
+    pub warp_keyform_opacities: Vec<f32>,
     /// Draw order of each drawable keyform, in the same order.
     pub drawable_keyform_draw_orders: Vec<f32>,
     /// The model's own motions. Empty when the source supplied none.

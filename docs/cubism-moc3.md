@@ -57,7 +57,8 @@ used by the parser:
 | 11 | deformer ids | | 53 | parameter defaults |
 | 16 | deformer parent | | 56 | parameter binding begin |
 | 17 | deformer type (0 warp, 1 rotation) | | 57 | parameter binding count |
-| 18 | deformer index within its type | | 60 | warp keyform position offsets |
+| 18 | deformer index within its type | | 59 | warp keyform opacity |
+| | | | 60 | warp keyform position offsets |
 | 19 | warp keyform binding | | 61 | rotation keyform opacity |
 | 20 | warp keyform begin | | 62 | rotation keyform angle |
 | 21 | warp keyform count | | 63 | rotation keyform origin x |
@@ -186,11 +187,15 @@ none the other way, and swapping the weights increases triangle flips caused by
 glue (from 0 to 43 over motions on one model). That is evidence from seam
 geometry, not a reference runtime.
 
-**Open: a hidden partner.** One glue pulls a visible mesh by 0.6 canvas units
-towards a partner that is fully transparent and static in that pose. It is
-applied as decoded. Whether Cubism skips a glue toward a transparent mesh is
-unknown; no opacity rule is added on one case. A cross-check in the official
-free viewer would settle it.
+**Hidden partners.** A glue is applied whatever the opacity of either mesh,
+and no opacity rule is added to it. The glues that once looked wrong, with a
+visible mesh pulled by up to 0.6 canvas units towards a transparent partner,
+were pairs of alternate pieces that the artist hides by fading a deformer; see
+"Deformer opacity" in section 6. Once that fade reaches the drawables, the
+pre-glue gap of every pair whose two meshes are both shown is under 0.1 canvas
+units. A glue toward a mesh that is only partly faded still pulls a visible mesh
+by more than 0.005 canvas units during a crossfade (largest seen 0.29, at an
+opacity of 0.06), which is taken as authored.
 
 ## 3. What was confirmed, and against what
 
@@ -471,6 +476,43 @@ part tree. Section 58 holds a per-part draw order on the same 0-to-1000 scale,
 but it is 500 for all but three parts on the model measured, so it separates
 nothing. Section 69 is therefore decoded and carried but not yet used.
 
+### Deformer opacity: sections 59 and 61
+
+Every deformer keyform carries an opacity as well: section 61 for rotations
+(read alongside their angle and origin) and **section 59 for warps**. Section 59
+is identified like section 68: exactly one float per warp keyform (count slot 7
+equals the number of warp keyforms, and the room before section 60 holds that
+many floats after padding), every value inside `[0, 1]`, only two or three
+distinct values per model, and a few dozen to a hundred and forty zeros.
+
+The rule, as implemented: a deformer's opacity is its blended own opacity times
+its parent's, so it is the product of every ancestor's; a drawable shows its own
+blended opacity times its parent deformer's. Geometry, glue and masks do not
+change, and a drawable whose deformer is transparent still works as a mask, as
+a transparent drawable always did.
+
+What established it:
+
+* The Live2D Inspector manual says a deformer's opacity changes the opacity of
+  the art meshes that belong to it, and the modeling menu's "apply deformer to
+  child elements" folds a deformer's opacity into its children.
+* Real models hide alternate pieces this way. At rest, 91, 33 and 280 drawables
+  are hidden across the three models measured, against 26, 2 and 52 by their own
+  opacity alone. Rendered without the rule, a model shows duplicate hands,
+  lanterns and shawl or ribbon variants stacked on the intended ones; with it,
+  one of each.
+* It explains the glue gaps: the pairs that drifted by up to 0.6 canvas units
+  were alternate pieces hidden this way, and with the rule the worst pre-glue
+  gap while both meshes of a glue show is 0.042, 0.012 and 0.089.
+
+What is not established: whether ancestors combine by multiplication (rather
+than a minimum, or only the direct parent counting), which rests on the manual's
+wording and the renders; how a partial opacity between 0 and 1 should look,
+which no reference was compared against; and the deformers' visibility and
+enabled flags (sections 13 and 14, and 37 and 38 for drawables), which are not
+read. A part's own opacity (pose files and part-opacity motion curves) is also
+still not applied; the bundles examined carry no such curves.
+
 ### Section 87 is a sequence, not a key
 
 Slot `k` names the drawable painted `k`-th. It is *not* a per-drawable value
@@ -619,7 +661,13 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
   point being walked through both (up to `0.02` canvas units apart at rest,
   `0.06` in motion); and glue where a gap exists at rest (the widest is `0.3`
   canvas units on one model), which pulls a mesh towards its partner and can
-  still stretch it. Whether Cubism shows the same pull needs a reference.
+  still stretch it. Whether Cubism shows the same pull needs a reference. A
+  glue with a gap at rest is mostly between alternate pieces that deformer
+  opacity hides in that pose (section 6), so the pull is not on screen.
+- **Deformer opacity.** Applied as a product down the deformer chain (section
+  6). Unverified: multiplication against a minimum or the direct parent only;
+  how a partial opacity should look; the visibility and enabled flags
+  (sections 13, 14, 37, 38); and part opacity, which is not applied at all.
 - **Motions.** The bundles' animations are Unity `AnimationClip`s in the
   compressed muscle-clip form, not `motion3.json`. Their parameter curves are
   recovered and carried in the package as keyed Hermite segments, so a model
@@ -639,4 +687,5 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
 - **Glue.** Decoded and applied (§2). Weights may sum below 1 (partial release,
   seen on two of three models). Unverified: intensities other than 1, which
   weight belongs to which mesh, the order of application when one vertex is in
-  several glues, and whether a glue toward a fully transparent mesh is skipped.
+  several glues, and whether a glue toward a partly faded mesh is weakened (a
+  fully faded one is hidden by deformer opacity, see section 6).
