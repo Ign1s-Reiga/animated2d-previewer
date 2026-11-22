@@ -1016,25 +1016,47 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<()
 
     writeln!(out, "\n  physics:     {}", physics_summary(inventory.physics.as_ref()))?;
 
-    if !inventory.animator_controllers.is_empty() {
-        writeln!(out, "\n  animator controllers:")?;
-        for name in &inventory.animator_controllers {
-            writeln!(out, "    {name}")?;
-        }
-    }
-
-    if !inventory.fade_sources.is_empty() {
-        writeln!(out, "\n  original motion sources:")?;
-        for path in &inventory.fade_sources {
-            writeln!(out, "    {path}")?;
-        }
-    }
+    print_controllers_and_sources(out, &inventory)?;
 
     print_report(out, &report)?;
     writeln!(
         out,
         "\nThis reports what the bundle holds. `animated2d import` reconstructs a loadable \npackage from it, and `animated2d preview` opens it directly."
     )?;
+    Ok(())
+}
+
+/// The animator controllers and the original motion sources. Both always
+/// print: an empty list is a finding (a bundle with no fade motion data is the
+/// normal case for real exports), and omitting the heading would leave the
+/// reader unable to tell "absent" from "not looked for".
+fn print_controllers_and_sources(
+    out: &mut dyn std::io::Write,
+    inventory: &a2d_import::CubismInventory,
+) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "
+  animator controllers:"
+    )?;
+    if inventory.animator_controllers.is_empty() {
+        writeln!(out, "    (none: no AnimatorController in this bundle)")?;
+    }
+    for name in &inventory.animator_controllers {
+        writeln!(out, "    {name}")?;
+    }
+
+    writeln!(
+        out,
+        "
+  original motion sources:"
+    )?;
+    if inventory.fade_sources.is_empty() {
+        writeln!(out, "    (none: no fade motion entry names a .motion3.json)")?;
+    }
+    for path in &inventory.fade_sources {
+        writeln!(out, "    {path}")?;
+    }
     Ok(())
 }
 
@@ -1085,6 +1107,62 @@ mod tests {
         let mut out = Vec::new();
         print_report(&mut out, &LoadReport::new()).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "\nLoaded cleanly.\n");
+    }
+
+    #[test]
+    fn empty_controller_and_fade_lists_are_stated_not_omitted() {
+        let mut inventory = a2d_import::CubismInventory {
+            unity_revision: String::new(),
+            object_count: 0,
+            moc: None,
+            textures: vec![],
+            motions: vec![],
+            animator_controllers: vec![],
+            game_objects: 0,
+            parameters: 0,
+            parts: 0,
+            drawables: 0,
+            fade_sources: vec![],
+            physics: None,
+        };
+        let mut out = Vec::new();
+        print_controllers_and_sources(&mut out, &inventory).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "animator controllers:
+    (none: no AnimatorController"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "original motion sources:
+    (none: no fade motion entry names a .motion3.json)"
+            ),
+            "{text}"
+        );
+
+        inventory.animator_controllers = vec!["Ctrl".into()];
+        inventory.fade_sources = vec!["a.motion3.json".into()];
+        let mut out = Vec::new();
+        print_controllers_and_sources(&mut out, &inventory).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "animator controllers:
+    Ctrl"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "original motion sources:
+    a.motion3.json"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("(none"), "{text}");
     }
 
     #[test]
