@@ -16,7 +16,7 @@
 //!
 //! Those checks hold of `apply_glue` for any weights, so the data itself is
 //! also checked: weights lie in `[0, 1]`, glued pairs coincide at rest, and
-//! most weight sums are one.
+//! most non-keyed glues are fully weighted.
 //!
 //! The asset is never committed (spec §11). `A2D_FIXTURE_CUBISM` names one
 //! bundle:
@@ -33,14 +33,19 @@ use a2d_cubism::GenericCubismModel;
 type Key = (u32, u32);
 
 /// How far apart a glued pair may sit at rest and still count as coincident.
-/// Measured on three real models: the widest single-glue pair is 0.0053, 0.0127
+/// Measured on three large real models: the widest single-glue pair is 0.0053, 0.0127
 /// and 0.295 canvas units, with 0, 0 and 8 of 817 pairs over this tolerance;
 /// the 0.295 ones are known rest gaps that glue exists to close.
 const REST_TOLERANCE: f32 = 2e-2;
 /// The share of single-glue pairs allowed to be farther apart than that.
 const MAX_REST_APART_SHARE: f32 = 0.05;
-/// The share of single-glue pairs whose weights must sum to one.
-const MIN_FULL_SHARE: f32 = 0.9;
+/// The share of non-keyed glues that must be fully weighted (every pair's
+/// weights sum to one). Counted per glue, not per pair: a glue that is partly
+/// released contributes many pairs that do not sum to one, and how many such
+/// glues a rig has does not scale with its size, so a pair share collapses on
+/// a small rig. Measured across six real models: 0.80 to 1.00 (the lowest, 0.80,
+/// is one partly released glue among five non-keyed ones).
+const MIN_FULL_GLUE_SHARE: f32 = 0.75;
 
 fn gap(a: (f32, f32), b: (f32, f32)) -> f32 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
@@ -106,7 +111,7 @@ fn glued_pairs_of_a_real_model_close_by_exactly_their_weights() {
 
     // Claim (ii): single-glue pairs coincide at rest before glue. This is what
     // says the vertex indices and the mesh order were decoded right.
-    let (mut single_pairs, mut single_full, mut rest_far, mut rest_worst) = (0usize, 0usize, 0usize, 0.0f32);
+    let (mut single_pairs, mut rest_far, mut rest_worst) = (0usize, 0usize, 0.0f32);
     {
         let rp = raw.pose();
         for (gi, glue) in ir.glues.iter().enumerate() {
@@ -118,9 +123,6 @@ fn glued_pairs_of_a_real_model_close_by_exactly_their_weights() {
                     continue;
                 }
                 single_pairs += 1;
-                if (pair.weight_a + pair.weight_b - 1.0).abs() < 1e-4 {
-                    single_full += 1;
-                }
                 let g = gap(
                     rp.drawables[glue.mesh_a as usize][pair.vertex_a as usize],
                     rp.drawables[glue.mesh_b as usize][pair.vertex_b as usize],
@@ -133,13 +135,26 @@ fn glued_pairs_of_a_real_model_close_by_exactly_their_weights() {
         }
     }
     let rest_far_share = rest_far as f32 / single_pairs.max(1) as f32;
-    let full_share = single_full as f32 / single_pairs.max(1) as f32;
+    let (mut glues_checked, mut glues_full) = (0usize, 0usize);
+    for (gi, glue) in ir.glues.iter().enumerate() {
+        if keyed[gi] {
+            continue;
+        }
+        glues_checked += 1;
+        if !glue.pairs.is_empty() && glue.pairs.iter().all(|p| (p.weight_a + p.weight_b - 1.0).abs() < 1e-4) {
+            glues_full += 1;
+        }
+    }
+    let full_share = glues_full as f32 / glues_checked.max(1) as f32;
     println!(
-        "single-glue pairs {single_pairs}: {rest_far} apart at rest by over {REST_TOLERANCE} (share {rest_far_share:.4}, widest {rest_worst}); weight sum one on {full_share:.4}"
+        "single-glue pairs {single_pairs}: {rest_far} apart at rest by over {REST_TOLERANCE} (share {rest_far_share:.4}, widest {rest_worst}); fully weighted glues {glues_full} of {glues_checked} non-keyed ({full_share:.4})"
     );
     assert!(single_pairs > 0, "no single-glue pair to check");
     assert!(rest_far_share <= MAX_REST_APART_SHARE, "too many glued pairs are apart at rest: {rest_far_share}");
-    assert!(full_share >= MIN_FULL_SHARE, "too few pairs have weights summing to one: {full_share}");
+    assert!(
+        full_share >= MIN_FULL_GLUE_SHARE,
+        "too few glues have every pair's weights summing to one: {glues_full} of {glues_checked}"
+    );
 
     let (mut closed, mut partial, mut shared, mut unstable, mut crossed) =
         (Tally::default(), Tally::default(), Tally::default(), Tally::default(), Tally::default());
