@@ -552,6 +552,54 @@ before being reverted. §3 records the argument and why it was wrong. Nothing in
 the format says which way up a character stands; only someone who knows the
 character can say.
 
+### Repeating parameters: inferred, not read
+
+Cubism's editor can mark a parameter as repeating: its two ends join, so a value
+past the maximum comes round to the minimum. The flag is not in a MOC3 version 2
+(the parameter records carry an id and a range, nothing else), so the only trace
+is in the motions. On one real model six parameters, all on `[-30, 30]`, are
+keyed in whole multiples of their 60-wide range: a linear ramp from 0 to 180 over
+the clip, held rest phases of 360, -180 and 120. Clamped, the ramp freezes at 30
+after a fraction of the clip and snaps back at the loop wrap (a vertex move of
+0.0357 canvas units over eleven drawables and an opacity pop of 0.70);
+wrapped, the same wrap is closed (0.0002, no opacity change). The other five
+models measured key nothing outside their ranges and already closed to 0.0.
+
+The rule (`CubismIr::repeating_parameters`): a parameter repeats when some motion
+curve driving it has **every** key on the same side of `[min, max]`, at least
+half the range beyond that end (a curve that straddles the range, say -90 to 90,
+is a deliberate sweep and does not count).
+Playback then folds that parameter's value into `[min, max)` (the maximum maps
+to the minimum) instead of clamping it. It is computed from the motions on load,
+so no package layout changed.
+
+Why that rule and not a looser one. The first candidate, "any key at least half a
+range outside", also caught seven more parameters on the same model that were
+keyed in one motion only: six `[-30, 30]` parameters that climb from 0 by one
+to three ranges and return to 0, and one `[0, 1]` parameter with a single key at
+2 among in-range keys. Their geometry could not say whether they loop (they move
+nothing visible at rest), and a ramp that goes up and comes back is as likely a
+value the author expected to saturate. A curve lying wholly outside the range
+has no such reading, since clamped it would be a constant at one end. All six
+confirmed parameters have such a curve in several motions. The cost: a
+parameter whose only out-of-range evidence is a ramp that also visits the range
+is not flagged, and is still clamped. Each flag is reported as a note naming the
+motion and key that justified it, so a wrong call is visible rather than silent.
+
+Unverified:
+
+- Whether the game's own runtime wrapped these values or clamped them (the seam
+  may exist there too). The authoring intent is clearly a loop.
+- The editor's rule that, once repeating is on, the rightmost key value is no
+  longer recognised: a value between the last inner key and the maximum would
+  blend towards the keyform at the minimum. Wrapping the value alone leaves a
+  drawable whose keyforms differ between the two ends moving by that difference
+  when a curve crosses the join (at most 0.0199 canvas units on this model, 0.0002
+  at the seams actually measured). Not implemented; the exact rule is unknown
+  without a reference runtime.
+- Crossfading between two motions should take the shortest way round a
+  repeating parameter. There is no crossfade yet.
+
 ## 7. How correctness is judged without a reference runtime
 
 No reference *runtime* has been compared against. What the chain is judged by

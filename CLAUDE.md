@@ -58,6 +58,9 @@ Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 bin
 for Cubism, expressions, pose/part-opacity curves, motion fades and crossfades,
 animated draw order, multiple texture pages, and the model-level curves (opacity, eye blink,
 lip sync) that motions may carry.
+Looping (repeat) parameters have no flag in a MOC3 v2; they are inferred from motions that
+key a parameter wholly beyond one end of its range, wrapped instead of clamped, and reported per parameter.
+The editor's "rightmost key ignored" keyform rule for them is not implemented.
 
 **The 4.0/4.1 binary decoder has not been checked against a real export.** Its tests
 round-trip through the fixture writer, which proves the decoder and the writer agree with

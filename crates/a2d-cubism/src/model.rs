@@ -412,6 +412,11 @@ impl AnimatedModel for GenericCubismModel {
         for degradation in self.moc.unresolved_physics_targets() {
             report.warn(degradation);
         }
+        // A parameter wrapped rather than clamped is an inference, not something
+        // the file says; name each one so a wrong call is visible.
+        for degradation in self.moc.repeat_degradations() {
+            report.warn(degradation);
+        }
     }
 }
 
@@ -1066,5 +1071,89 @@ mod tests {
         // The rig still loads and does nothing harmful.
         frames(&mut m, 5);
         assert!(m.values.iter().all(|v| v.is_finite()));
+    }
+
+    // ---- repeating parameters ----
+
+    /// `ParamAngleX` ([-30, 30]) turning linearly 0 -> 180 over 4 s, plus a
+    /// motion holding it at 360 (six turns), which marks it as repeating.
+    fn spinner(physics: Option<Physics>) -> GenericCubismModel {
+        let spin = Motion {
+            name: "Spin".into(),
+            duration: 4.0,
+            curves: vec![MotionCurve {
+                target: "ParamAngleX".into(),
+                keys: vec![k(0.0, 0.0, 45.0), k(4.0, 180.0, 45.0)],
+                ..MotionCurve::default()
+            }],
+            ..Motion::default()
+        };
+        let rest = Motion {
+            name: "Rest".into(),
+            duration: 1.0,
+            curves: vec![MotionCurve {
+                target: "ParamAngleX".into(),
+                keys: vec![k(0.0, 360.0, 0.0), k(1.0, 360.0, 0.0)],
+                ..MotionCurve::default()
+            }],
+            ..Motion::default()
+        };
+        match physics {
+            Some(p) => with_physics(vec![spin, rest], p),
+            None => with_motions(vec![spin, rest]),
+        }
+    }
+
+    #[test]
+    fn a_repeating_parameter_is_posed_wrapped_and_pose_at_stays_pure() {
+        let mut fresh = spinner(None);
+        fresh.pose_at("Spin", 1.0).expect("pose");
+        assert!((value(&fresh, "ParamAngleX") - -15.0).abs() < 1e-3);
+        let mut used = spinner(None);
+        used.pose_at("Spin", 3.0).expect("pose");
+        used.play_animation("Rest", PlayOptions::looping()).expect("play");
+        frames(&mut used, 10);
+        used.pose_at("Spin", 1.0).expect("pose");
+        assert_eq!(used.values, fresh.values);
+        assert_eq!(used.pose, fresh.pose);
+    }
+
+    #[test]
+    fn physics_reads_the_wrapped_value_of_a_repeating_parameter() {
+        // 360 is six whole turns, so the model is posed at 0. A rig reading it
+        // must behave exactly as one reading a held 0, not one reading a
+        // clamped 30.
+        let mut wrapped = spinner(Some(rig("ParamAngleX", "ParamEyeLOpen", 100.0)));
+        wrapped.play_animation("Rest", PlayOptions::looping()).expect("play");
+        let mut zero = with_physics(vec![hold_at("Rest", 0.0)], rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+        zero.play_animation("Rest", PlayOptions::looping()).expect("play");
+        frames(&mut wrapped, 60);
+        frames(&mut zero, 60);
+        assert_eq!(value(&wrapped, "ParamAngleX"), 0.0);
+        assert!((value(&wrapped, "ParamEyeLOpen") - value(&zero, "ParamEyeLOpen")).abs() < 1e-6);
+    }
+
+    /// A motion holding `ParamAngleX` at `v`.
+    fn hold_at(name: &str, v: f32) -> Motion {
+        Motion {
+            name: name.into(),
+            duration: 1.0,
+            curves: vec![MotionCurve {
+                target: "ParamAngleX".into(),
+                keys: vec![k(0.0, v, 0.0), k(1.0, v, 0.0)],
+                ..MotionCurve::default()
+            }],
+            ..Motion::default()
+        }
+    }
+
+    #[test]
+    fn repeating_parameters_are_reported_once_each() {
+        let m = spinner(None);
+        let mut report = a2d_core::LoadReport::new();
+        m.absorb_degradations(&mut report);
+        let text: Vec<String> = report.warnings().iter().map(|w| w.to_string()).collect();
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("ParamAngleX") && text[0].contains("repeating"), "{text:?}");
     }
 }

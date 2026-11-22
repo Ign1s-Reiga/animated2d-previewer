@@ -72,8 +72,8 @@ pub fn wrap_time(t: f32, duration: f32, looping: bool) -> f32 {
 #[derive(Debug, Clone)]
 pub struct MotionPlayer {
     motion: usize,
-    /// `(curve index, parameter index)` for every curve that resolved.
-    bindings: Vec<(usize, usize)>,
+    /// `(curve index, parameter index, repeats)` for every curve that resolved.
+    bindings: Vec<(usize, usize, bool)>,
     time: f32,
     looping: bool,
     speed: f32,
@@ -85,11 +85,12 @@ impl MotionPlayer {
     pub fn new(ir: &CubismIr, motion: usize, looping: bool, speed: f32) -> Option<MotionPlayer> {
         let m = ir.motions.get(motion)?;
         let mut bindings = Vec::new();
+        let repeating = ir.repeating_parameters();
         for (ci, c) in m.curves.iter().enumerate() {
             // A curve that resolves to nothing is simply not bound; it is
             // reported through `CubismIr::unresolved_motion_targets`.
             if let Some(pi) = ir.motion_target(&c.target) {
-                bindings.push((ci, pi));
+                bindings.push((ci, pi, repeating.contains(&pi)));
             }
         }
         let speed = if speed.is_finite() { speed } else { 1.0 };
@@ -157,14 +158,16 @@ impl MotionPlayer {
     }
 
     /// Writes this motion's value at the playhead into `values`, clamped to
-    /// each parameter's range. Curves with no keys leave their parameter alone.
+    /// each parameter's range, or wrapped into it for a parameter that repeats
+    /// (see [`CubismIr::repeating_parameters`]). Curves with no keys leave their
+    /// parameter alone. A pure function of the playhead: the wrap keeps no state.
     pub fn apply(&self, ir: &CubismIr, values: &mut [f32]) {
         let Some(m) = ir.motions.get(self.motion) else { return };
-        for &(ci, pi) in &self.bindings {
+        for &(ci, pi, repeats) in &self.bindings {
             let (Some(curve), Some(param)) = (m.curves.get(ci), ir.parameters.get(pi)) else { continue };
             let Some(v) = sample(&curve.keys, self.time) else { continue };
             if let Some(slot) = values.get_mut(pi) {
-                *slot = param.clamp(v);
+                *slot = if repeats { param.wrap(v) } else { param.clamp(v) };
             }
         }
     }
@@ -259,5 +262,108 @@ mod tests {
         assert_eq!(wrap_time(5.0, 2.0, false), 2.0);
         assert_eq!(wrap_time(-1.0, 2.0, false), 0.0);
         assert_eq!(wrap_time(1.0, 0.0, true), 0.0);
+    }
+    // ---- repeating parameters ----
+
+    use a2d_core::ir::cubism::{Motion, MotionCurve, Parameter};
+
+    fn curve(target: &str, keys: Vec<CurveKey>) -> MotionCurve {
+        MotionCurve { target: target.into(), keys, ..MotionCurve::default() }
+    }
+
+    /// Parameter `A` on [-30, 30]. Motion 0 ramps it linearly 0 -> 180 over 4 s
+    /// (slope 45/s). With `marked`, motion 1 holds `A` at 360 (a rest phase wholly
+    /// beyond the range), which is what marks it as repeating; without it the
+    /// ramp alone, which has an in-range key, is not evidence of a loop.
+    fn ramp_ir(marked: bool) -> CubismIr {
+        let mut motions = vec![Motion {
+            name: "ramp".into(),
+            duration: 4.0,
+            curves: vec![curve("A", vec![key(0.0, 0.0, 45.0, 45.0), key(4.0, 180.0, 45.0, 45.0)])],
+            ..Motion::default()
+        }];
+        if marked {
+            motions.push(Motion {
+                name: "rest".into(),
+                duration: 1.0,
+                curves: vec![curve("A", vec![key(0.0, 360.0, 0.0, 0.0)])],
+                ..Motion::default()
+            });
+        }
+        let parameters = vec![Parameter { id: "A".into(), minimum: -30.0, maximum: 30.0, default: 0.0 }];
+        CubismIr { parameters, motions, ..CubismIr::default() }
+    }
+
+    fn value_at(ir: &CubismIr, motion: usize, t: f32) -> f32 {
+        let mut player = MotionPlayer::new(ir, motion, true, 1.0).expect("motion");
+        player.seek(ir, t);
+        let mut values = vec![0.0];
+        player.apply(ir, &mut values);
+        values[0]
+    }
+
+    #[test]
+    fn a_repeating_parameter_wraps_instead_of_clamping() {
+        let ir = ramp_ir(true);
+        assert_eq!(ir.repeating_parameters(), vec![0]);
+        // 45 t wrapped into [-30, 30): t=1 -> 45 -> -15, t=2 -> 90 -> -30,
+        // t=3 -> 135 -> 15, t=4 -> 180 -> 0, the same as t=0.
+        assert!((value_at(&ir, 0, 1.0) - -15.0).abs() < 1e-3);
+        let two = value_at(&ir, 0, 2.0);
+        assert!((two - -30.0).abs() < 1e-3 || (two - 30.0).abs() < 1e-3, "{two}");
+        assert!((value_at(&ir, 0, 3.0) - 15.0).abs() < 1e-3);
+        assert!(value_at(&ir, 0, 4.0).abs() < 1e-3);
+        assert!((value_at(&ir, 0, 4.0) - value_at(&ir, 0, 0.0)).abs() < 1e-3);
+        // The held rest phase 360 is six turns round: 0.
+        assert!(value_at(&ir, 1, 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn without_evidence_of_a_loop_the_same_ramp_clamps() {
+        let ir = ramp_ir(false);
+        assert!(ir.repeating_parameters().is_empty());
+        assert_eq!(value_at(&ir, 0, 1.0), 30.0);
+        assert_eq!(value_at(&ir, 0, 3.0), 30.0);
+    }
+
+    #[test]
+    fn an_overshoot_just_past_the_range_still_clamps() {
+        let mut ir = ramp_ir(false);
+        ir.motions[0].curves[0].keys = vec![key(0.0, 30.5, 0.0, 0.0), key(4.0, 30.5, 0.0, 0.0)];
+        assert!(ir.repeating_parameters().is_empty());
+        assert_eq!(value_at(&ir, 0, 1.0), 30.0);
+    }
+
+    #[test]
+    fn a_looping_player_is_continuous_across_every_wrap_of_a_repeating_parameter() {
+        // Three passes at 60 Hz of a ramp that turns the parameter 1.5 times per
+        // pass. Each step moves at most slope/60 round the circle; the pass
+        // boundary adds no jump because 180 is three whole turns.
+        let ir = ramp_ir(true);
+        let mut player = MotionPlayer::new(&ir, 0, true, 1.0).expect("motion");
+        let mut values = vec![0.0];
+        player.apply(&ir, &mut values);
+        let mut last = values[0];
+        let mut wraps = 0;
+        for _ in 0..(3 * 4 * 60) {
+            if player.advance(&ir, 1.0 / 60.0).is_some() {
+                wraps += 1;
+            }
+            player.apply(&ir, &mut values);
+            let raw = (values[0] - last).rem_euclid(60.0);
+            let step = raw.min(60.0 - raw);
+            assert!(step <= 45.0 / 60.0 + 1e-3, "jumped {step} to {} from {last}", values[0]);
+            last = values[0];
+        }
+        assert!(wraps >= 2, "{wraps}");
+    }
+
+    #[test]
+    fn pose_just_before_the_end_meets_the_start_for_a_repeating_parameter() {
+        let ir = ramp_ir(true);
+        let end = value_at(&ir, 0, 4.0 - 1e-3);
+        let start = value_at(&ir, 0, 0.0);
+        let raw = (end - start).rem_euclid(60.0);
+        assert!(raw.min(60.0 - raw) < 0.1, "{end} vs {start}");
     }
 }

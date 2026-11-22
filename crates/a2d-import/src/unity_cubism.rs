@@ -317,6 +317,10 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
     for degradation in model.unresolved_motion_targets() {
         report.warn(degradation);
     }
+    // Wrapping instead of clamping is an inference from the motions; say so.
+    for degradation in model.repeat_degradations() {
+        report.warn(degradation);
+    }
     // Recovered once, while inspecting, so its notes are not reported twice.
     model.physics = physics;
     for degradation in model.unresolved_physics_targets() {
@@ -353,7 +357,7 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
 /// Copies the import report into the manifest, so `preview` and `validate`
 /// can show it after the bundle is gone.
 ///
-/// Unresolved motion and physics targets are left out: they are re-derived
+/// Unresolved motion and physics targets and inferred repeat parameters are left out: they are re-derived
 /// from the IR every time the package is opened and validated, so persisting
 /// them as well would print each one twice. Order is the report's insertion order, which is
 /// deterministic for a given bundle.
@@ -362,6 +366,7 @@ fn record_warnings(package: &mut Package, report: &LoadReport) {
         a2d_pack::PackageModel::Cubism(ir) => {
             let mut all = ir.unresolved_motion_targets();
             all.extend(ir.unresolved_physics_targets());
+            all.extend(ir.repeat_degradations());
             all
         }
         _ => Vec::new(),
@@ -661,6 +666,39 @@ mod tests {
         assert_eq!(report.len(), 2);
         record_warnings(&mut package, &report);
         assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
+    }
+
+    #[test]
+    fn repeat_notes_are_reported_at_import_and_not_persisted_because_they_are_rederived() {
+        use a2d_core::ir::cubism::{CurveKey, Motion, MotionCurve, Parameter};
+        let key = |t: f32, v: f32| CurveKey { time: t, value: v, in_slope: 0.0, out_slope: 0.0, stepped: false };
+        let motion = Motion {
+            name: "Idle".into(),
+            duration: 1.0,
+            curves: vec![MotionCurve {
+                target: "ParamSpin".into(),
+                keys: vec![key(0.0, 360.0), key(1.0, 360.0)],
+                ..MotionCurve::default()
+            }],
+            ..Motion::default()
+        };
+        let mut package = cubism_package(vec![motion]);
+        let a2d_pack::PackageModel::Cubism(ir) = &mut package.model else { panic!("cubism package expected") };
+        ir.parameters.push(Parameter { id: "ParamSpin".into(), minimum: -30.0, maximum: 30.0, default: 0.0 });
+        let mut report = LoadReport::new();
+        for d in ir.repeat_degradations() {
+            report.warn(d);
+        }
+        assert_eq!(report.len(), 1);
+        report.note("kept");
+        record_warnings(&mut package, &report);
+        assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
+        // Validation derives the same note once, so import then validate shows it once.
+        let a2d_pack::PackageModel::Cubism(ir) = &package.model else { panic!("cubism package expected") };
+        let mut validated = LoadReport::new();
+        a2d_pack::validate::validate_cubism(ir, a2d_pack::FORMAT_VERSION, &[], &mut validated);
+        let repeats = validated.warnings().iter().filter(|w| w.to_string().contains("repeating")).count();
+        assert_eq!(repeats, 1);
     }
 
     #[test]
