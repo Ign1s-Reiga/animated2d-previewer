@@ -293,6 +293,7 @@ pub fn cubism_package(with_motion: bool) -> a2d_pack::Package {
         draw_order: vec![0],
         drawable_keyform_opacities: vec![1.0, 1.0],
         warp_keyform_opacities: vec![],
+        physics: None,
         drawable_keyform_draw_orders: vec![500.0, 500.0],
         ..CubismIr::default()
     };
@@ -439,6 +440,7 @@ pub fn cubism_deformation_package() -> a2d_pack::Package {
         draw_order: vec![0, 1],
         drawable_keyform_opacities: vec![1.0; 4],
         warp_keyform_opacities: vec![],
+        physics: None,
         drawable_keyform_draw_orders: vec![500.0; 4],
         ..CubismIr::default()
     };

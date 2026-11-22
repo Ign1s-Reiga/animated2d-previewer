@@ -19,6 +19,8 @@
 //!   `.motion3.json` it was built from and the parameter curves themselves, so
 //!   it is what `import_bundle` recovers motions from (see `fade_motion`).
 //! * `CubismFadeMotionList` — the index tying those to their clips.
+//! * `CubismPhysicsController` — the physics rig, as serialized fields (see
+//!   `physics`). There is no `.physics3.json` in a bundle.
 //!
 //! The same motions also exist as Unity `AnimationClip`s. Shipping bundles often
 //! hold *only* those, compressed, with no fade data at all; `import_bundle`
@@ -28,10 +30,11 @@
 
 mod clip_motion;
 mod fade_motion;
+mod physics;
 
 use std::collections::HashSet;
 
-use a2d_core::ir::cubism::Motion;
+use a2d_core::ir::cubism::{Motion, Physics};
 use a2d_core::{DecodeError, Degradation, LoadReport};
 use a2d_pack::manifest::TextureEntry as PackTextureEntry;
 use a2d_pack::package::TextureFile;
@@ -90,6 +93,10 @@ pub struct CubismInventory {
     pub drawables: usize,
     /// Fade motion entries that name their original `.motion3.json`.
     pub fade_sources: Vec<String>,
+    /// The physics rig recovered from the model's `CubismPhysicsController`.
+    /// `None` when the bundle has none or it could not be recovered; the
+    /// report says which.
+    pub physics: Option<Physics>,
 }
 
 impl CubismInventory {
@@ -156,6 +163,7 @@ pub fn inspect_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<CubismInv
         parts: inventory.by_script("CubismPart").count(),
         drawables: inventory.by_script("CubismDrawable").count(),
         fade_sources,
+        physics: recover_physics(&file, &inventory, report),
     };
 
     if out.moc.is_none() {
@@ -278,6 +286,7 @@ fn read_i32(data: &[u8], at: usize) -> Result<i32, DecodeError> {
 /// reported through `report` and the model still loads.
 pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, DecodeError> {
     let inventory = inspect_bundle(bytes, report)?;
+    let physics = inventory.physics;
     let moc = inventory.moc.ok_or_else(|| DecodeError::Reconstruction {
         game: "unity_cubism".into(),
         message: "the bundle holds no CubismMoc, so there is no model to reconstruct".into(),
@@ -306,6 +315,11 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
     // Curves aimed at ids the model lacks (model-level opacity, say) are kept
     // and playback skips them; saying so here keeps that visible at import.
     for degradation in model.unresolved_motion_targets() {
+        report.warn(degradation);
+    }
+    // Recovered once, while inspecting, so its notes are not reported twice.
+    model.physics = physics;
+    for degradation in model.unresolved_physics_targets() {
         report.warn(degradation);
     }
 
@@ -339,17 +353,72 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
 /// Copies the import report into the manifest, so `preview` and `validate`
 /// can show it after the bundle is gone.
 ///
-/// Unresolved motion targets are left out: they are re-derived from the IR
-/// every time the package is opened and validated, so persisting them as well
-/// would print each one twice. Order is the report's insertion order, which is
+/// Unresolved motion and physics targets are left out: they are re-derived
+/// from the IR every time the package is opened and validated, so persisting
+/// them as well would print each one twice. Order is the report's insertion order, which is
 /// deterministic for a given bundle.
 fn record_warnings(package: &mut Package, report: &LoadReport) {
     let rederived = match &package.model {
-        a2d_pack::PackageModel::Cubism(ir) => ir.unresolved_motion_targets(),
+        a2d_pack::PackageModel::Cubism(ir) => {
+            let mut all = ir.unresolved_motion_targets();
+            all.extend(ir.unresolved_physics_targets());
+            all
+        }
         _ => Vec::new(),
     };
     package.manifest.import_warnings =
         report.warnings().iter().filter(|w| !rederived.contains(w)).map(|w| w.to_string()).collect();
+}
+
+/// Recovers the physics rig from the model's `CubismPhysicsController`.
+///
+/// A bundle with no controller simply has no physics and says nothing. Every
+/// other way of coming up empty is reported: a body that fits no known layout,
+/// a controller the source had switched off, a second controller (the first is
+/// used), and whatever conversion had to drop.
+///
+/// A disabled controller (`m_Enabled` is 0) is not recovered: the source ran
+/// with no physics, and a viewer that swayed hair the original never swayed
+/// would be showing something else. The body is still decoded first, so a
+/// layout change is reported either way.
+fn recover_physics(file: &SerializedFile, inventory: &Inventory, report: &mut LoadReport) -> Option<Physics> {
+    let mut controllers = inventory.by_script("CubismPhysicsController");
+    let info = controllers.next()?;
+    if controllers.next().is_some() {
+        report.note("the bundle holds more than one CubismPhysicsController; only the first is read");
+    }
+    let label = info.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| format!("physics#{}", info.path_id));
+    let Some(object) = file.find_object(info.path_id) else {
+        report.note(format!("physics controller {label:?} vanished between passes; physics is not recovered"));
+        return None;
+    };
+    let raw = match behaviour_body(file, object).and_then(|(body, _)| physics::decode(&body)) {
+        Ok(raw) => raw,
+        Err(error) => {
+            report.note(format!("physics controller {label:?} was not recovered: {error}"));
+            return None;
+        }
+    };
+    // `m_Enabled` is the byte right after the owner's `PPtr` (12 bytes).
+    let enabled = file.object_data(object).ok().and_then(|data| data.get(12).copied());
+    physics_if_enabled(&raw, enabled, &label, report)
+}
+
+/// The enabled-switch decision of [`recover_physics`], apart from the bundle.
+fn physics_if_enabled(
+    raw: &physics::RawRig,
+    enabled: Option<u8>,
+    label: &str,
+    report: &mut LoadReport,
+) -> Option<Physics> {
+    if enabled == Some(0) {
+        report.note(format!(
+            "physics controller {label:?} is disabled in the source (m_Enabled is 0), which ran without physics; \
+             it is not recovered"
+        ));
+        return None;
+    }
+    physics::to_physics(raw, report)
 }
 
 /// Decodes every `CubismFadeMotionData` into a motion.
@@ -635,6 +704,49 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_physics_controller_is_reported_and_not_recovered() {
+        let rig = physics::tests::sample();
+        let mut report = LoadReport::new();
+        assert!(physics_if_enabled(&rig, Some(0), "ctl", &mut report).is_none());
+        assert!(report.to_string().contains("disabled in the source"), "{report}");
+
+        for enabled in [Some(1), None] {
+            let mut report = LoadReport::new();
+            assert!(physics_if_enabled(&rig, enabled, "ctl", &mut report).is_some());
+            assert!(report.is_empty(), "{report}");
+        }
+    }
+
+    #[test]
+    fn recovered_physics_packs_and_its_unresolved_ids_are_rederived_not_persisted() {
+        let rig = physics::tests::sample();
+        let mut report = LoadReport::new();
+        let physics = physics::to_physics(&rig, &mut report).unwrap();
+        let ir = a2d_core::ir::cubism::CubismIr {
+            parameters: vec![a2d_core::ir::cubism::Parameter {
+                id: "ParamAngleX".into(),
+                minimum: -30.0,
+                maximum: 30.0,
+                default: 0.0,
+            }],
+            physics: Some(physics),
+            ..Default::default()
+        };
+        // Three ids name nothing: ParamAngleZ, ParamHairA, ParamHairB.
+        let unresolved = ir.unresolved_physics_targets();
+        assert_eq!(unresolved.len(), 3, "{unresolved:?}");
+        let mut package = Package::from_cubism(ir, "m", "cubism-moc3-v3");
+        let mut report = LoadReport::new();
+        for d in unresolved {
+            report.warn(d);
+        }
+        report.note("kept");
+        record_warnings(&mut package, &report);
+        assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
+        assert!(package.encode_model().is_ok());
+    }
+
+    #[test]
     fn a_bundle_that_is_not_one_is_refused() {
         let mut report = LoadReport::new();
         assert!(inspect_bundle(b"not a bundle at all", &mut report).is_err());
@@ -654,6 +766,7 @@ mod tests {
             parts: 0,
             drawables: 0,
             fade_sources: Vec::new(),
+            physics: None,
         };
         assert!(!empty.is_cubism());
     }

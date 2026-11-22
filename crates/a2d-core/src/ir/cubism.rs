@@ -355,6 +355,212 @@ pub struct CubismIr {
     pub drawable_keyform_draw_orders: Vec<f32>,
     /// The model's own motions. Empty when the source supplied none.
     pub motions: Vec<Motion>,
+    /// Secondary motion (hair, cloth, ornaments) driven by the parameters.
+    /// `None` when the source carried none, or when a package written before
+    /// this was stored is read. Nothing applies it yet: it is recovered and
+    /// kept, and playback ignores it.
+    pub physics: Option<Physics>,
+}
+
+/// A model's physics rig: groups of pendulum chains that read some parameters
+/// and write others.
+///
+/// Groups are evaluated in order and write straight into the parameter values,
+/// so a later group sees what an earlier one wrote.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Physics {
+    /// Acceleration applied to every chain. `(0, -1)` is ordinary downward gravity.
+    pub gravity: (f32, f32),
+    /// Constant push applied to every chain.
+    pub wind: (f32, f32),
+    pub groups: Vec<PhysicsGroup>,
+}
+
+/// One chain of particles together with the parameters that sway it and the
+/// parameters it moves in return.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PhysicsGroup {
+    /// Parameters read to move the chain's root.
+    pub inputs: Vec<PhysicsInput>,
+    /// Parameters written from the chain's motion.
+    pub outputs: Vec<PhysicsOutput>,
+    /// The chain, root first. The root is pinned to the input; each later
+    /// particle hangs a fixed `radius` from the one before. Starting positions
+    /// are not stored: they follow from the radii.
+    pub particles: Vec<PhysicsParticle>,
+    /// How input parameter values map onto the chain's translation and angle.
+    pub normalization: PhysicsNormalization,
+}
+
+/// Which quantity of a chain an input feeds or an output reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhysicsComponent {
+    /// Horizontal translation.
+    #[default]
+    X,
+    /// Vertical translation.
+    Y,
+    /// Rotation.
+    Angle,
+}
+
+/// A parameter that moves a chain.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PhysicsInput {
+    /// Identifier of the parameter read. It may name nothing in the model;
+    /// evaluation ignores such an input and reports it instead.
+    pub source: String,
+    pub component: PhysicsComponent,
+    /// Share of the input that counts, in `0..=100`.
+    pub weight: f32,
+    /// The source's "reflect" switch for this input; it decides whether the
+    /// input's sign is flipped on the way in.
+    pub reflect: bool,
+}
+
+/// A parameter that a chain's motion writes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PhysicsOutput {
+    /// Identifier of the parameter written. It may name nothing in the model.
+    pub destination: String,
+    /// The particle whose motion relative to the one before it is measured.
+    /// Always at least 1 (the root has no predecessor) and below the group's
+    /// particle count.
+    pub particle: u32,
+    pub component: PhysicsComponent,
+    /// Multiplier from the measured quantity to the parameter value, already
+    /// the one that belongs to `component`.
+    pub scale: f32,
+    /// How much of the result replaces the parameter, in `0..=100`; the rest of
+    /// the parameter's current value is kept.
+    pub weight: f32,
+    pub reflect: bool,
+}
+
+impl PhysicsOutput {
+    /// Whether this output reads a particle a chain of `chain_len` has and that
+    /// has a predecessor to be measured against: `1..chain_len`.
+    pub fn reads_particle_in(&self, chain_len: usize) -> bool {
+        self.particle >= 1 && (self.particle as usize) < chain_len
+    }
+}
+
+/// One point of a chain.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PhysicsParticle {
+    /// How much of its velocity the particle keeps.
+    pub mobility: f32,
+    /// How slowly it follows its predecessor; larger lags more.
+    pub delay: f32,
+    /// Strength with which gravity and wind pull it.
+    pub acceleration: f32,
+    /// Distance from the previous particle. Not negative.
+    pub radius: f32,
+}
+
+/// The ranges an input parameter is mapped onto.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PhysicsNormalization {
+    /// For translation inputs.
+    pub position: NormRange,
+    /// For angle inputs.
+    pub angle: NormRange,
+}
+
+/// The target range of a normalization: where the parameter's lowest value,
+/// its midpoint and its highest value land.
+///
+/// `minimum <= maximum` always, whichever order the source listed them in.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct NormRange {
+    pub minimum: f32,
+    pub maximum: f32,
+    /// Where the parameter's midpoint lands.
+    pub default: f32,
+}
+
+impl NormRange {
+    /// A range from two ends in either order.
+    pub fn new(a: f32, b: f32, default: f32) -> NormRange {
+        NormRange { minimum: a.min(b), maximum: a.max(b), default }
+    }
+}
+
+impl PhysicsGroup {
+    /// The first reason this group cannot be used, if any.
+    ///
+    /// One rule set for every layer: an importer drops a group it names, and
+    /// the package writer and reader refuse one. Non-finite numbers, weights
+    /// outside `0..=100`, a negative radius, a normalization range turned
+    /// inside out, an empty chain, and an output reading a particle that is not in the chain.
+    pub fn problem(&self) -> Option<String> {
+        let finite = |what: &str, v: f32| (!v.is_finite()).then(|| format!("{what} is not finite ({v})"));
+        let weight = |what: &str, v: f32| {
+            (!(v.is_finite() && (0.0..=100.0).contains(&v))).then(|| format!("{what} weight {v} is outside 0..=100"))
+        };
+        if self.particles.is_empty() {
+            return Some("the chain has no particles".to_string());
+        }
+        for i in &self.inputs {
+            if let Some(p) = weight("an input", i.weight) {
+                return Some(p);
+            }
+        }
+        for o in &self.outputs {
+            if let Some(p) = weight("an output", o.weight).or_else(|| finite("an output scale", o.scale)) {
+                return Some(p);
+            }
+            if !o.reads_particle_in(self.particles.len()) {
+                return Some(format!(
+                    "an output reads particle {} of a chain of {}; only 1.. is a valid choice",
+                    o.particle,
+                    self.particles.len()
+                ));
+            }
+        }
+        for p in &self.particles {
+            for (what, v) in [
+                ("a particle mobility", p.mobility),
+                ("a particle delay", p.delay),
+                ("a particle acceleration", p.acceleration),
+                ("a particle radius", p.radius),
+            ] {
+                if let Some(problem) = finite(what, v) {
+                    return Some(problem);
+                }
+            }
+            if p.radius < 0.0 {
+                return Some(format!("a particle radius {} is negative", p.radius));
+            }
+        }
+        for (what, r) in [("position", self.normalization.position), ("angle", self.normalization.angle)] {
+            for (name, v) in [("minimum", r.minimum), ("maximum", r.maximum), ("default", r.default)] {
+                if let Some(problem) = finite(&format!("the {what} normalization {name}"), v) {
+                    return Some(problem);
+                }
+            }
+            if r.minimum > r.maximum {
+                return Some(format!("the {what} normalization has minimum {} above maximum {}", r.minimum, r.maximum));
+            }
+        }
+        None
+    }
+}
+
+impl Physics {
+    /// The first reason these physics cannot be used, if any: a non-finite
+    /// gravity or wind, or the first group's [`PhysicsGroup::problem`].
+    pub fn problem(&self) -> Option<String> {
+        if !self.forces_finite() {
+            return Some(format!("gravity {:?} or wind {:?} is not finite", self.gravity, self.wind));
+        }
+        self.groups.iter().enumerate().find_map(|(i, g)| g.problem().map(|p| format!("group {i}: {p}")))
+    }
+
+    /// Whether gravity and wind are both finite.
+    pub fn forces_finite(&self) -> bool {
+        [self.gravity.0, self.gravity.1, self.wind.0, self.wind.1].iter().all(|v| v.is_finite())
+    }
 }
 
 /// One authored motion: parameter curves over a fixed length.
@@ -435,6 +641,29 @@ impl CubismIr {
                     out.push(crate::Degradation::MissingReference {
                         kind: format!("parameter targeted by motion {:?}", m.name),
                         name: c.target.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// One degradation per physics input or output whose parameter id names
+    /// nothing in the model.
+    ///
+    /// Evaluation skips such an entry; this is how it is reported instead of
+    /// being lost silently, by the importer and by package validation alike.
+    pub fn unresolved_physics_targets(&self) -> Vec<crate::Degradation> {
+        let mut out = Vec::new();
+        let Some(physics) = &self.physics else { return out };
+        for (g, group) in physics.groups.iter().enumerate() {
+            let inputs = group.inputs.iter().map(|i| ("read by", &i.source));
+            let outputs = group.outputs.iter().map(|o| ("written by", &o.destination));
+            for (verb, id) in inputs.chain(outputs) {
+                if self.motion_target(id).is_none() {
+                    out.push(crate::Degradation::MissingReference {
+                        kind: format!("parameter {verb} physics group {g}"),
+                        name: id.clone(),
                     });
                 }
             }

@@ -170,7 +170,7 @@ impl<'a> Reader<'a> {
     /// An element count, refused when `count` elements of at least `min_each`
     /// bytes could not fit in what remains, so a corrupt length errors instead
     /// of allocating.
-    pub(crate) fn count(&mut self, min_each: usize, what: &str) -> Result<usize, DecodeError> {
+    pub fn count(&mut self, min_each: usize, what: &str) -> Result<usize, DecodeError> {
         let at = self.pos as u64;
         let n = self.i32()?;
         let n = usize::try_from(n).map_err(|_| DecodeError::corrupt_at(format!("{what} count {n} is negative"), at))?;
