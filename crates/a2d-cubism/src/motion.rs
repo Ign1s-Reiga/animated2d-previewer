@@ -5,7 +5,8 @@
 //!
 //! Curves are sampled as authored: cubic Hermite between the keys, with no
 //! resampling to a fixed step, so the easing the author drew is the easing that
-//! plays. Fades are stored in the IR but not applied here.
+//! plays. Authored fades are stored in the IR but not applied here; crossfades
+//! between motions are the model's business (`GenericCubismModel`).
 
 use a2d_core::ir::cubism::{CubismIr, CurveKey};
 
@@ -116,6 +117,15 @@ impl MotionPlayer {
         let duration = ir.motions.get(self.motion).map_or(0.0, |m| m.duration);
         self.time = wrap_time(t, duration, false);
         self.finished = false;
+    }
+
+    /// Stops the playhead at the end it is heading for and stops looping, so
+    /// what is left is a hold of the last frame shown. Used for the outgoing
+    /// side of a queued handover.
+    pub fn hold_end(&mut self, ir: &CubismIr) {
+        let duration = ir.motions.get(self.motion).map_or(0.0, |m| m.duration);
+        self.time = if self.speed < 0.0 { 0.0 } else { duration.max(0.0) };
+        self.looping = false;
     }
 
     /// Whether a non-looping motion has reached its end.

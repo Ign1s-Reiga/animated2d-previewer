@@ -596,16 +596,17 @@ impl Physics {
 /// arrive here as keyed Hermite segments in seconds.
 ///
 /// The fade fields are stored so a package can keep what the source said, but
-/// nothing applies them yet: playback neither crossfades motions nor ramps a
-/// curve in and out.
+/// nothing applies them: playback crossfades between motions over the length
+/// the host asks for (`PlayOptions::mix_duration`), because no asset this was
+/// built against carries authored fades, and never ramps a curve in and out.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Motion {
     pub name: String,
     /// Length of one pass, in seconds. Looping wraps at this, not at the last key.
     pub duration: f32,
-    /// Seconds to fade in. Not applied yet.
+    /// Seconds to fade in. Stored, not applied.
     pub fade_in: f32,
-    /// Seconds to fade out. Not applied yet.
+    /// Seconds to fade out. Stored, not applied.
     pub fade_out: f32,
     pub curves: Vec<MotionCurve>,
 }
@@ -616,8 +617,8 @@ pub struct MotionCurve {
     /// The parameter identifier this curve drives. It may name nothing in the
     /// model; evaluation ignores such a curve and reports it instead.
     pub target: String,
-    /// Per-curve fade override in seconds; `None` means use the motion's. Not
-    /// applied yet.
+    /// Per-curve fade override in seconds; `None` means use the motion's. Stored,
+    /// not applied.
     pub fade_in: Option<f32>,
     pub fade_out: Option<f32>,
     /// Ordered by time, non-decreasing.
