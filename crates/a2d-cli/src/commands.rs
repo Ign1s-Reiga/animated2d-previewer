@@ -96,6 +96,23 @@ fn resolve_importer(input: &Path, requested: Option<&str>) -> Result<Importer, D
     }
 }
 
+/// One line on a model's physics rig, shared by `inspect` and `validate`.
+fn physics_summary(physics: Option<&a2d_core::ir::cubism::Physics>) -> String {
+    match physics {
+        None => "none".to_string(),
+        Some(p) => {
+            let sum = |f: fn(&a2d_core::ir::cubism::PhysicsGroup) -> usize| p.groups.iter().map(f).sum::<usize>();
+            format!(
+                "{} groups, {} inputs, {} outputs, {} particles",
+                p.groups.len(),
+                sum(|g| g.inputs.len()),
+                sum(|g| g.outputs.len()),
+                sum(|g| g.particles.len())
+            )
+        }
+    }
+}
+
 /// `animated2d inspect <input>`
 pub fn inspect(out: &mut dyn std::io::Write, input: &Path, game: Option<&str>) -> Result<(), CliError> {
     writeln!(out, "Input:    {}", input.display())?;
@@ -244,6 +261,9 @@ pub fn validate(out: &mut dyn std::io::Write, package_dir: &Path) -> Result<bool
     writeln!(out, "  source format: {}", package.manifest.source_format)?;
     writeln!(out, "  animations:    {}", package.manifest.animations.len())?;
     writeln!(out, "  textures:      {}/{}", package.textures.len(), package.manifest.textures.len())?;
+    if let Some(ir) = package.model.as_cubism() {
+        writeln!(out, "  physics:       {}", physics_summary(ir.physics.as_ref()))?;
+    }
 
     let report = package.validate();
     print_report(out, &report)?;
@@ -994,6 +1014,8 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<()
         writeln!(out, "    {}{fade}", motion.name)?;
     }
 
+    writeln!(out, "\n  physics:     {}", physics_summary(inventory.physics.as_ref()))?;
+
     if !inventory.animator_controllers.is_empty() {
         writeln!(out, "\n  animator controllers:")?;
         for name in &inventory.animator_controllers {
@@ -1043,6 +1065,20 @@ fn classify_path(path: &Path) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use a2d_core::Degradation;
+
+    #[test]
+    fn the_physics_summary_counts_or_says_none() {
+        use a2d_core::ir::cubism::{Physics, PhysicsGroup, PhysicsInput, PhysicsOutput, PhysicsParticle};
+        assert_eq!(physics_summary(None), "none");
+        let group = PhysicsGroup {
+            inputs: vec![PhysicsInput::default(); 3],
+            outputs: vec![PhysicsOutput::default(); 2],
+            particles: vec![PhysicsParticle::default(); 4],
+            ..PhysicsGroup::default()
+        };
+        let physics = Physics { groups: vec![group.clone(), group], ..Physics::default() };
+        assert_eq!(physics_summary(Some(&physics)), "2 groups, 6 inputs, 4 outputs, 8 particles");
+    }
 
     #[test]
     fn a_clean_report_says_so() {

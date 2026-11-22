@@ -17,6 +17,16 @@
 //! * Version 4: appends `warp_keyform_opacities: f32 seq`. A version 3 model
 //!   reads with an empty track, which draws as if no warp were ever faded; its
 //!   package validates with a note telling the user to re-import.
+//! * Version 5: appends `physics: opt` (a `u8` 0 or 1, then the rig). A rig is
+//!   `gravity, wind` (two `f32` each) then `groups: seq`. A group is
+//!   `inputs: seq`, `outputs: seq`, `particles: seq`, then six `f32`: the
+//!   position range's `minimum, maximum, default`, then the angle range's. An
+//!   input is `source: str, component: u8, weight: f32, reflect: u8`; an output
+//!   is `destination: str, particle: u32, component: u8, scale: f32,
+//!   weight: f32, reflect: u8`; a particle is `mobility, delay, acceleration,
+//!   radius: f32`. A component is 0 (X), 1 (Y) or 2 (angle), and a flag is 0
+//!   or 1. A version 4 model reads with no physics; its package validates with
+//!   a note telling the user to re-import.
 //!
 //! A motion is `name: str, duration: f32, fade_in: f32, fade_out: f32,
 //! curves: seq`. A curve is `target: str, fade_in: opt f32, fade_out: opt f32,
@@ -64,6 +74,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     }
     validate_glues(ir)?;
     validate_warp_opacities(ir)?;
+    validate_physics(ir)?;
     write_canvas(w, &ir.canvas);
     w.seq(&ir.parameters, write_parameter);
     write_ids(w, &ir.part_ids);
@@ -90,6 +101,8 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     w.f32_seq(&ir.glue_intensities);
     // Added in format version 4.
     w.f32_seq(&ir.warp_keyform_opacities);
+    // Added in format version 5.
+    w.opt(ir.physics.as_ref(), write_physics);
     Ok(())
 }
 
@@ -97,8 +110,9 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
 ///
 /// `version` is the format version from the `model.bin` header. A version 1
 /// model ends after the draw-order tracks and has no motions; version 2 adds
-/// the motion table, version 3 the glue table and version 4 the warp opacities. The layout is chosen by the header, never inferred from
-/// how many bytes happen to remain.
+/// the motion table, version 3 the glue table, version 4 the warp opacities and
+/// version 5 the physics rig. The layout is chosen by the header, never
+/// inferred from how many bytes happen to remain.
 pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     let mut ir = CubismIr {
         canvas: read_canvas(r)?,
@@ -122,6 +136,7 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
         drawable_keyform_opacities: r.f32_seq()?,
         drawable_keyform_draw_orders: r.f32_seq()?,
         motions: Vec::new(),
+        physics: None,
     };
     if version >= 2 {
         ir.motions = r.seq("motion", 20, read_motion)?;
@@ -133,10 +148,125 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     if version >= 4 {
         ir.warp_keyform_opacities = r.f32_seq()?;
     }
+    if version >= 5 {
+        ir.physics = r.opt(read_physics)?;
+    }
     validate_references(&ir)?;
     validate_glues(&ir)?;
     validate_warp_opacities(&ir)?;
+    validate_physics(&ir)?;
     Ok(ir)
+}
+
+/// The physics rig, if any, must be usable: the one rule set lives with the IR
+/// ([`Physics::problem`]) so the importer, the writer and the reader agree.
+fn validate_physics(ir: &CubismIr) -> Result<(), DecodeError> {
+    match ir.physics.as_ref().and_then(Physics::problem) {
+        Some(problem) => Err(DecodeError::corrupt(format!("physics: {problem}"))),
+        None => Ok(()),
+    }
+}
+
+fn write_physics(w: &mut Writer, p: &Physics) {
+    w.f32(p.gravity.0);
+    w.f32(p.gravity.1);
+    w.f32(p.wind.0);
+    w.f32(p.wind.1);
+    w.seq(&p.groups, write_physics_group);
+}
+
+fn read_physics(r: &mut Reader<'_>) -> Result<Physics, DecodeError> {
+    Ok(Physics {
+        gravity: (r.f32()?, r.f32()?),
+        wind: (r.f32()?, r.f32()?),
+        groups: r.seq("physics group", 36, read_physics_group)?,
+    })
+}
+
+fn write_component(w: &mut Writer, c: PhysicsComponent) {
+    w.u8(match c {
+        PhysicsComponent::X => 0,
+        PhysicsComponent::Y => 1,
+        PhysicsComponent::Angle => 2,
+    });
+}
+
+fn read_component(r: &mut Reader<'_>) -> Result<PhysicsComponent, DecodeError> {
+    match r.u8()? {
+        0 => Ok(PhysicsComponent::X),
+        1 => Ok(PhysicsComponent::Y),
+        2 => Ok(PhysicsComponent::Angle),
+        other => Err(DecodeError::corrupt(format!("physics component is {other}, not 0, 1 or 2"))),
+    }
+}
+
+fn read_flag(r: &mut Reader<'_>, what: &str) -> Result<bool, DecodeError> {
+    match r.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(DecodeError::corrupt(format!("physics {what} flag is {other}, not 0 or 1"))),
+    }
+}
+
+fn write_norm(w: &mut Writer, n: &NormRange) {
+    w.f32(n.minimum);
+    w.f32(n.maximum);
+    w.f32(n.default);
+}
+
+fn read_norm(r: &mut Reader<'_>) -> Result<NormRange, DecodeError> {
+    Ok(NormRange { minimum: r.f32()?, maximum: r.f32()?, default: r.f32()? })
+}
+
+fn write_physics_group(w: &mut Writer, g: &PhysicsGroup) {
+    w.seq(&g.inputs, |w, i| {
+        w.str(&i.source);
+        write_component(w, i.component);
+        w.f32(i.weight);
+        w.bool(i.reflect);
+    });
+    w.seq(&g.outputs, |w, o| {
+        w.str(&o.destination);
+        w.u32(o.particle);
+        write_component(w, o.component);
+        w.f32(o.scale);
+        w.f32(o.weight);
+        w.bool(o.reflect);
+    });
+    w.seq(&g.particles, |w, p| {
+        w.f32(p.mobility);
+        w.f32(p.delay);
+        w.f32(p.acceleration);
+        w.f32(p.radius);
+    });
+    write_norm(w, &g.normalization.position);
+    write_norm(w, &g.normalization.angle);
+}
+
+fn read_physics_group(r: &mut Reader<'_>) -> Result<PhysicsGroup, DecodeError> {
+    let inputs = r.seq("physics input", 10, |r| {
+        Ok(PhysicsInput {
+            source: r.str()?,
+            component: read_component(r)?,
+            weight: r.f32()?,
+            reflect: read_flag(r, "reflect")?,
+        })
+    })?;
+    let outputs = r.seq("physics output", 18, |r| {
+        Ok(PhysicsOutput {
+            destination: r.str()?,
+            particle: r.u32()?,
+            component: read_component(r)?,
+            scale: r.f32()?,
+            weight: r.f32()?,
+            reflect: read_flag(r, "reflect")?,
+        })
+    })?;
+    let particles = r.seq("physics particle", 16, |r| {
+        Ok(PhysicsParticle { mobility: r.f32()?, delay: r.f32()?, acceleration: r.f32()?, radius: r.f32()? })
+    })?;
+    let normalization = PhysicsNormalization { position: read_norm(r)?, angle: read_norm(r)? };
+    Ok(PhysicsGroup { inputs, outputs, particles, normalization })
 }
 
 /// The warp opacity track is empty or holds one opacity per warp keyform, each
@@ -679,6 +809,7 @@ mod tests {
             glues: vec![],
             glue_intensities: vec![],
             warp_keyform_opacities: vec![],
+            physics: None,
             drawables: vec![
                 Drawable {
                     id: "ArtMesh1".into(),
@@ -1019,9 +1150,9 @@ mod tests {
     #[test]
     fn an_implausible_motion_count_is_refused_before_allocating() {
         let mut bytes = Package::from_cubism(model(), "test", "x").encode_model().unwrap();
-        // The motion count is followed by the two empty glue tables and the
-        // empty warp opacity track, a count each.
-        let at = bytes.len() - 16;
+        // The motion count is followed by the two empty glue tables, the empty
+        // warp opacity track (a count each) and the physics flag (one byte).
+        let at = bytes.len() - 17;
         bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("a huge count should be refused");
         assert!(err.to_string().contains("motion count"), "{err}");
@@ -1149,7 +1280,8 @@ mod tests {
             good.warp_keyform_opacities.clear();
             write(&mut w, &good).unwrap();
             let mut bytes = w.into_bytes();
-            bytes.truncate(bytes.len() - 4);
+            // Drop the physics flag, then the empty opacity track before it.
+            bytes.truncate(bytes.len() - 1 - 4);
             let mut tail = Writer::new();
             tail.f32_seq(&ir.warp_keyform_opacities);
             bytes.extend(tail.into_bytes());
@@ -1290,5 +1422,230 @@ mod tests {
             bytes[at] ^= 0xff;
             let _ = Package::decode_model(&bytes);
         }
+    }
+
+    /// `with_glue()` plus a physics rig whose ids all resolve against `model()`'s
+    /// parameters, touching every field the layout holds.
+    fn with_physics() -> CubismIr {
+        let mut ir = with_glue();
+        ir.physics = Some(Physics {
+            gravity: (0.0, -1.0),
+            wind: (0.25, -0.5),
+            groups: vec![
+                PhysicsGroup {
+                    inputs: vec![
+                        PhysicsInput {
+                            source: "ParamAngleX".into(),
+                            component: PhysicsComponent::X,
+                            weight: 60.0,
+                            reflect: false,
+                        },
+                        PhysicsInput {
+                            source: "ParamAngleX".into(),
+                            component: PhysicsComponent::Angle,
+                            weight: 40.0,
+                            reflect: true,
+                        },
+                    ],
+                    outputs: vec![
+                        PhysicsOutput {
+                            destination: "ParamEyeLOpen".into(),
+                            particle: 1,
+                            component: PhysicsComponent::Angle,
+                            scale: 25.5,
+                            weight: 100.0,
+                            reflect: false,
+                        },
+                        PhysicsOutput {
+                            destination: "ParamEyeLOpen".into(),
+                            particle: 2,
+                            component: PhysicsComponent::Y,
+                            scale: -0.5,
+                            weight: 25.0,
+                            reflect: true,
+                        },
+                    ],
+                    particles: vec![
+                        PhysicsParticle { mobility: 1.0, delay: 1.0, acceleration: 1.0, radius: 0.0 },
+                        PhysicsParticle { mobility: 0.9, delay: 0.8, acceleration: 1.2, radius: 10.0 },
+                        PhysicsParticle { mobility: 0.85, delay: 0.7, acceleration: 1.5, radius: 12.5 },
+                    ],
+                    normalization: PhysicsNormalization {
+                        position: NormRange { minimum: -10.0, maximum: 10.0, default: 0.0 },
+                        angle: NormRange { minimum: -40.0, maximum: 40.0, default: 2.5 },
+                    },
+                },
+                // A group with no outputs is legitimate; one with no chain is not.
+                PhysicsGroup {
+                    particles: vec![PhysicsParticle { mobility: 1.0, delay: 1.0, acceleration: 1.0, radius: 0.0 }],
+                    ..PhysicsGroup::default()
+                },
+            ],
+        });
+        ir
+    }
+
+    #[test]
+    fn a_version_4_model_reads_with_no_physics() {
+        // Generated by the version 4 layout from `with_glue()`: it ends exactly
+        // where the physics flag now begins.
+        let bytes = include_bytes!("../tests/fixtures/cubism_v4.model.bin");
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 4);
+        let PackageModel::Cubism(ir) = Package::decode_model(bytes).expect("v4 must still load") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert!(ir.physics.is_none());
+        assert_eq!(ir, with_glue());
+    }
+
+    #[test]
+    fn a_version_5_header_over_version_4_bytes_is_refused() {
+        let mut bytes = include_bytes!("../tests/fixtures/cubism_v4.model.bin").to_vec();
+        bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
+        assert!(Package::decode_model(&bytes).is_err());
+    }
+
+    #[test]
+    fn the_current_writer_without_physics_is_the_version_4_layout_plus_one_zero_byte() {
+        let v4 = include_bytes!("../tests/fixtures/cubism_v4.model.bin");
+        let now = Package::from_cubism(with_glue(), "test", "x").encode_model().unwrap();
+        assert_eq!(&now[8..now.len() - 1], &v4[8..]);
+        assert_eq!(now[now.len() - 1], 0);
+    }
+
+    #[test]
+    fn physics_round_trips_and_re_encodes_to_identical_bytes() {
+        let ir = with_physics();
+        let first = Package::from_cubism(ir.clone(), "test", "x").encode_model().unwrap();
+        let PackageModel::Cubism(back) = Package::decode_model(&first).expect("should decode") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert_eq!(back.physics, ir.physics);
+        assert_eq!(back, ir);
+        assert_eq!(Package::from_cubism(back, "test", "x").encode_model().unwrap(), first);
+    }
+
+    #[test]
+    fn bad_physics_is_refused_by_the_writer_and_the_reader_alike() {
+        type Damage = fn(&mut Physics);
+        let cases: [(&str, Damage); 10] = [
+            ("not finite", |p| p.gravity.1 = f32::NAN),
+            ("not finite", |p| p.wind.0 = f32::INFINITY),
+            ("input weight 100.5 is outside", |p| p.groups[0].inputs[0].weight = 100.5),
+            ("input weight -1 is outside", |p| p.groups[0].inputs[1].weight = -1.0),
+            ("output weight NaN is outside", |p| p.groups[0].outputs[0].weight = f32::NAN),
+            ("output scale is not finite", |p| p.groups[0].outputs[1].scale = f32::INFINITY),
+            ("reads particle 3 of a chain of 3", |p| p.groups[0].outputs[1].particle = 3),
+            ("reads particle 0", |p| p.groups[0].outputs[0].particle = 0),
+            ("radius -2 is negative", |p| p.groups[0].particles[1].radius = -2.0),
+            ("minimum 5 above maximum -5", |p| {
+                p.groups[0].normalization.angle = NormRange { minimum: 5.0, maximum: -5.0, default: 0.0 }
+            }),
+        ];
+        for (what, damage) in cases {
+            let mut ir = with_physics();
+            damage(ir.physics.as_mut().unwrap());
+            let err = Package::from_cubism(ir.clone(), "test", "x").encode_model().expect_err(what);
+            assert!(matches!(err, DecodeError::Corrupt { .. }), "{err:?}");
+            assert!(err.to_string().contains(what), "{what}: {err}");
+
+            // Bypass the writer's check to prove the reader holds the same line.
+            let mut w = Writer::new();
+            let mut good = with_physics();
+            good.physics = None;
+            write(&mut w, &good).unwrap();
+            let mut bytes = w.into_bytes();
+            bytes.pop();
+            let mut tail = Writer::new();
+            tail.opt(ir.physics.as_ref(), write_physics);
+            bytes.extend(tail.into_bytes());
+            let err = read(&mut Reader::new(&bytes), 5).expect_err(what);
+            assert!(err.to_string().contains(what), "{what}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_physics_component_or_flag_outside_its_range_is_refused_on_read() {
+        let mut w = Writer::new();
+        write_physics(&mut w, with_physics().physics.as_ref().unwrap());
+        let good = w.into_bytes();
+        // The first input's string is followed by its component, a weight and a flag.
+        let name = b"ParamAngleX";
+        let at = good.windows(name.len()).position(|w| w == name).expect("the input id") + name.len();
+        for (what, offset, value, message) in
+            [("component", 0, 3u8, "component is 3"), ("reflect flag", 1 + 4, 2u8, "flag is 2")]
+        {
+            let mut bytes = good.clone();
+            bytes[at + offset] = value;
+            let err = read_physics(&mut Reader::new(&bytes)).expect_err(what);
+            assert!(err.to_string().contains(message), "{what}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_implausible_physics_count_is_refused_before_allocating() {
+        let mut w = Writer::new();
+        write_physics(&mut w, with_physics().physics.as_ref().unwrap());
+        let mut bytes = w.into_bytes();
+        // The group count follows gravity and wind: four floats.
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = read_physics(&mut Reader::new(&bytes)).expect_err("a huge count should be refused");
+        assert!(err.to_string().contains("physics group count"), "{err}");
+    }
+
+    #[test]
+    fn truncating_or_corrupting_physics_bytes_never_panics() {
+        let full = Package::from_cubism(with_physics(), "test", "x").encode_model().unwrap();
+        for cut in 0..full.len() {
+            let _ = Package::decode_model(&full[..cut]);
+        }
+        for at in 8..full.len() {
+            let mut bytes = full.clone();
+            bytes[at] ^= 0xff;
+            let _ = Package::decode_model(&bytes);
+        }
+    }
+
+    #[test]
+    fn an_older_package_without_physics_says_to_re_import_and_a_current_one_does_not() {
+        let notes = |package: Package| {
+            package.validate().warnings().iter().map(|w| w.to_string()).collect::<Vec<_>>().join("\n")
+        };
+        let mut old = Package::from_cubism(with_glue(), "test", "x");
+        old.manifest.format_version = 4;
+        assert!(notes(old).contains("predates stored physics"));
+        assert!(!notes(Package::from_cubism(with_glue(), "test", "x")).contains("physics"));
+        assert!(!notes(Package::from_cubism(with_physics(), "test", "x")).contains("predates"));
+    }
+
+    #[test]
+    fn physics_ids_naming_no_parameter_are_reported_by_validate_and_survive_a_round_trip() {
+        let mut ir = with_physics();
+        ir.physics.as_mut().unwrap().groups[0].inputs[0].source = "ParamNoSuchInput".into();
+        ir.physics.as_mut().unwrap().groups[0].outputs[1].destination = "ParamNoSuchOutput".into();
+        let package = Package::from_cubism(ir, "test", "x");
+        let text = package.validate().warnings().iter().map(|w| w.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("ParamNoSuchInput") && text.contains("read by physics group 0"), "{text}");
+        assert!(text.contains("ParamNoSuchOutput") && text.contains("written by physics group 0"), "{text}");
+        assert!(!text.contains("\"ParamAngleX\""), "{text}");
+
+        let bytes = package.encode_model().unwrap();
+        let PackageModel::Cubism(back) = Package::decode_model(&bytes).expect("decode") else { panic!() };
+        assert_eq!(back.unresolved_physics_targets().len(), 2);
+    }
+
+    /// Writes the committed version 4 fixture. Run with `--ignored` and
+    /// `UPDATE_GOLDEN=1` to regenerate it; nothing else touches the file.
+    #[test]
+    #[ignore = "regenerates tests/fixtures/cubism_v4.model.bin; needs UPDATE_GOLDEN=1"]
+    fn regenerate_the_version_4_fixture() {
+        // The fixture is frozen: it stands for what a version 4 writer wrote.
+        if std::env::var_os("UPDATE_GOLDEN").is_none() {
+            return;
+        }
+        let mut bytes = Package::from_cubism(with_glue(), "test", "x").encode_model().unwrap();
+        assert_eq!(bytes.pop(), Some(0), "the physics flag of a model with none");
+        bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cubism_v4.model.bin"), bytes).unwrap();
     }
 }

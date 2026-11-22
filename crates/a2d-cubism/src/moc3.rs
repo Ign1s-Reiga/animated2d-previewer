@@ -461,6 +461,8 @@ impl Moc3 {
                 drawable_keyform_draw_orders,
                 // A MOC3 holds no motions; they live in separate files.
                 motions: Vec::new(),
+                // Nor physics, which is a separate file in the editor's export.
+                physics: None,
             },
         })
     }

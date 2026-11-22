@@ -215,7 +215,7 @@ fn check_timelines(ir: &SpineIr, report: &mut LoadReport) {
 /// so what is left here is what a package can be *coherently* missing: a
 /// texture page with no file, a model with nothing to draw, and the tracks a
 /// drawable needs to be posed at all.
-pub fn validate_cubism(ir: &CubismIr, textures: &[TextureFile], report: &mut LoadReport) {
+pub fn validate_cubism(ir: &CubismIr, format_version: u32, textures: &[TextureFile], report: &mut LoadReport) {
     for entry in ir.drawables.iter().map(|d| d.texture).collect::<std::collections::BTreeSet<_>>() {
         if textures.get(entry as usize).is_none() {
             report.warn(Degradation::MissingReference { kind: "texture page".into(), name: format!("page {entry}") });
@@ -267,6 +267,23 @@ pub fn validate_cubism(ir: &CubismIr, textures: &[TextureFile], report: &mut Loa
              written before format 4, re-import the source to include it"
                 .into(),
         ));
+    }
+
+    // A package written before physics was stored cannot say whether its source
+    // had any. Absence is legitimate in a current package, so only an older
+    // format is told to re-import.
+    if ir.physics.is_none() && format_version < 5 {
+        report.warn(Degradation::Note(
+            "this package predates stored physics (format 5): if the source model had physics it is not included; \
+             re-import the source to recover it"
+                .into(),
+        ));
+    }
+
+    // Physics naming a parameter the model lacks is skipped at playback;
+    // validation reports it for the same reason as for motions below.
+    for degradation in ir.unresolved_physics_targets() {
+        report.warn(degradation);
     }
 
     // Playback skips a curve aimed at a parameter the model lacks. Package
