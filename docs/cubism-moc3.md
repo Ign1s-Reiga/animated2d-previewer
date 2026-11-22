@@ -129,7 +129,8 @@ entries walks straight past it, which is why it was missed on the first pass.
 
 Sections 4 to 9 are per *part*: 5 is the identity, 4, 6, 7 and 8 are constant on
 every model seen, and 9 is the parent part index with `u32::MAX` at a root.
-Notably **none of them orders the parts**, which matters for §6.
+Notably **none of them orders the parts**, which matters for §6. The full part
+layout is under "Parts" in §6.
 
 ### Glue: sections 91 to 100 and count slots 21 and 22
 
@@ -562,8 +563,56 @@ than a minimum, or only the direct parent counting), which rests on the manual's
 wording and the renders; how a partial opacity between 0 and 1 should look,
 which no reference was compared against; and the deformers' visibility and
 enabled flags (sections 13 and 14, and 37 and 38 for drawables), which are not
-read. A part's own opacity (pose files and part-opacity motion curves) is also
-still not applied; the bundles examined carry no such curves.
+read. A part's own opacity is also not applied; see "Parts" below.
+
+### Parts: sections 2 to 9, 15 and 58
+
+| Section | Type | Per part | Established by |
+|---|---|---|---|
+| 2 | u32 | runtime space | order of the part block in the open-source `moc3` crate's layout; not read here ("not read") |
+| 3 | string | part id | read and used (`part_ids`) |
+| 4 | u32 | keyform binding index | the same crate; on all six real models it names a binding with no axes, so no parameter drives a part |
+| 5 | u32 | keyform begin | the same crate; the identity on all six |
+| 6 | u32 | keyform count | the same crate; 1 per part on all six, and count slot 6 equals the part count |
+| 7, 8 | u32 | visible, enabled | the same crate; 1 on every part of all six |
+| 9 | u32 | parent part, `u32::MAX` at a root | the crate, and independently here: every index is in range and the trees are shallow (depth 0 to 3, up to 33 roots) |
+| 15 | u32 | (per deformer) the part it belongs to | the crate (13 and 14 being its visible and enabled flags, as noted under Deformer opacity above); in range wherever set, `u32::MAX` on a handful of deformers per model |
+| 58 | f32 | (per part keyform) draw order | see above |
+
+**A part keyform holds a draw order and nothing else.** The `moc3` crate's
+part-keyform layout has only section 58, and the real models agree (one keyform
+per part, no axes). As supporting evidence only, section 59 directly after it is
+already the warp keyforms' opacity, so nothing sits between them. In a MOC3 a
+part's opacity is therefore not stored; it is a value the host or a pose sets at
+run time. That the core folds it into the drawable opacity it reports is
+inferred from how the renderers draw (they multiply only the drawable opacity
+and the model opacity), not stated by any source read.
+
+On the six real models examined, that run-time value has no source anywhere in
+the bundle (the first point below is pinned by a test, the other two were
+checked once by a throwaway probe of the six bundles and are not tested): no clip binds a `CubismPart` property (zero part-opacity bindings in
+30 clips, those clips carrying only parameter values and, on some, a constant
+model opacity); every `CubismPart` component in the prefabs stores opacity 1
+(its body is an index and that float, nothing more); and the pose controller
+component is present but no pose part component exists, so no pose group is
+defined. Applying part opacity or pose would change nothing on screen for these
+models, which is why neither is implemented. The importer now says so by name
+when a clip does bind a part (part-opacity curves are counted and, where the
+path resolves, the part ids listed), and `real_part_opacity.rs` pins that no
+clip binds a part, and that the MOC3 and the prefab agree on the part count.
+
+Open semantics, to settle only when a real asset needs them and against a
+reference viewer:
+
+- whether a part's opacity reaches drawables of its child parts (a product down
+  the parent chain of section 9) or only drawables whose section 39 names that
+  part;
+- whether it also reaches drawables through a deformer's part (section 15). On
+  real models a deformer's part differs from the part of the drawable under it
+  for roughly 3 to 46 percent of drawables, so the two rules give different
+  pictures;
+- the combination with deformer opacity (most likely a plain product);
+- pose itself: fade timing, which parts form a group, linked parts.
 
 ### Section 87 is the group's object list, not a paint sequence
 
@@ -824,7 +873,7 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
 - **Deformer opacity.** Applied as a product down the deformer chain (section
   6). Unverified: multiplication against a minimum or the direct parent only;
   how a partial opacity should look; the visibility and enabled flags
-  (sections 13, 14, 37, 38); and part opacity, which is not applied at all.
+  (sections 13, 14, 37, 38); and part opacity and pose, which are not applied (see "Parts" in section 6).
 - **Motions.** The bundles' animations are Unity `AnimationClip`s in the
   compressed muscle-clip form, not `motion3.json`. Their parameter curves are
   recovered and carried in the package as keyed Hermite segments, so a model

@@ -512,8 +512,17 @@ fn clip_motions(
             "{unnamed} CubismParameter(s) have no readable owner name, so clip curves aimed at them cannot be matched"
         ));
     }
+    // Part ids only name part-opacity curves in a note, so an unreadable owner
+    // is simply left out.
+    let part_ids: Vec<String> = inventory
+        .by_script("CubismPart")
+        .filter_map(|info| {
+            let object = file.find_object(info.path_id)?;
+            behaviour_owner_name(file, object).ok().flatten().filter(|n| !n.is_empty())
+        })
+        .collect();
     let names = match clip_motion::NameTable::new(ids.iter().map(String::as_str)) {
-        Ok(names) => names,
+        Ok(names) => names.with_parts(part_ids.iter().map(String::as_str)),
         Err(error) => {
             report.note(format!("{} AnimationClip(s) were not recovered: {error}", pending.len()));
             return Vec::new();

@@ -55,7 +55,7 @@ records what established each claim and what is still unverified); there is no c
 against the official runtime yet (§11 cross-impl).
 
 Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 binary layouts;
-for Cubism, expressions, pose/part-opacity curves, authored motion fades (crossfades use the host's mix duration),
+for Cubism, expressions, pose and part opacity (not applied; none of the target bundles carries any, and part-opacity curves in a clip are reported by name), authored motion fades (crossfades use the host's mix duration),
 multiple texture pages, and the model-level curves (opacity, eye blink,
 lip sync) that motions may carry.
 Looping (repeat) parameters are read from the per-parameter repeat flag (MOC3 section 54) and
