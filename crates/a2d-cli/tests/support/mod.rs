@@ -263,6 +263,7 @@ pub fn cubism_package(with_motion: bool) -> a2d_pack::Package {
     let mut ir = CubismIr {
         canvas: Canvas { pixels_per_unit: 100.0, origin: (100.0, 100.0), size: (200.0, 200.0) },
         parameters: vec![Parameter { id: "ParamAngleX".into(), minimum: -30.0, maximum: 30.0, default: 0.0 }],
+        parameter_repeats: None,
         part_ids: vec![],
         deformer_ids: vec![],
         drawable_ids: vec!["ArtMesh1".into()],
@@ -366,6 +367,7 @@ pub fn cubism_draw_order_package(tie_order: Vec<u32>) -> a2d_pack::Package {
     let mut ir = CubismIr {
         canvas: Canvas { pixels_per_unit: 100.0, origin: (100.0, 100.0), size: (200.0, 200.0) },
         parameters: vec![Parameter { id: "ParamOrder".into(), minimum: 0.0, maximum: 1.0, default: 0.0 }],
+        parameter_repeats: None,
         part_ids: vec![],
         deformer_ids: vec![],
         drawable_ids: vec!["A".into(), "B".into()],
@@ -508,6 +510,7 @@ pub fn cubism_deformation_package() -> a2d_pack::Package {
     let mut ir = CubismIr {
         canvas: Canvas { pixels_per_unit: 100.0, origin: (100.0, 100.0), size: (200.0, 200.0) },
         parameters: vec![param("ParamAngleX"), param("ParamAngleY")],
+        parameter_repeats: None,
         part_ids: vec![],
         deformer_ids: vec![],
         drawable_ids: vec!["A".into(), "B".into()],

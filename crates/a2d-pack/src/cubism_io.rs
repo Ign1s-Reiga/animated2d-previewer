@@ -27,6 +27,11 @@
 //!   radius: f32`. A component is 0 (X), 1 (Y) or 2 (angle), and a flag is 0
 //!   or 1. A version 4 model reads with no physics; its package validates with
 //!   a note telling the user to re-import.
+//! * Version 6: appends `parameter_repeats: opt` (a marker `u8`, written 0 or 1
+//!   and read as present when non-zero like every `opt`, then a `seq` of one
+//!   `u8` per parameter, each 0 or 1). A version 5 model reads with no
+//!   flags, so repeating parameters are inferred from its motions; its package
+//!   validates with a note telling the user to re-import.
 //!
 //! A motion is `name: str, duration: f32, fade_in: f32, fade_out: f32,
 //! curves: seq`. A curve is `target: str, fade_in: opt f32, fade_out: opt f32,
@@ -76,6 +81,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     validate_warp_opacities(ir)?;
     validate_draw_order_track(ir)?;
     validate_physics(ir)?;
+    validate_repeats(ir)?;
     write_canvas(w, &ir.canvas);
     w.seq(&ir.parameters, write_parameter);
     write_ids(w, &ir.part_ids);
@@ -104,6 +110,8 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     w.f32_seq(&ir.warp_keyform_opacities);
     // Added in format version 5.
     w.opt(ir.physics.as_ref(), write_physics);
+    // Added in format version 6.
+    w.opt(ir.parameter_repeats.as_ref(), |w, flags| w.seq(flags, |w, f| w.bool(*f)));
     Ok(())
 }
 
@@ -112,12 +120,13 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
 /// `version` is the format version from the `model.bin` header. A version 1
 /// model ends after the draw-order tracks and has no motions; version 2 adds
 /// the motion table, version 3 the glue table, version 4 the warp opacities and
-/// version 5 the physics rig. The layout is chosen by the header, never
+/// version 5 the physics rig, version 6 the repeat flags. The layout is chosen by the header, never
 /// inferred from how many bytes happen to remain.
 pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     let mut ir = CubismIr {
         canvas: read_canvas(r)?,
         parameters: r.seq("parameter", 16, read_parameter)?,
+        parameter_repeats: None,
         part_ids: read_ids(r, "part id")?,
         deformer_ids: read_ids(r, "deformer id")?,
         drawable_ids: read_ids(r, "drawable id")?,
@@ -152,12 +161,36 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     if version >= 5 {
         ir.physics = r.opt(read_physics)?;
     }
+    if version >= 6 {
+        ir.parameter_repeats = r.opt(|r| {
+            r.seq("parameter repeat flag", 1, |r| match r.u8()? {
+                0 => Ok(false),
+                1 => Ok(true),
+                other => Err(DecodeError::corrupt(format!("a parameter repeat flag is {other}, not 0 or 1"))),
+            })
+        })?;
+    }
     validate_references(&ir)?;
     validate_glues(&ir)?;
     validate_warp_opacities(&ir)?;
     validate_draw_order_track(&ir)?;
     validate_physics(&ir)?;
+    validate_repeats(&ir)?;
     Ok(ir)
+}
+
+/// The repeat flags, when stored, are exactly one per parameter: a short list
+/// would leave some parameters with no answer, and a long one would name
+/// parameters that do not exist.
+fn validate_repeats(ir: &CubismIr) -> Result<(), DecodeError> {
+    match &ir.parameter_repeats {
+        Some(flags) if flags.len() != ir.parameters.len() => Err(DecodeError::corrupt(format!(
+            "{} parameter repeat flags for {} parameters",
+            flags.len(),
+            ir.parameters.len()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The physics rig, if any, must be usable: the one rule set lives with the IR
@@ -829,6 +862,7 @@ mod tests {
                 Parameter { id: "ParamAngleX".into(), minimum: -30.0, maximum: 30.0, default: 0.0 },
                 Parameter { id: "ParamEyeLOpen".into(), minimum: 0.0, maximum: 1.2, default: 1.0 },
             ],
+            parameter_repeats: None,
             part_ids: vec!["Part01".into()],
             deformer_ids: vec!["Rotation1".into(), "Warp1".into()],
             drawable_ids: vec!["ArtMesh1".into(), "ArtMesh2".into()],
@@ -1307,8 +1341,8 @@ mod tests {
             good.warp_keyform_opacities.clear();
             write(&mut w, &good).unwrap();
             let mut bytes = w.into_bytes();
-            // Drop the physics flag, then the empty opacity track before it.
-            bytes.truncate(bytes.len() - 1 - 4);
+            // Drop the repeat flag and the physics flag, then the empty opacity track before them.
+            bytes.truncate(bytes.len() - 2 - 4);
             let mut tail = Writer::new();
             tail.f32_seq(&ir.warp_keyform_opacities);
             bytes.extend(tail.into_bytes());
@@ -1593,11 +1627,99 @@ mod tests {
     }
 
     #[test]
-    fn the_current_writer_without_physics_is_the_version_4_layout_plus_one_zero_byte() {
-        let v4 = include_bytes!("../tests/fixtures/cubism_v4.model.bin");
-        let now = Package::from_cubism(with_glue(), "test", "x").encode_model().unwrap();
-        assert_eq!(&now[8..now.len() - 1], &v4[8..]);
+    fn the_current_writer_without_repeat_flags_is_the_version_5_layout_plus_one_zero_byte() {
+        let v5 = include_bytes!("../tests/fixtures/cubism_v5.model.bin");
+        let now = Package::from_cubism(with_physics(), "test", "x").encode_model().unwrap();
+        assert_eq!(&now[8..now.len() - 1], &v5[8..]);
         assert_eq!(now[now.len() - 1], 0);
+    }
+
+    #[test]
+    fn a_version_5_model_reads_with_no_repeat_flags_and_its_physics_intact() {
+        // Generated by the version 5 writer from `with_physics()`.
+        let bytes = include_bytes!("../tests/fixtures/cubism_v5.model.bin");
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 5);
+        let PackageModel::Cubism(ir) = Package::decode_model(bytes).expect("v5 must still load") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert_eq!(ir.parameter_repeats, None);
+        assert!(ir.physics.is_some());
+        assert_eq!(ir, with_physics());
+    }
+
+    #[test]
+    fn a_version_6_header_over_version_5_bytes_is_refused() {
+        let mut bytes = include_bytes!("../tests/fixtures/cubism_v5.model.bin").to_vec();
+        bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
+        assert!(Package::decode_model(&bytes).is_err());
+    }
+
+    #[test]
+    fn repeat_flags_round_trip_and_re_encode_to_identical_bytes() {
+        for flags in [None, Some(vec![false, false]), Some(vec![true, false]), Some(vec![false, true])] {
+            let mut ir = with_physics();
+            ir.parameter_repeats = flags.clone();
+            let first = Package::from_cubism(ir.clone(), "test", "x").encode_model().unwrap();
+            let PackageModel::Cubism(back) = Package::decode_model(&first).expect("should decode") else {
+                panic!("a Cubism package must decode as one")
+            };
+            assert_eq!(back.parameter_repeats, flags);
+            assert_eq!(back, ir);
+            assert_eq!(Package::from_cubism(back, "test", "x").encode_model().unwrap(), first);
+        }
+    }
+
+    #[test]
+    fn repeat_flags_of_the_wrong_length_are_refused_by_the_writer_and_the_reader_alike() {
+        for flags in [vec![true], vec![true, false, false], vec![]] {
+            let mut ir = with_physics();
+            ir.parameter_repeats = Some(flags);
+            let err = Package::from_cubism(ir.clone(), "test", "x").encode_model().expect_err("wrong length");
+            assert!(matches!(err, DecodeError::Corrupt { .. }), "{err:?}");
+            assert!(err.to_string().contains("parameter repeat flags for 2 parameters"), "{err}");
+
+            // Bypass the writer's check to prove the reader holds the same line.
+            let mut good = with_physics();
+            good.parameter_repeats = Some(vec![false, false]);
+            let mut w = Writer::new();
+            write(&mut w, &good).unwrap();
+            let mut bytes = w.into_bytes();
+            // Drop the flag sequence (opt byte, count, two flags) and put the bad one back.
+            bytes.truncate(bytes.len() - (1 + 4 + 2));
+            let mut tail = Writer::new();
+            tail.opt(ir.parameter_repeats.as_ref(), |w, f| w.seq(f, |w, f| w.bool(*f)));
+            bytes.extend(tail.into_bytes());
+            let err = read(&mut Reader::new(&bytes), 6).expect_err("wrong length");
+            assert!(err.to_string().contains("parameter repeat flags for 2 parameters"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_repeat_flag_byte_other_than_zero_or_one_is_refused_on_read() {
+        let mut ir = with_physics();
+        ir.parameter_repeats = Some(vec![true, false]);
+        let mut w = Writer::new();
+        write(&mut w, &ir).unwrap();
+        let mut bytes = w.into_bytes();
+        let n = bytes.len();
+        bytes[n - 2] = 2;
+        let err = read(&mut Reader::new(&bytes), 6).expect_err("a flag of 2");
+        assert!(err.to_string().contains("repeat flag is 2"), "{err}");
+    }
+
+    #[test]
+    fn an_older_package_without_repeat_flags_says_to_re_import_and_a_current_one_does_not() {
+        let notes = |package: Package| {
+            package.validate().warnings().iter().map(|w| w.to_string()).collect::<Vec<_>>().join("\n")
+        };
+        let mut old = Package::from_cubism(with_glue(), "test", "x");
+        old.manifest.format_version = 5;
+        assert!(notes(old).contains("predates stored repeat flags"));
+        let mut flagged = with_glue();
+        flagged.parameter_repeats = Some(vec![false, false]);
+        assert!(!notes(Package::from_cubism(flagged, "test", "x")).contains("repeat flags"));
+        // A current package with none stored is a source that carried none: no nag.
+        assert!(!notes(Package::from_cubism(with_glue(), "test", "x")).contains("predates"));
     }
 
     #[test]
@@ -1642,7 +1764,8 @@ mod tests {
             good.physics = None;
             write(&mut w, &good).unwrap();
             let mut bytes = w.into_bytes();
-            bytes.pop();
+            // The physics flag and the repeat flag after it.
+            bytes.truncate(bytes.len() - 2);
             let mut tail = Writer::new();
             tail.opt(ir.physics.as_ref(), write_physics);
             bytes.extend(tail.into_bytes());
@@ -1721,6 +1844,26 @@ mod tests {
         assert_eq!(back.unresolved_physics_targets().len(), 2);
     }
 
+    /// Writes the committed version 5 fixture. Run with `--ignored` and
+    /// `UPDATE_GOLDEN=1` to regenerate it; nothing else touches the file.
+    #[test]
+    #[ignore = "regenerates tests/fixtures/cubism_v5.model.bin; needs UPDATE_GOLDEN=1"]
+    fn regenerate_the_version_5_fixture() {
+        // The fixture is frozen: it stands for what a version 5 writer wrote,
+        // which is the current layout without its final repeat-flag byte.
+        if std::env::var_os("UPDATE_GOLDEN").is_none() {
+            return;
+        }
+        let mut bytes = Package::from_cubism(with_physics(), "test", "x").encode_model().unwrap();
+        assert_eq!(bytes.pop(), Some(0), "the repeat-flag marker of a model with none");
+        bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
+        let PackageModel::Cubism(ir) = Package::decode_model(&bytes).expect("the v5 bytes must decode") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert_eq!(ir, with_physics(), "the regenerated v5 fixture must read back as the model it stands for");
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cubism_v5.model.bin"), bytes).unwrap();
+    }
+
     /// Writes the committed version 4 fixture. Run with `--ignored` and
     /// `UPDATE_GOLDEN=1` to regenerate it; nothing else touches the file.
     #[test]
@@ -1731,6 +1874,8 @@ mod tests {
             return;
         }
         let mut bytes = Package::from_cubism(with_glue(), "test", "x").encode_model().unwrap();
+        // The current writer ends [physics 0][repeat flags 0]; a version 4 body ends before both.
+        assert_eq!(bytes.pop(), Some(0), "the repeat-flag marker of a model with none");
         assert_eq!(bytes.pop(), Some(0), "the physics flag of a model with none");
         bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
         std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cubism_v4.model.bin"), bytes).unwrap();

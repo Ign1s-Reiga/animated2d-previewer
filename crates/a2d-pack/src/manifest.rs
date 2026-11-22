@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 /// * 4 -- Cubism `model.bin` gains its warp keyform opacities. Spine is
 ///   unchanged.
 /// * 5 -- Cubism `model.bin` gains its physics rig. Spine is unchanged.
-pub const FORMAT_VERSION: u32 = 5;
+/// * 6 -- Cubism `model.bin` gains its per-parameter repeat flags. Spine is
+///   unchanged.
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Which runtime family loads this package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

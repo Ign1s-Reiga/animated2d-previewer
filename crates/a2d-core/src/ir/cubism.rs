@@ -345,6 +345,11 @@ impl Keyforms {
 pub struct CubismIr {
     pub canvas: Canvas,
     pub parameters: Vec<Parameter>,
+    /// The editor's per-parameter "repeat" switch, one entry per parameter, as
+    /// the MOC3 stores it. `None` when the source carries none (or a package
+    /// written before it was stored is read): repeating parameters are then
+    /// inferred from motions, see [`CubismIr::repeating_parameters`].
+    pub parameter_repeats: Option<Vec<bool>>,
     pub part_ids: Vec<String>,
     pub deformer_ids: Vec<String>,
     pub drawable_ids: Vec<String>,
@@ -687,18 +692,34 @@ impl CubismIr {
         out
     }
 
-    /// Parameters that loop, found from the motions that key them.
+    /// Parameters that loop: their two ends join, so a value past the maximum
+    /// wraps round to the minimum instead of being clamped. Ascending indices.
     ///
-    /// Cubism's editor can mark a parameter as repeating: its two ends join, so
-    /// a value past the maximum wraps round to the minimum. MOC3 version 2
-    /// stores no such flag, so the only trace is in the motions. A parameter is
-    /// taken to repeat when some motion curve driving it has every key on the
-    /// same side of `[minimum, maximum]`, at least half the range beyond that
-    /// end. Such a curve would sit frozen at one end of the range if clamped,
-    /// which is not something anyone authors, while on a loop it is a perfectly
-    /// good value (a whole number of turns, or a rest phase). A curve with keys
-    /// on both sides (-90 to 90 on [-30, 30]) is a deliberate sweep, not
-    /// evidence; neither is one with a key inside the range.
+    /// The editor's per-parameter "repeat" switch is stored in the MOC3
+    /// ([`CubismIr::parameter_repeats`]) and, when the model carries it, it is
+    /// the answer: exactly the flagged parameters. Only a model with no flags
+    /// (a source or an older package without them) falls back to
+    /// an inference from the motions, described on the private helper behind it.
+    pub fn repeating_parameters(&self) -> Vec<usize> {
+        match &self.parameter_repeats {
+            Some(flags) => {
+                flags.iter().enumerate().filter(|(i, on)| **on && *i < self.parameters.len()).map(|(i, _)| i).collect()
+            }
+            None => self.inferred_repeating_parameters(),
+        }
+    }
+
+    /// Parameters that loop, found from the motions that key them: the
+    /// fallback for a model that carries no repeat flags (an older package, or
+    /// a source without the section).
+    ///
+    /// A parameter is taken to repeat when some motion curve driving it has
+    /// every key on the same side of `[minimum, maximum]`, at least half the
+    /// range beyond that end. Such a curve would sit frozen at one end of the
+    /// range if clamped, which is not something anyone authors, while on a loop
+    /// it is a perfectly good value (a whole number of turns, or a rest phase).
+    /// A curve with keys on both sides (-90 to 90 on [-30, 30]) is a deliberate
+    /// sweep, not evidence; neither is one with a key inside the range.
     ///
     /// Deliberately narrow. A ramp that merely passes beyond the range on its
     /// way somewhere (it has a key inside the range) does not count: that is
@@ -706,24 +727,40 @@ impl CubismIr {
     /// overshoots by a little, as a Hermite segment can, never counts. Keys
     /// that are not finite, and curves whose target names no parameter, are
     /// ignored. Ascending parameter indices.
-    pub fn repeating_parameters(&self) -> Vec<usize> {
+    ///
+    /// Measured against the stored flags on real models this finds a subset of
+    /// them: it misses a parameter whose motions never leave the range.
+    fn inferred_repeating_parameters(&self) -> Vec<usize> {
         self.repeat_evidence().into_iter().map(|e| e.parameter).collect()
     }
 
-    /// One note per repeating parameter, naming the evidence. Reported by the
-    /// model and by package validation, which is how an inference that may be
-    /// wrong stays visible.
+    /// Notes on repeating parameters, reported by the model, the importer and
+    /// package validation alike so a guess that may be wrong stays visible.
+    ///
+    /// With stored flags the flags decide, so there is nothing to say about the
+    /// parameters they mark. The one thing worth saying is a parameter the
+    /// motions suggest should repeat but the source does not mark: it is
+    /// clamped, and the note names the evidence so the disagreement is visible.
+    /// Without flags, one note per parameter inferred to repeat.
     pub fn repeat_degradations(&self) -> Vec<crate::Degradation> {
         self.repeat_evidence()
             .into_iter()
             .filter_map(|e| {
                 let p = self.parameters.get(e.parameter)?;
                 let motion = self.motions.get(e.motion)?;
-                Some(crate::Degradation::Note(format!(
-                    "parameter {} is keyed at least half its range beyond one end of [{}, {}] for a whole curve (motion {:?} holds {}); \
-                     treated as repeating, because this MOC3 version stores no repeat flag",
+                let evidence = format!(
+                    "parameter {} is keyed at least half its range beyond one end of [{}, {}] for a whole curve (motion {:?} holds {})",
                     p.id, p.minimum, p.maximum, motion.name, e.key
-                )))
+                );
+                match &self.parameter_repeats {
+                    Some(flags) if flags.get(e.parameter) == Some(&true) => None,
+                    Some(_) => Some(crate::Degradation::Note(format!(
+                        "{evidence}, but the source does not mark it repeating; clamped"
+                    ))),
+                    None => Some(crate::Degradation::Note(format!(
+                        "{evidence}; treated as repeating, because no repeat flags are stored"
+                    ))),
+                }
             })
             .collect()
     }
@@ -838,6 +875,44 @@ mod tests {
         assert_eq!(notes.len(), 1);
         let text = notes[0].to_string();
         assert!(text.contains("parameter A") && text.contains("repeating") && text.contains("\"m\""), "{text}");
+    }
+
+    #[test]
+    fn without_flags_the_note_says_the_source_stores_none() {
+        let ir = ir_with(vec![("A", vec![360.0, 180.0])]);
+        let text = ir.repeat_degradations()[0].to_string();
+        assert!(text.contains("treated as repeating") && text.contains("no repeat flags are stored"), "{text}");
+    }
+
+    #[test]
+    fn a_stored_flag_makes_a_parameter_repeat_with_no_motion_evidence() {
+        let mut ir = ir_with(vec![("A", vec![0.0, 10.0])]);
+        ir.parameter_repeats = Some(vec![false, true]);
+        assert_eq!(ir.repeating_parameters(), vec![1]);
+        assert!(ir.inferred_repeating_parameters().is_empty());
+        // A flag the motions do not contradict needs no note.
+        assert!(ir.repeat_degradations().is_empty());
+    }
+
+    #[test]
+    fn a_cleared_flag_overrides_motion_evidence_and_the_disagreement_is_reported_once() {
+        let mut ir = ir_with(vec![("A", vec![360.0, 180.0]), ("A", vec![200.0])]);
+        ir.parameter_repeats = Some(vec![false, false]);
+        assert!(ir.repeating_parameters().is_empty());
+        assert_eq!(ir.inferred_repeating_parameters(), vec![0]);
+        let notes = ir.repeat_degradations();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let text = notes[0].to_string();
+        assert!(text.contains("parameter A") && text.contains("does not mark it repeating"), "{text}");
+        assert!(text.contains("clamped") && !text.contains("treated as repeating"), "{text}");
+    }
+
+    #[test]
+    fn a_flag_that_agrees_with_the_motions_is_silent_and_a_flag_alone_is_silent() {
+        let mut ir = ir_with(vec![("A", vec![360.0, 180.0])]);
+        ir.parameter_repeats = Some(vec![true, true]);
+        assert_eq!(ir.repeating_parameters(), vec![0, 1]);
+        assert!(ir.repeat_degradations().is_empty(), "{:?}", ir.repeat_degradations());
     }
 
     #[test]

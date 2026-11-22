@@ -288,6 +288,16 @@ pub fn validate_cubism(ir: &CubismIr, format_version: u32, textures: &[TextureFi
         ));
     }
 
+    // Same for repeat flags: an older package cannot say whether its source
+    // marked any parameter as repeating. Playback then infers them from motions.
+    if ir.parameter_repeats.is_none() && format_version < 6 {
+        report.warn(Degradation::Note(
+            "this package predates stored repeat flags (format 6): repeating parameters are inferred from motions; \
+             re-import the source to read them"
+                .into(),
+        ));
+    }
+
     // Physics naming a parameter the model lacks is skipped at playback;
     // validation reports it for the same reason as for motions below.
     for degradation in ir.unresolved_physics_targets() {
@@ -300,8 +310,9 @@ pub fn validate_cubism(ir: &CubismIr, format_version: u32, textures: &[TextureFi
         report.warn(degradation);
     }
 
-    // Playback wraps a parameter the motions key by whole turns instead of
-    // clamping it. The package stores no flag for that, so say what was inferred.
+    // Playback wraps the parameters flagged as repeating, or, with no flag
+    // stored, those the motions key by whole turns. Say where the two disagree
+    // or what was inferred.
     for degradation in ir.repeat_degradations() {
         report.warn(degradation);
     }
@@ -640,5 +651,39 @@ mod tests {
             .filter(|w| w.contains("ParamSpin") && w.contains("repeating"))
             .collect();
         assert_eq!(hits.len(), 1, "{hits:?}");
+    }
+
+    #[test]
+    fn with_stored_flags_validation_reports_only_a_disagreement_and_only_once() {
+        use a2d_core::ir::cubism::{CubismIr, CurveKey, Motion, MotionCurve, Parameter};
+        let key = |t: f32, v: f32| CurveKey { time: t, value: v, in_slope: 0.0, out_slope: 0.0, stepped: false };
+        let motion = |name: &str| Motion {
+            name: name.into(),
+            duration: 1.0,
+            curves: vec![MotionCurve {
+                target: "ParamSpin".into(),
+                keys: vec![key(0.0, 360.0), key(1.0, 180.0)],
+                ..MotionCurve::default()
+            }],
+            ..Motion::default()
+        };
+        let mut ir = CubismIr {
+            parameters: vec![Parameter { id: "ParamSpin".into(), minimum: -30.0, maximum: 30.0, default: 0.0 }],
+            motions: vec![motion("a"), motion("b")],
+            ..CubismIr::default()
+        };
+        let notes = |ir: &CubismIr| {
+            let mut report = LoadReport::new();
+            validate_cubism(ir, crate::FORMAT_VERSION, &[], &mut report);
+            report.warnings().iter().map(|w| w.to_string()).filter(|w| w.contains("ParamSpin")).collect::<Vec<_>>()
+        };
+        // The source does not mark it: clamped, and said once however many motions show it.
+        ir.parameter_repeats = Some(vec![false]);
+        let hits = notes(&ir);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].contains("does not mark it repeating"), "{hits:?}");
+        // Marked and agreeing with the motions: nothing to say.
+        ir.parameter_repeats = Some(vec![true]);
+        assert!(notes(&ir).is_empty());
     }
 }
