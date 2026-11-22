@@ -7,6 +7,8 @@
 
 use crate::gpu::{GpuContext, RenderError};
 use crate::texture::Rgba8Image;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 /// A texture the renderer can draw into and the CPU can read back.
 #[derive(Debug)]
@@ -109,13 +111,15 @@ impl OffscreenTarget {
             // A closed channel just means the caller gave up first.
             let _ = sender.send(result);
         });
-        gpu.device
-            .poll(wgpu::PollType::Wait)
-            .map_err(|e| RenderError::Readback(format!("waiting for the GPU failed: {e}")))?;
-        receiver
-            .recv()
-            .map_err(|_| RenderError::Readback("the map callback never ran".into()))?
-            .map_err(|e| RenderError::Readback(e.to_string()))?;
+        // In wgpu 26 `PollType::Wait` blocks for up to 60 s per call inside wgpu-core
+        // and cannot be shortened, so poll with our own bound instead. The deadline
+        // is checked between polls; it cannot interrupt a block inside `poll()`.
+        wait_for_map(&receiver, READBACK_TIMEOUT, || {
+            gpu.device
+                .poll(wgpu::PollType::Poll)
+                .map(|_| ())
+                .map_err(|e| RenderError::Readback(format!("polling the GPU failed: {e}")))
+        })?;
 
         let mapped = slice.get_mapped_range();
         let mut pixels = Vec::with_capacity((unpadded_row * self.height) as usize);
@@ -128,6 +132,56 @@ impl OffscreenTarget {
 
         straighten(&mut pixels);
         Ok(Rgba8Image { width: self.width, height: self.height, pixels })
+    }
+}
+
+/// How long a read-back may wait for the GPU before it is reported as failed.
+const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Interval between non-blocking polls while waiting for the map callback.
+const POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Waits for the buffer-map result, driving the device through `poll` without
+/// blocking, and gives up with [`RenderError::Readback`] after `timeout`.
+///
+/// If this returns an error the buffer may still have a map pending; dropping
+/// a buffer with a pending map is fine in wgpu (the callback receives an error
+/// and its send to the closed channel is ignored).
+fn wait_for_map(
+    receiver: &Receiver<Result<(), wgpu::BufferAsyncError>>,
+    timeout: Duration,
+    mut poll: impl FnMut() -> Result<(), RenderError>,
+) -> Result<(), RenderError> {
+    let deadline = Instant::now() + timeout;
+    let mapped = |result: Result<(), wgpu::BufferAsyncError>| result.map_err(|e| RenderError::Readback(e.to_string()));
+    let timed_out = || {
+        RenderError::Readback(format!(
+            "timed out after {:.1} s waiting for the GPU to finish the read-back",
+            timeout.as_secs_f32()
+        ))
+    };
+    loop {
+        poll()?;
+        // The map often completes on the first poll; skip the timed wait then.
+        if let Ok(result) = receiver.try_recv() {
+            return mapped(result);
+        }
+        match receiver.recv_timeout(POLL_INTERVAL.min(timeout)) {
+            Ok(result) => return mapped(result),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(RenderError::Readback("the map callback never ran".into()));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    // A read-back that finished during the last interval must succeed.
+                    poll()?;
+                    return match receiver.try_recv() {
+                        Ok(result) => mapped(result),
+                        Err(_) => Err(timed_out()),
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -234,7 +288,71 @@ impl DepthStencil {
 
 #[cfg(test)]
 mod tests {
-    use super::{linear_to_srgb, srgb_to_linear, straighten};
+    use super::{linear_to_srgb, srgb_to_linear, straighten, wait_for_map};
+    use crate::gpu::RenderError;
+    use std::time::Duration;
+
+    #[test]
+    fn a_map_that_never_completes_times_out() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut polls = 0;
+        let err = wait_for_map(&receiver, Duration::from_millis(200), || {
+            polls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(&err, RenderError::Readback(m) if m.contains("timed out")), "{err:?}");
+        assert!(polls > 1, "should keep polling until the deadline");
+    }
+
+    #[test]
+    fn a_map_that_completes_late_still_succeeds() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut polls = 0;
+        let result = wait_for_map(&receiver, Duration::from_secs(5), || {
+            polls += 1;
+            if polls == 3 {
+                let _ = sender.send(Ok(()));
+            }
+            Ok(())
+        });
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn a_map_that_finishes_during_the_last_interval_succeeds() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(20);
+        let result = wait_for_map(&receiver, timeout, || {
+            // Only the poll made after the deadline delivers the value.
+            if start.elapsed() >= timeout {
+                let _ = sender.send(Ok(()));
+            }
+            Ok(())
+        });
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn a_map_error_is_reported_as_a_readback_error() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Err(wgpu::BufferAsyncError)).unwrap();
+        let err = wait_for_map(&receiver, Duration::from_secs(1), || Ok(())).unwrap_err();
+        assert!(matches!(err, RenderError::Readback(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_dropped_callback_and_a_poll_failure_are_reported() {
+        let (sender, receiver) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
+        drop(sender);
+        let err = wait_for_map(&receiver, Duration::from_secs(1), || Ok(())).unwrap_err();
+        assert!(matches!(&err, RenderError::Readback(m) if m.contains("never ran")), "{err:?}");
+        let (_s, receiver) = std::sync::mpsc::channel();
+        let err =
+            wait_for_map(&receiver, Duration::from_secs(1), || Err(RenderError::Readback("boom".into()))).unwrap_err();
+        assert!(matches!(&err, RenderError::Readback(m) if m == "boom"));
+    }
 
     /// Row padding is what makes read-back subtle, so the arithmetic is checked
     /// on its own — it holds regardless of whether a GPU is present.
