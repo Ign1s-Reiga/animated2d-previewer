@@ -56,6 +56,33 @@ impl Parameter {
     pub fn clamp(&self, value: f32) -> f32 {
         value.clamp(self.minimum, self.maximum)
     }
+
+    /// Folds a value into `[minimum, maximum)` by whole turns of the range, for
+    /// a parameter that repeats (see [`CubismIr::repeating_parameters`]).
+    ///
+    /// The maximum maps onto the minimum, since on a loop they are the same
+    /// point. A range with no usable width, or a non-finite value or offset,
+    /// falls back to [`Parameter::clamp`] so the result never leaves the range.
+    pub fn wrap(&self, value: f32) -> f32 {
+        let span = self.maximum - self.minimum;
+        if !span.is_finite() || span <= 0.0 {
+            return self.clamp(value);
+        }
+        let turn = (value - self.minimum).rem_euclid(span);
+        if !turn.is_finite() {
+            // The offset overflowed (a range of astronomic width): the clamped
+            // value, with the maximum still read as the minimum.
+            let clamped = self.clamp(value);
+            return if clamped >= self.maximum { self.minimum } else { clamped };
+        }
+        let wrapped = self.minimum + turn;
+        // `rem_euclid` can round up to `span`, and adding the minimum back can
+        // round up to the maximum; the maximum is the minimum on a loop.
+        if turn >= span || wrapped >= self.maximum {
+            return self.minimum;
+        }
+        self.clamp(wrapped)
+    }
 }
 
 /// One drawable: a textured triangle mesh, in Cubism terms an art mesh.
@@ -613,6 +640,14 @@ pub struct CurveKey {
     pub stepped: bool,
 }
 
+/// Why a parameter was taken to repeat.
+#[derive(Debug, Clone, Copy)]
+struct RepeatEvidence {
+    parameter: usize,
+    motion: usize,
+    key: f32,
+}
+
 impl CubismIr {
     /// A parameter by identifier.
     pub fn parameter(&self, id: &str) -> Option<&Parameter> {
@@ -648,6 +683,72 @@ impl CubismIr {
         out
     }
 
+    /// Parameters that loop, found from the motions that key them.
+    ///
+    /// Cubism's editor can mark a parameter as repeating: its two ends join, so
+    /// a value past the maximum wraps round to the minimum. MOC3 version 2
+    /// stores no such flag, so the only trace is in the motions. A parameter is
+    /// taken to repeat when some motion curve driving it has every key on the
+    /// same side of `[minimum, maximum]`, at least half the range beyond that
+    /// end. Such a curve would sit frozen at one end of the range if clamped,
+    /// which is not something anyone authors, while on a loop it is a perfectly
+    /// good value (a whole number of turns, or a rest phase). A curve with keys
+    /// on both sides (-90 to 90 on [-30, 30]) is a deliberate sweep, not
+    /// evidence; neither is one with a key inside the range.
+    ///
+    /// Deliberately narrow. A ramp that merely passes beyond the range on its
+    /// way somewhere (it has a key inside the range) does not count: that is
+    /// just as likely a value the author expected to be clamped. A key that
+    /// overshoots by a little, as a Hermite segment can, never counts. Keys
+    /// that are not finite, and curves whose target names no parameter, are
+    /// ignored. Ascending parameter indices.
+    pub fn repeating_parameters(&self) -> Vec<usize> {
+        self.repeat_evidence().into_iter().map(|e| e.parameter).collect()
+    }
+
+    /// One note per repeating parameter, naming the evidence. Reported by the
+    /// model and by package validation, which is how an inference that may be
+    /// wrong stays visible.
+    pub fn repeat_degradations(&self) -> Vec<crate::Degradation> {
+        self.repeat_evidence()
+            .into_iter()
+            .filter_map(|e| {
+                let p = self.parameters.get(e.parameter)?;
+                let motion = self.motions.get(e.motion)?;
+                Some(crate::Degradation::Note(format!(
+                    "parameter {} is keyed at least half its range beyond one end of [{}, {}] for a whole curve (motion {:?} holds {}); \
+                     treated as repeating, because this MOC3 version stores no repeat flag",
+                    p.id, p.minimum, p.maximum, motion.name, e.key
+                )))
+            })
+            .collect()
+    }
+
+    /// The first qualifying curve of each repeating parameter, in parameter order.
+    fn repeat_evidence(&self) -> Vec<RepeatEvidence> {
+        let mut out: Vec<Option<RepeatEvidence>> = vec![None; self.parameters.len()];
+        for (mi, m) in self.motions.iter().enumerate() {
+            for c in &m.curves {
+                let Some(pi) = self.motion_target(&c.target) else { continue };
+                if out[pi].is_some() {
+                    continue;
+                }
+                let p = &self.parameters[pi];
+                let span = p.maximum - p.minimum;
+                if !span.is_finite() || span <= 0.0 || c.keys.is_empty() {
+                    continue;
+                }
+                let half = span * 0.5;
+                let above = |v: f32| v.is_finite() && v >= p.maximum + half;
+                let below = |v: f32| v.is_finite() && v <= p.minimum - half;
+                if c.keys.iter().all(|k| above(k.value)) || c.keys.iter().all(|k| below(k.value)) {
+                    out[pi] = Some(RepeatEvidence { parameter: pi, motion: mi, key: c.keys[0].value });
+                }
+            }
+        }
+        out.into_iter().flatten().collect()
+    }
+
     /// One degradation per physics input or output whose parameter id names
     /// nothing in the model.
     ///
@@ -669,5 +770,123 @@ impl CubismIr {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn param(id: &str) -> Parameter {
+        Parameter { id: id.into(), minimum: -30.0, maximum: 30.0, default: 0.0 }
+    }
+
+    fn key(time: f32, value: f32) -> CurveKey {
+        CurveKey { time, value, in_slope: 0.0, out_slope: 0.0, stepped: false }
+    }
+
+    fn ir_with(curves: Vec<(&str, Vec<f32>)>) -> CubismIr {
+        let motion = Motion {
+            name: "m".into(),
+            duration: 4.0,
+            curves: curves
+                .into_iter()
+                .map(|(target, values)| MotionCurve {
+                    target: target.into(),
+                    keys: values.into_iter().enumerate().map(|(i, v)| key(i as f32, v)).collect(),
+                    ..MotionCurve::default()
+                })
+                .collect(),
+            ..Motion::default()
+        };
+        CubismIr { parameters: vec![param("A"), param("B")], motions: vec![motion], ..CubismIr::default() }
+    }
+
+    #[test]
+    fn wrap_folds_into_a_half_open_range() {
+        let p = param("A");
+        assert!((p.wrap(45.0) - -15.0).abs() < 1e-4);
+        assert!((p.wrap(135.0) - 15.0).abs() < 1e-4);
+        assert!((p.wrap(-45.0) - 15.0).abs() < 1e-4);
+        assert!((p.wrap(180.0) - 0.0).abs() < 1e-4);
+        assert!((p.wrap(10.0) - 10.0).abs() < 1e-6);
+        // The maximum is the same point as the minimum.
+        assert_eq!(p.wrap(30.0), -30.0);
+        assert_eq!(p.wrap(-30.0), -30.0);
+    }
+
+    #[test]
+    fn wrap_never_leaves_the_range_and_survives_bad_input() {
+        let p = param("A");
+        assert!(p.wrap(f32::NAN).is_nan(), "same as clamp, which lets NaN through");
+        assert_eq!(p.wrap(f32::INFINITY), -30.0, "clamped to the maximum, which reads as the minimum");
+        let tiny = p.wrap(-30.0 - 1e-6);
+        assert!((-30.0..30.0).contains(&tiny), "{tiny}");
+        let flat = Parameter { id: "F".into(), minimum: 1.0, maximum: 1.0, default: 1.0 };
+        assert_eq!(flat.wrap(5.0), 1.0);
+    }
+
+    #[test]
+    fn a_curve_wholly_far_outside_the_range_marks_the_parameter_repeating() {
+        let ir = ir_with(vec![("A", vec![360.0, 180.0]), ("B", vec![0.0, 10.0])]);
+        assert_eq!(ir.repeating_parameters(), vec![0]);
+        let notes = ir.repeat_degradations();
+        assert_eq!(notes.len(), 1);
+        let text = notes[0].to_string();
+        assert!(text.contains("parameter A") && text.contains("repeating") && text.contains("\"m\""), "{text}");
+    }
+
+    #[test]
+    fn each_repeating_parameter_is_reported_once_however_many_curves_show_it() {
+        let mut ir = ir_with(vec![("A", vec![180.0]), ("A", vec![-90.0, -120.0])]);
+        let again = ir.motions[0].clone();
+        ir.motions.push(again);
+        assert_eq!(ir.repeating_parameters(), vec![0]);
+        assert_eq!(ir.repeat_degradations().len(), 1);
+    }
+
+    #[test]
+    fn hermite_overshoot_and_ramps_that_visit_the_range_do_not_repeat() {
+        // 30.5 on [-30, 30] is the size of overshoot a Hermite segment makes.
+        assert!(ir_with(vec![("A", vec![30.5, 30.5])]).repeating_parameters().is_empty());
+        assert!(ir_with(vec![("A", vec![0.0, 40.0, 29.0])]).repeating_parameters().is_empty());
+        // A curve with an in-range key could be authored to clamp.
+        assert!(ir_with(vec![("A", vec![0.0, 180.0, 0.0])]).repeating_parameters().is_empty());
+        // Just under half a span (30) beyond the maximum.
+        assert!(ir_with(vec![("A", vec![59.0])]).repeating_parameters().is_empty());
+        assert_eq!(ir_with(vec![("A", vec![60.0])]).repeating_parameters(), vec![0]);
+    }
+
+    #[test]
+    fn a_curve_straddling_the_range_is_a_sweep_not_a_repeat() {
+        assert!(ir_with(vec![("A", vec![-90.0, 90.0])]).repeating_parameters().is_empty());
+        assert!(ir_with(vec![("A", vec![90.0, -90.0])]).repeating_parameters().is_empty());
+        // Same side on both ends still flags, whichever side.
+        assert_eq!(ir_with(vec![("A", vec![-90.0, -75.0])]).repeating_parameters(), vec![0]);
+    }
+
+    #[test]
+    fn wrap_keeps_the_half_open_range_where_rounding_would_reach_the_maximum() {
+        let p = Parameter { id: "P".into(), minimum: 1000.0, maximum: 1060.0, default: 1000.0 };
+        for v in [1059.9999, 1060.0, 1060.001, 1119.9999, 2060.0, 940.00006, 939.9999] {
+            let w = p.wrap(v);
+            assert!((1000.0..1060.0).contains(&w), "{v} -> {w}");
+        }
+        let wide = Parameter { id: "W".into(), minimum: -1e38, maximum: 1e38, default: 0.0 };
+        for v in [0.0, 5e37, -5e37, 1e38, -1e38, 3e38, f32::MAX] {
+            let w = wide.wrap(v);
+            assert!(w.is_finite() && (-1e38..1e38).contains(&w), "{v} -> {w}");
+        }
+    }
+
+    #[test]
+    fn non_finite_keys_unresolved_targets_and_empty_curves_never_flag() {
+        assert!(ir_with(vec![("A", vec![f32::NAN, 400.0])]).repeating_parameters().is_empty());
+        assert!(ir_with(vec![("A", vec![f32::INFINITY])]).repeating_parameters().is_empty());
+        assert!(ir_with(vec![("Missing", vec![400.0])]).repeating_parameters().is_empty());
+        assert!(ir_with(vec![("A", vec![])]).repeating_parameters().is_empty());
+        let mut flat = ir_with(vec![("A", vec![400.0])]);
+        flat.parameters[0].maximum = flat.parameters[0].minimum;
+        assert!(flat.repeating_parameters().is_empty());
     }
 }

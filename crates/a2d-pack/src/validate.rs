@@ -291,6 +291,12 @@ pub fn validate_cubism(ir: &CubismIr, format_version: u32, textures: &[TextureFi
     for degradation in ir.unresolved_motion_targets() {
         report.warn(degradation);
     }
+
+    // Playback wraps a parameter the motions key by whole turns instead of
+    // clamping it. The package stores no flag for that, so say what was inferred.
+    for degradation in ir.repeat_degradations() {
+        report.warn(degradation);
+    }
 }
 
 #[cfg(test)]
@@ -596,5 +602,35 @@ mod tests {
         ir.animations[0].timelines.clear();
         let text = run(&ir, &page_file());
         assert!(text.contains("no timelines"), "{text}");
+    }
+
+    #[test]
+    fn a_repeating_cubism_parameter_is_reported_once() {
+        use a2d_core::ir::cubism::{CubismIr, CurveKey, Motion, MotionCurve, Parameter};
+        let key = |t: f32, v: f32| CurveKey { time: t, value: v, in_slope: 0.0, out_slope: 0.0, stepped: false };
+        let motion = |name: &str| Motion {
+            name: name.into(),
+            duration: 1.0,
+            curves: vec![MotionCurve {
+                target: "ParamSpin".into(),
+                keys: vec![key(0.0, 360.0), key(1.0, 180.0)],
+                ..MotionCurve::default()
+            }],
+            ..Motion::default()
+        };
+        let ir = CubismIr {
+            parameters: vec![Parameter { id: "ParamSpin".into(), minimum: -30.0, maximum: 30.0, default: 0.0 }],
+            motions: vec![motion("a"), motion("b")],
+            ..CubismIr::default()
+        };
+        let mut report = LoadReport::new();
+        validate_cubism(&ir, crate::FORMAT_VERSION, &[], &mut report);
+        let hits: Vec<String> = report
+            .warnings()
+            .iter()
+            .map(|w| w.to_string())
+            .filter(|w| w.contains("ParamSpin") && w.contains("repeating"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{hits:?}");
     }
 }
