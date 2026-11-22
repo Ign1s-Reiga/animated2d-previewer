@@ -117,6 +117,15 @@ fn anisotropy(from: &[(f32, f32)], to: &[(f32, f32)]) -> Option<f64> {
     (small > 1e-18).then(|| (big / small).sqrt())
 }
 
+/// Fewest measurable rigid meshes for which the similar-share floor applies.
+const MIN_CHECKED_FOR_SIMILAR_SHARE: usize = 5;
+/// The share of measurable rigid meshes that must start out similar to their texture.
+const MIN_SIMILAR_SHARE: f64 = 0.85;
+/// Fewest glues for which the closed-at-rest fraction floor applies.
+const MIN_GLUES_FOR_CLOSED_FLOOR: usize = 30;
+/// The share of glues that must coincide at rest, on a rig with enough glues.
+const MIN_CLOSED_FRACTION: f64 = 0.75;
+
 #[test]
 #[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
 fn rigid_meshes_keep_their_texture_proportions() {
@@ -125,13 +134,19 @@ fn rigid_meshes_keep_their_texture_proportions() {
     let rigid = rigid_candidates(&ir);
     let pose = ir.pose(&[]);
 
+    // `measurable` counts meshes whose rest layout has UV area (a data-only
+    // property); a mesh measurable at rest whose posed layout is not is the
+    // evaluator collapsing it, and is a failure, not a skip.
     let mut checked = 0usize;
     let mut similar = 0usize;
+    let mut degenerate = Vec::new();
     let mut worst = (0.0f64, 0usize);
     for &d in &rigid {
         let drawable = &ir.drawables[d];
         let (local, posed) = (local_points(&ir, d), &pose.drawables[d]);
-        let (Some(was), Some(is)) = (anisotropy(&drawable.uvs, &local), anisotropy(&drawable.uvs, posed)) else {
+        let Some(was) = anisotropy(&drawable.uvs, &local) else { continue };
+        let Some(is) = anisotropy(&drawable.uvs, posed) else {
+            degenerate.push(d);
             continue;
         };
         checked += 1;
@@ -151,11 +166,33 @@ fn rigid_meshes_keep_their_texture_proportions() {
         worst.0,
         worst.1
     );
-    assert!(checked > 0, "no rigid drawable could be measured, so nothing was checked");
-    // Measured at 0.91, 0.98 and 1.00 on three real models; the rest are
-    // meshes whose layout is not a pure similarity of their texture region.
-    assert!(similar_fraction >= 0.85, "only {similar} of {checked} rigid meshes are similar to their texture");
     assert!(pose.is_stable(), "unstable drawables: {:?}", pose.unstable);
+    assert!(degenerate.is_empty(), "rigid meshes measurable at rest collapsed when posed: {degenerate:?}");
+    let measurable = checked + degenerate.len();
+    if measurable == 0 {
+        // Every candidate had no UV area to measure (a hit-area quad is a few
+        // 1e-5 of the texture on a side), as on a small rig with one or two
+        // candidates. Nothing was checked, and saying so is all that is honest.
+        println!("skipped: none of the {} rigid candidates {rigid:?} has UV area to measure", rigid.len());
+        return;
+    }
+    // Measured at 0.91, 0.98 and 1.00 on three large real models; the rest are
+    // meshes whose layout is not a pure similarity of their texture region.
+    // A small rig has too few measurable meshes for a share to mean anything
+    // (one of six real models: 2 of 3 similar, the odd one at the same 1.0105
+    // anisotropy that a large rig also has on a couple of meshes), so the share
+    // floor applies from MIN_CHECKED_FOR_SIMILAR_SHARE meshes up. The anisotropy
+    // change below, which is what guards the evaluator, always applies.
+    if measurable >= MIN_CHECKED_FOR_SIMILAR_SHARE {
+        assert!(
+            similar_fraction >= MIN_SIMILAR_SHARE,
+            "only {similar} of {checked} rigid meshes are similar to their texture"
+        );
+    } else {
+        println!(
+            "similar-share floor not applied: {measurable} measurable meshes, fewer than {MIN_CHECKED_FOR_SIMILAR_SHARE}"
+        );
+    }
     assert!(worst.0 < 1e-3, "drawable {} changed its texture proportions by {}", worst.1, worst.0);
 }
 
@@ -296,13 +333,26 @@ fn most_glued_pairs_coincide_at_rest_before_the_glue_runs() {
         ir.canvas.size.1 / ir.canvas.pixels_per_unit
     );
     println!("{closed} of {} glues closed at rest ({fraction:.3}); widest rest gap {widest}", ir.glues.len());
-    // Measured on three real models (canvas 1 unit wide): closed fractions of
-    // 0.81, 0.86 and 1.00; exactly one glue open by more than 0.02 on one of
-    // them (0.295) and none on the other two; the next-widest anywhere is 0.018.
-    // So the bounds are a floor on the closed fraction, at most one wide-open
-    // glue, and a widest gap no more than about 20% past the measured one. A
-    // few glues really are open at rest, so this is not exactness.
-    assert!(fraction >= 0.75, "only {closed} of {} glues close at rest", ir.glues.len());
+    // Measured on six real models (canvas 1 unit wide): closed fractions of
+    // 0.81, 0.86 and 1.00 on three large rigs (56 to 122 glues) but 0.42 and
+    // 0.43 on two small ones (12 and 7 glues), and 1.00 on a third (3 glues); exactly one glue open by more
+    // than 0.02 on one of them (0.295) and none on the others; the next-widest
+    // anywhere is 0.018. A small rig keeps the body and shoulder seams, which are
+    // open at rest in the large rig too (several of them the same glues, at similar gaps), and drops
+    // most of the cloth-chain glues that close exactly, so the fraction collapses
+    // with the sample size; a tolerance change alone would not fix it. So the
+    // closed-fraction floor applies only from MIN_GLUES_FOR_CLOSED_FLOOR glues up,
+    // while the wide-gap bounds apply to every rig: at most one wide-open glue,
+    // and a widest gap no more than about 20% past the measured one. A few glues
+    // really are open at rest, so this is not exactness.
+    if ir.glues.len() >= MIN_GLUES_FOR_CLOSED_FLOOR {
+        assert!(fraction >= MIN_CLOSED_FRACTION, "only {closed} of {} glues close at rest", ir.glues.len());
+    } else {
+        println!(
+            "closed-fraction floor not applied: {} glues, fewer than {MIN_GLUES_FOR_CLOSED_FLOOR}",
+            ir.glues.len()
+        );
+    }
     assert!(wide <= 1, "{wide} glues are open by more than 0.02 canvas units at rest");
     assert!(widest < 0.35, "a glued pair is {widest} canvas units apart at rest");
 }

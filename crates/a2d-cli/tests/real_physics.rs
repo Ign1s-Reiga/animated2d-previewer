@@ -180,16 +180,28 @@ fn driving_the_most_used_input_swings_first_segment_outputs_the_predicted_way() 
     let ir = model(&package);
     let physics = ir.physics.as_ref().expect("recovered");
 
-    // The parameter feeding the most inputs.
+    // The parameter feeding the most inputs, among groups with an angle output
+    // on particle 1: the prediction below covers the first segment only, and a
+    // small rig may read only deeper particles (one of six real models has no
+    // particle-1 output at all), where this test has nothing to predict.
+    let groups: Vec<_> = physics
+        .groups
+        .iter()
+        .filter(|g| g.outputs.iter().any(|o| o.particle == 1 && o.component == PhysicsComponent::Angle))
+        .collect();
+    if groups.is_empty() {
+        println!("skipped: no physics group has an angle output on particle 1, so the first-segment prediction does not apply");
+        return;
+    }
     let mut uses: HashMap<&str, usize> = HashMap::new();
-    for i in physics.groups.iter().flat_map(|g| &g.inputs) {
+    for i in groups.iter().flat_map(|g| &g.inputs) {
         *uses.entry(i.source.as_str()).or_default() += 1;
     }
     let (driven, count) = uses
         .iter()
         .max_by_key(|(id, n)| (**n, std::cmp::Reverse(**id)))
         .map(|(a, b)| (*a, *b))
-        .expect("the rig has inputs");
+        .expect("groups with a particle-1 output have inputs");
     let param = ir.parameter(driven).expect("resolves");
     let index = ir.motion_target(driven).expect("resolves");
     println!("driving {driven} ({count} inputs), range {}..{}", param.minimum, param.maximum);
