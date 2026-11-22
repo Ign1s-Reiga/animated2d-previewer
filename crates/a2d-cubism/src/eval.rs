@@ -267,8 +267,9 @@ pub struct Pose {
     /// One draw order per drawable, blended from its keyforms.
     ///
     /// Cubism animates draw order, so a hand passing in front of a face is a
-    /// change in this rather than a change in geometry. Falls back to the fixed
-    /// order when the model carries no track.
+    /// change in this rather than a change in geometry. With no track every
+    /// drawable rests at 500, so the model's draw-order object list alone
+    /// decides the paint order.
     pub draw_orders: Vec<f32>,
     /// Drawables whose deformer chain produced something unusable, and which
     /// therefore hold their own coordinates rather than a posed result.

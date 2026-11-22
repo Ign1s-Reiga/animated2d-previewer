@@ -47,9 +47,13 @@ fn temp_dir(label: &str) -> TempDir {
 /// The model as a viewer would get it: written to a package directory and read
 /// back, so serialisation is part of what is under test.
 fn load_model(label: &str) -> (GenericCubismModel, a2d_pack::Package) {
+    load_package(label, support::cubism_deformation_package())
+}
+
+fn load_package(label: &str, source: a2d_pack::Package) -> (GenericCubismModel, a2d_pack::Package) {
     let dir = temp_dir(label);
     let package_dir = dir.path().join("synthetic.a2dpack");
-    support::cubism_deformation_package().write_to(&package_dir).expect("package should write");
+    source.write_to(&package_dir).expect("package should write");
     let package = a2d_pack::Package::read_from(&package_dir).expect("package should read");
     let ir = package.model.as_cubism().cloned().expect("fixture is a Cubism model");
     (GenericCubismModel::load(ir, "synthetic"), package)
@@ -66,7 +70,11 @@ struct Harness {
 
 impl Harness {
     fn build(gpu: GpuContext, label: &str) -> Harness {
-        let (mut model, package) = load_model(label);
+        Harness::from_loaded(gpu, load_model(label))
+    }
+
+    fn from_loaded(gpu: GpuContext, loaded: (GenericCubismModel, a2d_pack::Package)) -> Harness {
+        let (mut model, package) = loaded;
         let mut renderer = Renderer::new(gpu.clone());
         let entry = &package.manifest.textures[0];
         let file = package.textures.iter().find(|t| t.file == entry.file).expect("page should be present");
@@ -91,6 +99,15 @@ impl Harness {
             .render(self.target.view(), self.target.format(), FrameSettings::new(self.viewport, self.camera), &list)
             .expect("render should succeed");
         self.target.read_pixels(&self.gpu).expect("read-back should succeed")
+    }
+
+    /// The pixel at a point given in canvas units (y up).
+    fn pixel_at(&self, image: &Rgba8Image, x: f32, y: f32) -> [u8; 4] {
+        let ppu = self.camera.pixels_per_unit;
+        let px = (SIZE as f32 * 0.5 + (x - self.camera.center.x) * ppu).floor() as u32;
+        let py = (SIZE as f32 * 0.5 - (y - self.camera.center.y) * ppu).floor() as u32;
+        let at = ((py * image.width + px) * 4) as usize;
+        [image.pixels[at], image.pixels[at + 1], image.pixels[at + 2], image.pixels[at + 3]]
     }
 
     /// Centroid of the opaque pixels in rows `rows`, in canvas units with y up
@@ -253,4 +270,79 @@ fn frames_match_a_stored_baseline_when_one_is_configured() {
         let image = harness.frame(time);
         support::check_baseline(&dir, &format!("cubism_idle_{time:.2}.png"), &image, TOLERANCE);
     }
+}
+
+// ---- animated draw order -------------------------------------------------
+//
+// Quad A is red, quad B is blue; they overlap on x -0.2..0.2. A's draw order
+// is 400 + 200 * p for the parameter p, B's is 500, and the motion drives p
+// linearly to 0 / 0.25 / 0.5 / 1.0 at the four fixed timestamps. By hand:
+//
+//   t     p      A      B    on top in the overlap
+//   0.00  0.00   400    500  B (blue): A is behind
+//   0.25  0.25   450    500  B (blue)
+//   0.50  0.50   500    500  tie: whichever the object list names last
+//   1.00  1.00   600    500  A (red): A is in front
+//
+// Both are opaque with opacity 1 and the page is not premultiplied, so a
+// covered pixel is its texel exactly: red is [255, 0, 0, 255], blue
+// [0, 0, 255, 255]. Outside the overlap the same holds for whichever quad is
+// there, and outside both quads the frame stays transparent.
+const RED: [u8; 4] = [255, 0, 0, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+const A_ONLY: (f32, f32) = (-0.5, 0.0);
+const B_ONLY: (f32, f32) = (0.5, 0.0);
+const OVERLAP: (f32, f32) = (0.0, 0.0);
+const OUTSIDE: (f32, f32) = (0.0, 0.8);
+
+fn draw_order_harness(gpu: GpuContext, label: &str, tie_order: Vec<u32>) -> Harness {
+    Harness::from_loaded(gpu, load_package(label, support::cubism_draw_order_package(tie_order)))
+}
+
+#[test]
+fn animated_draw_order_changes_which_mesh_is_emitted_first() {
+    // CPU-only. Meshes come out back to front; A is the one whose vertices reach x = -0.8.
+    let (mut model, _) = load_package("order-cpu", support::cubism_draw_order_package(vec![0, 1]));
+    let first_is_a = |model: &mut GenericCubismModel, time: f32| {
+        model.pose_at("idle", time).expect("idle should exist");
+        let mut list = RenderList::new();
+        model.emit(&mut list);
+        assert_eq!(list.meshes().len(), 2, "t={time}");
+        assert_eq!((list.meshes()[0].z_order, list.meshes()[1].z_order), (0, 1));
+        let lowest_x = |m: &a2d_core::RenderMesh| m.vertices.iter().map(|v| v.x).fold(f32::MAX, f32::min);
+        lowest_x(&list.meshes()[0]) < -0.7
+    };
+    // A first (behind) until its order passes B's; the tie at 0.5 goes to the list [A, B].
+    assert!(first_is_a(&mut model, 0.0));
+    assert!(first_is_a(&mut model, 0.25));
+    assert!(first_is_a(&mut model, 0.5));
+    assert!(!first_is_a(&mut model, 1.0));
+}
+
+#[test]
+fn the_overlap_flips_from_one_quad_to_the_other_as_the_draw_order_crosses() {
+    let Some(gpu) = gpu() else { return };
+    let mut harness = draw_order_harness(gpu, "order-flip", vec![0, 1]);
+    // The tie at 0.5 is settled by the list [A, B]: A is painted first, B on top.
+    let expected = [(0.0, BLUE), (0.25, BLUE), (0.5, BLUE), (1.0, RED)];
+    for (time, want) in expected {
+        let image = harness.frame(time);
+        // The rest of the frame does not move: a flip must come from order alone.
+        assert_eq!(harness.pixel_at(&image, A_ONLY.0, A_ONLY.1), RED, "t={time}: A alone");
+        assert_eq!(harness.pixel_at(&image, B_ONLY.0, B_ONLY.1), BLUE, "t={time}: B alone");
+        assert_eq!(harness.pixel_at(&image, OUTSIDE.0, OUTSIDE.1)[3], 0, "t={time}: outside both quads");
+        assert_eq!(harness.pixel_at(&image, OVERLAP.0, OVERLAP.1), want, "t={time}: overlap");
+    }
+}
+
+#[test]
+fn a_tie_in_draw_order_is_settled_by_the_object_list_when_rendered() {
+    let Some(gpu) = gpu() else { return };
+    // At 0.5 s both are 500. With the list [B, A], A is painted last and is on top.
+    let mut harness = draw_order_harness(gpu, "order-tie", vec![1, 0]);
+    let image = harness.frame(0.5);
+    assert_eq!(harness.pixel_at(&image, OVERLAP.0, OVERLAP.1), RED);
+    // Away from the tie the list does not matter: at 0 s A (400) is still behind B.
+    let image = harness.frame(0.0);
+    assert_eq!(harness.pixel_at(&image, OVERLAP.0, OVERLAP.1), BLUE);
 }

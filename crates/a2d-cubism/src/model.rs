@@ -940,6 +940,31 @@ mod tests {
     }
 
     #[test]
+    fn a_motion_that_moves_a_draw_order_changes_what_is_painted_first() {
+        // Drawable 0's draw order is 400 up to the middle key and 600 at the
+        // last, so as the motion drives the first parameter from 0 to 30 it
+        // crosses the 500 the other drawable holds. The list names drawable 1
+        // first, so the tie and everything after paints 1 behind 0.
+        let bytes = crate::moc3::tests::Builder::new()
+            .drawables(2)
+            .tie_order(&[1, 0])
+            .draw_orders(&[400.0, 400.0, 600.0, 500.0, 500.0, 500.0])
+            .build();
+        let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+        ir.motions = vec![sweep("S", "ParamAngleX", 30.0)];
+        let mut m = GenericCubismModel::load(ir, "test");
+        let painted = |m: &GenericCubismModel| {
+            let mut list = RenderList::new();
+            m.emit(&mut list);
+            list.meshes().iter().map(|mesh| (mesh.uvs[0].x / 0.125).round() as usize).collect::<Vec<_>>()
+        };
+        m.pose_at("S", 0.0).expect("known");
+        assert_eq!(painted(&m), [0, 1], "drawable 0 at 400 is behind");
+        m.pose_at("S", 2.0).expect("known");
+        assert_eq!(painted(&m), [1, 0], "drawable 0 at 600 is in front");
+    }
+
+    #[test]
     fn pose_at_does_not_depend_on_what_happened_before() {
         let motions = vec![sweep("S", "ParamExtra", 8.0), hold("H", "ParamEyeLOpen", 0.25)];
         let mut fresh = with_three(motions.clone());

@@ -243,7 +243,15 @@ pub fn validate_cubism(ir: &CubismIr, format_version: u32, textures: &[TextureFi
         report.warn(Degradation::Note("no drawable opacity track; every drawable will be painted opaque".into()));
     }
     if ir.draw_order.is_empty() {
-        report.warn(Degradation::Note("no paint sequence; drawables will be painted in model order".into()));
+        report.warn(Degradation::Note("no draw-order object list; ties between drawables fall to model order".into()));
+    }
+    // Draw order decides paint order, and its resting value is 500 for every
+    // drawable, so without the track the object list alone decides.
+    if ir.drawable_keyform_draw_orders.is_empty() && !ir.drawables.is_empty() {
+        report.warn(Degradation::Note(
+            "no drawable draw-order track; drawables are painted in object-list order and cannot be reordered by motions"
+                .into(),
+        ));
     }
 
     // Glue stitches split meshes back together. A package written before glue

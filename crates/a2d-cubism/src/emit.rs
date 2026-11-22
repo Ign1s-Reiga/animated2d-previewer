@@ -9,6 +9,57 @@ use a2d_core::{MaskId, RenderList, Rgba, TextureId, Vec2};
 use crate::eval::Pose;
 use crate::moc3::CubismIr;
 
+/// The draw order a drawable with no usable value is painted at, which is also
+/// where an unanimated drawable rests.
+const DEFAULT_DRAW_ORDER: i32 = 500;
+
+/// The drawables in the order they are painted, back to front.
+///
+/// `draw_orders` holds each drawable's blended draw order; `tie_order` is the
+/// model's draw-order object list, naming drawables. Drawables sort ascending
+/// on the draw order *rounded to the nearest integer* -- blended weights sum to
+/// one only within float error, so 500 can arrive as 499.99997, and truncating
+/// that would invent a reorder. Equal draw orders are settled by position in
+/// `tie_order`: the earlier entry paints first, further back.
+///
+/// A non-finite draw order counts as 500. A drawable `tie_order` does not name
+/// goes after every one it does, but the draw orders still apply among the
+/// unlisted ones (ties between them fall to index order), so an empty list
+/// still animates; an entry naming no drawable, or repeating one, is ignored
+/// (the first position wins). The result is always a permutation of
+/// `0..draw_orders.len()`.
+pub fn paint_sequence(draw_orders: &[f32], tie_order: &[u32]) -> Vec<usize> {
+    paint_sequence_of(draw_orders.len(), draw_orders, tie_order)
+}
+
+/// [`paint_sequence`] for exactly `count` drawables, however many draw orders
+/// there are: a missing one rests at 500 and an extra one is ignored, so a
+/// pose that disagrees with the model in length neither panics nor drops
+/// drawables.
+pub fn paint_sequence_of(count: usize, draw_orders: &[f32], tie_order: &[u32]) -> Vec<usize> {
+    let mut position = vec![u32::MAX; count];
+    for (at, index) in tie_order.iter().enumerate() {
+        if let Some(slot) = position.get_mut(*index as usize) {
+            if *slot == u32::MAX {
+                *slot = at as u32;
+            }
+        }
+    }
+    let key = |i: usize| {
+        let order = draw_orders.get(i).copied().unwrap_or(DEFAULT_DRAW_ORDER as f32);
+        let rounded = if order.is_finite() { order.round() as i32 } else { DEFAULT_DRAW_ORDER };
+        match position.get(i).copied() {
+            Some(at) if at != u32::MAX => (false, rounded, at),
+            // Unlisted: after every listed drawable, ordered among themselves
+            // by draw order and then by index.
+            _ => (true, rounded, i as u32),
+        }
+    };
+    let mut sequence: Vec<usize> = (0..count).collect();
+    sequence.sort_by_key(|i| key(*i));
+    sequence
+}
+
 /// Turning a pose into renderer-neutral meshes.
 ///
 /// A trait for the same reason as [`CubismEval`](crate::CubismEval): the model
@@ -32,36 +83,20 @@ impl CubismEmit for CubismIr {
     /// Coordinates come out in canvas units — the space the canvas size is
     /// expressed in once divided by its pixels per unit — with `y` upwards.
     fn emit(&self, pose: &Pose, texture: TextureId, out: &mut RenderList) {
-        // The model carries the resolved back-to-front sequence outright, so
-        // there is nothing to sort: slot k names the drawable drawn k-th.
-        //
-        // Reading that array the other way round -- as a per-drawable key
-        // saying where each one sits -- gives the inverse permutation, which
-        // looks plausible and draws the face skin over the eyes.
-        //
-        // It is not the same thing as [`Pose::draw_orders`], the artist's
-        // per-drawable value that Cubism animates. Turning those into a render
-        // order needs the part tree, and the per-part orders are all equal on
-        // the models measured, so the resolved sequence is what is used.
-        let n = self.drawables.len();
-        let mut order: Vec<usize> = Vec::with_capacity(n);
-        let mut placed = vec![false; n];
-        for slot in &self.draw_order {
-            let at = *slot as usize;
-            if at < n && !placed[at] {
-                placed[at] = true;
-                order.push(at);
-            }
-        }
-        // A model whose table repeats leaves gaps; those keep model order.
-        order.extend((0..n).filter(|i| !placed[*i]));
+        // Paint order is decided per frame: each drawable's blended draw order
+        // (which motions animate) picks its layer, and the model's draw-order
+        // object list breaks ties. Neither is a sequence on its own; the
+        // list alone is wrong at rest on three of the four models checked.
+        // Masks are shape sources looked up by index below, so none of this
+        // changes what they clip.
+        let order = paint_sequence_of(self.drawables.len(), &pose.draw_orders, &self.draw_order);
 
         // Masks are shared: a face's worth of drawables usually clip to the
         // same one or two meshes, so identical lists are registered once.
         let mut masks: Vec<(Vec<u32>, MaskId)> = Vec::new();
 
         for (z, index) in order.into_iter().enumerate() {
-            let drawable = &self.drawables[index];
+            let Some(drawable) = self.drawables.get(index) else { continue };
             let Some(points) = pose.drawables.get(index) else { continue };
             if points.len() != drawable.uvs.len() || drawable.indices.len() < 3 {
                 continue;
@@ -153,11 +188,12 @@ mod tests {
 
     #[test]
     fn meshes_are_painted_in_the_sequence_the_model_names() {
-        // Section 87 is the sequence itself: slot k names the drawable painted
-        // k-th. Read the other way round it is the inverse permutation, which
-        // is plausible enough to have shipped -- it paints a face's skin over
-        // its eyes. The fixture uses a rotation rather than a reversal because
-        // a reversal is its own inverse and could not tell the two apart.
+        // With every draw order equal, the object list (section 87) settles
+        // everything: slot k names the drawable painted k-th. Read the other
+        // way round it is the inverse permutation, which is plausible enough
+        // to have shipped -- it paints a face's skin over its eyes. The
+        // fixture uses a rotation rather than a reversal because a reversal is
+        // its own inverse and could not tell the two apart.
         let moc = Moc3::parse(&crate::moc3::tests::Builder::new().drawables(3).build()).expect("should parse");
         assert_eq!(moc.draw_order, [1, 2, 0], "the table is read as a sequence, not as a per-drawable key");
 
@@ -173,9 +209,10 @@ mod tests {
 
     #[test]
     fn a_drawable_the_sequence_never_names_is_still_painted() {
-        // One real model repeats an entry rather than permuting cleanly. The
-        // drawables left unnamed by such a table must still be drawn, or part
-        // of the character silently disappears.
+        // A hand-built or damaged list can repeat an entry rather than
+        // permuting cleanly (the decoder never produces one, but a package
+        // could carry it). The drawables left unnamed must still be drawn, or
+        // part of the character silently disappears.
         let mut moc = Moc3::parse(&crate::moc3::tests::Builder::new().drawables(3).build()).expect("should parse");
         moc.draw_order = vec![1, 1, 1];
         let pose = moc.pose(&[]);
@@ -184,6 +221,108 @@ mod tests {
         assert_eq!(list.meshes().len(), 3, "every drawable is painted exactly once");
         let painted: Vec<usize> = list.meshes().iter().map(|m| (m.uvs[0].x / 0.125).round() as usize).collect();
         assert_eq!(painted, [1, 0, 2], "the named one first, the rest in model order");
+    }
+
+    /// The drawable each emitted mesh came from, read from its tagged `u`.
+    fn painted(list: &RenderList) -> Vec<usize> {
+        list.meshes().iter().map(|m| (m.uvs[0].x / 0.125).round() as usize).collect()
+    }
+
+    #[test]
+    fn the_blended_draw_order_picks_the_layer_and_the_list_breaks_ties() {
+        // Orders [500, 500, 400, 500], list [1, 3, 2, 0]. Drawable 2 is lowest,
+        // so it goes first; the rest tie at 500 and follow the list: 1, 3, 0.
+        // The alternatives each give a different answer, so this pins both the
+        // key and the tie direction:
+        //   the list alone (ignoring draw order)  -> [1, 3, 2, 0]
+        //   ties by drawable index                -> [2, 0, 1, 3]
+        //   ties by the list reversed             -> [2, 0, 3, 1]
+        assert_eq!(paint_sequence(&[500.0, 500.0, 400.0, 500.0], &[1, 3, 2, 0]), [2, 1, 3, 0]);
+    }
+
+    #[test]
+    fn draw_orders_are_rounded_not_truncated() {
+        // A weighted sum of 500s can come out a hair under 500. Truncated that
+        // is 499 and would put drawable 0 in front of 1 against the list
+        // [1, 0]; rounded it ties at 500 and the list puts 1 first.
+        assert_eq!(paint_sequence(&[499.99997, 500.0], &[1, 0]), [1, 0]);
+        // A genuine half-step still separates them: 500.4 rounds to 500, 500.6 to 501.
+        assert_eq!(paint_sequence(&[500.6, 500.4], &[0, 1]), [1, 0]);
+    }
+
+    #[test]
+    fn a_non_finite_draw_order_counts_as_500() {
+        // NaN and infinities rest at 500, so against a 499 and a 501 they sit between.
+        let orders = [f32::NAN, 499.0, 501.0, f32::INFINITY, f32::NEG_INFINITY];
+        assert_eq!(paint_sequence(&orders, &[0, 1, 2, 3, 4]), [1, 0, 3, 4, 2]);
+    }
+
+    #[test]
+    fn an_unlisted_drawable_goes_last_and_a_duplicate_entry_is_ignored() {
+        // Drawables 1 and 3 are never named, so both follow every listed
+        // drawable even though their draw orders are the lowest; between
+        // themselves the draw orders still apply, so 3 (0) precedes 1 (100).
+        assert_eq!(paint_sequence(&[500.0, 100.0, 500.0, 0.0], &[2, 0]), [2, 0, 3, 1]);
+        // The repeated 2 and the entry naming no drawable change nothing: the
+        // first position of each wins.
+        assert_eq!(paint_sequence(&[500.0, 500.0, 500.0], &[2, 9, 0, 2, 1]), [2, 0, 1]);
+        // No list at all: everything is unlisted, so draw order decides and
+        // equal ones fall to index order.
+        assert_eq!(paint_sequence(&[3.0, 2.0, 1.0], &[]), [2, 1, 0]);
+        assert_eq!(paint_sequence(&[500.0, 500.0], &[]), [0, 1]);
+        assert!(paint_sequence(&[], &[1]).is_empty());
+    }
+
+    #[test]
+    fn an_empty_list_still_animates() {
+        assert_eq!(paint_sequence(&[600.0, 400.0], &[]), [1, 0]);
+    }
+
+    #[test]
+    fn a_pose_of_the_wrong_length_neither_panics_nor_paints_nothing() {
+        let bytes = crate::moc3::tests::Builder::new().drawables(3).build();
+        let moc = Moc3::parse(&bytes).expect("should parse");
+        let ir = moc.model;
+        let full = ir.pose(&[]);
+        for orders in [vec![], vec![400.0], vec![500.0; 7]] {
+            let pose = Pose { draw_orders: orders.clone(), ..full.clone() };
+            let mut list = RenderList::new();
+            ir.emit(&pose, TextureId(0), &mut list);
+            assert_eq!(list.meshes().len(), 3, "{} draw orders", orders.len());
+        }
+        // Missing entries rest at 500, extra ones are ignored.
+        assert_eq!(paint_sequence_of(3, &[600.0], &[]), [1, 2, 0]);
+        assert_eq!(paint_sequence_of(2, &[500.0, 400.0, 0.0, 0.0], &[]), [1, 0]);
+    }
+
+    #[test]
+    fn an_animated_draw_order_reorders_the_emitted_meshes() {
+        // Drawable 0's draw order is 400 / 400 / 600 at the keys -30 / 0 / 30
+        // of the first parameter, so with p the fraction of the way from 0 to
+        // 30 it is 400 + 200p. The others are keyed 500 throughout, so the
+        // tie falls at p = 0.5.
+        let bytes = crate::moc3::tests::Builder::new()
+            .drawables(3)
+            .tie_order(&[1, 2, 0])
+            .draw_orders(&[400.0, 400.0, 600.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0])
+            .build();
+        let moc = Moc3::parse(&bytes).expect("should parse");
+        assert!(moc.notes.is_empty(), "{:?}", moc.notes);
+        assert_eq!(moc.draw_order, [1, 2, 0]);
+        let order_at = |p: f32| {
+            let pose = moc.pose(&[30.0 * p, 1.0]);
+            let mut list = RenderList::new();
+            moc.emit(&pose, TextureId(0), &mut list);
+            (painted(&list), list.meshes().iter().map(|m| m.z_order).collect::<Vec<_>>())
+        };
+        // 400 and 450 are below the others' 500: drawable 0 is furthest back.
+        assert_eq!(order_at(0.0).0, [0, 1, 2]);
+        assert_eq!(order_at(0.25).0, [0, 1, 2]);
+        // 500 ties, and the list puts 0 after 1 and 2. 600 is simply in front.
+        assert_eq!(order_at(0.5).0, [1, 2, 0]);
+        let (order, z) = order_at(1.0);
+        assert_eq!(order, [1, 2, 0]);
+        assert_eq!(z, [0, 1, 2], "z follows the paint sequence");
     }
 
     #[test]
