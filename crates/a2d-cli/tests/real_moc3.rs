@@ -375,3 +375,30 @@ fn a_bundle_reconstructs_into_a_package_that_poses_identically() {
     assert_eq!(from_package.drawables, from_bundle.drawables, "the package must pose to the same geometry");
     assert_eq!(from_package.opacities, from_bundle.opacities);
 }
+
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
+fn a_real_model_carries_repeat_flags_and_they_cover_what_the_motions_imply() {
+    let Some(bytes) = payload() else { return };
+    let moc = Moc3::parse(&bytes).expect("a real MOC3 should parse");
+    let flags = moc.parameter_repeats.clone().expect("a real MOC3 has the parameter repeat section");
+    assert_eq!(flags.len(), moc.parameters.len());
+    assert!(moc.notes.iter().all(|n| !n.contains("repeat")), "{:?}", moc.notes);
+
+    // A MOC3 holds no motions, so build the model the importer would to compare
+    // the flags with what the motions alone suggest.
+    let path = std::env::var("A2D_FIXTURE_CUBISM").expect("set by payload()");
+    let bundle = std::fs::read(&path).expect("the bundle");
+    let package = a2d_import::import_bundle(&bundle, &mut LoadReport::new()).expect("the bundle should reconstruct");
+    let ir = package.model.as_cubism().expect("a Cubism package");
+    assert_eq!(ir.parameter_repeats.as_ref(), Some(&flags), "the importer must carry the flags through");
+    let mut without = ir.clone();
+    without.parameter_repeats = None;
+    let inferred = without.repeating_parameters();
+    for &p in &inferred {
+        assert!(flags[p], "{} is inferred to repeat but not flagged", ir.parameters[p].id);
+    }
+    let flagged: Vec<&str> =
+        flags.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| ir.parameters[i].id.as_str()).collect();
+    println!("{} flagged {flagged:?}; {} inferred", flagged.len(), inferred.len());
+}

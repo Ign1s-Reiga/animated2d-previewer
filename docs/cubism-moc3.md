@@ -55,6 +55,8 @@ used by the parser:
 | 1 | canvas | | 51 | parameter maximums |
 | 3 | part ids | | 52 | parameter minimums |
 | 11 | deformer ids | | 53 | parameter defaults |
+| | | | 54 | parameter repeat flag (`u32`, 0 or 1) |
+| | | | 55 | parameter decimal places (`u32`, not read) |
 | 16 | deformer parent | | 56 | parameter binding begin |
 | 17 | deformer type (0 warp, 1 rotation) | | 57 | parameter binding count |
 | 18 | deformer index within its type | | 59 | warp keyform opacity |
@@ -610,53 +612,102 @@ before being reverted. §3 records the argument and why it was wrong. Nothing in
 the format says which way up a character stands; only someone who knows the
 character can say.
 
-### Repeating parameters: inferred, not read
+### Repeating parameters: section 54
 
 Cubism's editor can mark a parameter as repeating: its two ends join, so a value
-past the maximum comes round to the minimum. The flag is not in a MOC3 version 2
-(the parameter records carry an id and a range, nothing else), so the only trace
-is in the motions. On one real model six parameters, all on `[-30, 30]`, are
-keyed in whole multiples of their 60-wide range: a linear ramp from 0 to 180 over
-the clip, held rest phases of 360, -180 and 120. Clamped, the ramp freezes at 30
-after a fraction of the clip and snaps back at the loop wrap (a vertex move of
-0.0357 canvas units over eleven drawables and an opacity pop of 0.70);
-wrapped, the same wrap is closed (0.0002, no opacity change). The other five
-models measured key nothing outside their ranges and already closed to 0.0.
+past the maximum comes round to the minimum. The switch is stored in the MOC3,
+one little-endian `u32` per parameter (count slot 5), 0 or 1, in **section 54**.
+It is addressed and aligned exactly like sections 51 to 53, 56 and 57: 64-byte
+aligned, `4 * n` bytes rounded up to 64, the padding zero. **Section 55** is one
+`u32` per parameter of the same shape holding the editor's "decimal places" (3 on
+every parameter of every model measured); it is display metadata, is not read,
+and exists in the code only as a named constant.
 
-The rule (`CubismIr::repeating_parameters`): a parameter repeats when some motion
-curve driving it has **every** key on the same side of `[min, max]`, at least
-half the range beyond that end (a curve that straddles the range, say -90 to 90,
-is a deliberate sweep and does not count).
-Playback then folds that parameter's value into `[min, max)` (the maximum maps
-to the minimum) instead of clamping it. It is computed from the motions on load,
-so no package layout changed.
+What established it:
 
-Why that rule and not a looser one. The first candidate, "any key at least half a
-range outside", also caught seven more parameters on the same model that were
-keyed in one motion only: six `[-30, 30]` parameters that climb from 0 by one
-to three ranges and return to 0, and one `[0, 1]` parameter with a single key at
-2 among in-range keys. Their geometry could not say whether they loop (they move
-nothing visible at rest), and a ramp that goes up and comes back is as likely a
-value the author expected to saturate. A curve lying wholly outside the range
-has no such reading, since clamped it would be a constant at one end. All six
-confirmed parameters have such a curve in several motions. The cost: a
-parameter whose only out-of-range evidence is a ramp that also visits the range
-is not flagged, and is still clamped. Each flag is reported as a note naming the
-motion and key that justified it, so a wrong call is visible rather than silent.
+- Position. An independent MIT-licensed MOC3 reader lists nine parameter offsets
+  in its oldest layout (v3.00): runtime space, ids, maximum, minimum, default,
+  *is repeat*, *decimal places*, binding begin, binding count. That is sections
+  49 to 57, and 50 to 53, 56 and 57 are the indices this document had already
+  established on its own, which pins 54 and 55 by position.
+- Values. On all six real models section 54 holds only 0 and 1 as whole `u32`s
+  (the first bytes of one read `01 00 00 00 01 00 00 00`, not packed bytes), and
+  its distance to section 55 equals the distance between the neighbouring
+  parameter sections in the same file.
+- Meaning. On the one model with repeating parameters, twelve are flagged. All
+  twelve are rotation controls whose keyform angles cover a full turn over the
+  range (-180, 0, 180 at keys -30, 0, 30 on `[-30, 30]`). A second, low-detail
+  sibling of that model flags two parameters that have no bindings at all and are
+  held at 0 by every motion: an inherited, inert flag. Four other models flag
+  nothing, though each has parameters that drive a single-axis rotation over
+  360 to 540 degrees and stay in range: the flag is an authored opt-in, not
+  something geometry implies.
+- The version. A header byte of 2 is the Core's "moc3 file version 3.3.00 -
+  3.3.03" and these files carry the flag, so a 3.3 file has it. The Core's getter
+  for it is much newer (Core 05.01.0000, 2025) than the data; no new MOC version
+  came with it. Which editor version first wrote non-zero values is not known.
+
+Reading (`parameter_repeats` on the IR, `Moc3::parse`): present gives one `bool`
+per parameter; a section that runs past the file or holds a value other than 0 or
+1 is an error (a wrongly read flag would wrap a parameter that should clamp); an
+absent section gives `None` and a note. The package keeps the flags from format
+version 6; an older package has none.
+
+`CubismIr::repeating_parameters` returns exactly the flagged parameters when the
+flags exist. Only with none (a source without the section, or a package older
+than format 6) does it fall back to the inference this crate used before the flag
+was found: a parameter repeats when some motion curve driving it has **every** key
+on the same side of `[min, max]`, at least half the range beyond that end (a curve
+that straddles the range, say -90 to 90, is a deliberate sweep and does not
+count). With flags, `repeat_degradations` reports only a parameter that inference
+would flag and the source does not (it is clamped, and the note says why); with
+none it reports every inferred parameter. Playback folds a repeating parameter's
+value into `[min, max)` (the maximum maps to the minimum) instead of clamping it.
+
+How the inference measured against the flag, on all six real models: it finds a
+subset of the flagged set every time and never a parameter the source leaves
+unflagged. On the model that has them, it found six of the twelve flagged. The
+other six climb from 0 by one to three ranges in one motion and return to 0, and
+the original rule left them out on purpose: a ramp that visits the range and
+comes back is as likely a value the author expected to saturate. They were
+repeating parameters all along. Clamped they sit at the maximum for most of that
+motion; wrapped they spin one to three turns. A looser rule would also have caught
+two parameters on that model that are not flagged (one key just past the maximum,
+a Hermite-size overshoot; one `[0, 1]` parameter with a single key at 2), so the
+inference stays narrow.
+
+Why wrapping matters, from the same model: clamped, a linear ramp 0 to 180 over
+the clip freezes at 30 after a fraction of the clip and snaps back at the loop
+wrap (a vertex move of 0.0357 canvas units over eleven drawables and an opacity
+pop of 0.70); wrapped, the wrap is closed (0.0002, no opacity change).
 
 Unverified:
 
-- Whether the game's own runtime wrapped these values or clamped them (the seam
-  may exist there too). The authoring intent is clearly a loop.
-- The editor's rule that, once repeating is on, the rightmost key value is no
-  longer recognised: a value between the last inner key and the maximum would
-  blend towards the keyform at the minimum. Wrapping the value alone leaves a
-  drawable whose keyforms differ between the two ends moving by that difference
-  when a curve crosses the join (at most 0.0199 canvas units on this model, 0.0002
-  at the seams actually measured). Not implemented; the exact rule is unknown
-  without a reference runtime.
+- Whether the closed Core uses the flag inside its own update. The data proves the
+  field is written; what the Core does with it is not observable here. The public
+  Framework applies repeat when a parameter value is *set*, not during evaluation,
+  and both official SDKs need an opt-in before they honour the editor's flag, so
+  whether the source game's runtime wrapped these values or clamped them is open.
+- The boundary. This crate folds into `[min, max)`, so a value exactly on the
+  maximum (modulo the span) becomes the minimum. The Framework keeps the closed
+  interval `[min, max]`: a value on the maximum stays there, and exact multiples
+  land on the minimum above the range and on the maximum below it. The two
+  differ only for a value exactly on a boundary, and matter only where the
+  keyforms at the two ends differ (0.0199 canvas units at worst on the one model).
+  Ours follows the editor manual's description (the maximum is the same point as
+  the minimum); the Framework follows its code. Not changed.
+- The editor manual says that with repeat on, the rightmost key is "no longer
+  recognised" and the slider jumps to the leftmost point just before reaching it,
+  and advises a key at the rightmost point anyway for a full rotation. Read as a
+  statement about the value domain (the maximum is the minimum), not about
+  rerouting keyform interpolation; that is an interpretation, unverified against
+  the Core. Wrapping the value alone leaves a drawable whose keyforms differ
+  between the two ends moving by that difference when a curve crosses the join.
 - Crossfading between two motions takes the shortest way round a repeating
-  parameter (then wraps); see the motions entry in section 8.
+  parameter (then wraps). The Framework blends fades linearly in value space for
+  repeating and non-repeating parameters alike, with no shortest arc. This is a
+  deliberate divergence; with the flag read it now also applies to the six
+  parameters the inference missed. See the motions entry in section 8.
 
 ## 7. How correctness is judged without a reference runtime
 
@@ -783,7 +834,7 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
   `mix_duration` instead: a sine weight `0.5 - 0.5 cos(pi t)`, each side
   evaluated alone from the defaults and blended per parameter before physics
   (a parameter one side leaves alone fades to or from its default; a repeating
-  one takes the shortest arc). The outgoing motion keeps playing, a loop wrap
+  one takes the shortest arc, where the Framework blends linearly). The outgoing motion keeps playing, a loop wrap
   does not fade, and a second switch mid-fade fades from the pose on show. The
   shape and the 150/300 ms lengths are the Cubism-family convention and the
   host's choice, not read from the assets (their Unity controllers specify 0.25 s

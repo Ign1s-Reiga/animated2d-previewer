@@ -29,8 +29,10 @@
 //! is printed next to it; the test also requires the fade to beat the cut by
 //! at least a factor of two on every pair whose cut moves more than five times
 //! the ordinary move (the bound alone could be met by a cut when the gap is
-//! small), which is the point of the feature. On a model with repeating parameters it
-//! also requires some fade to move one, so the shortest-arc path is exercised.
+//! small), which is the point of the feature. On a model with a repeating
+//! parameter that takes more than one distinct value across its motions (every
+//! key value, plus the default when a motion leaves it unkeyed) it also requires
+//! some fade to move one, so the shortest-arc path is exercised.
 //!
 //! The asset is never committed (spec §11). `A2D_FIXTURE_CUBISM` names one
 //! bundle:
@@ -133,7 +135,30 @@ fn switching_between_motions_fades_without_a_larger_move_than_the_motions_make()
     let frames = (MIX * FPS) as usize;
     let repeating: Vec<String> =
         m.moc().repeating_parameters().into_iter().map(|p| m.moc().parameters[p].id.clone()).collect();
-    println!("{} repeating parameters: {repeating:?}", repeating.len());
+    // A flagged parameter that takes only one value across all motions (an
+    // inherited flag on a model that never uses it) cannot be moved by a fade,
+    // so only parameters with more than one distinct value are watched and
+    // expected to move. Every key value counts, and the default counts when some
+    // motion leaves the parameter unkeyed (a fade then goes to or from it).
+    let moving: Vec<String> = repeating
+        .iter()
+        .filter(|id| {
+            let moc = m.moc();
+            let mut values: Vec<f32> = Vec::new();
+            let mut unkeyed = false;
+            for motion in &moc.motions {
+                let curves: Vec<_> = motion.curves.iter().filter(|c| c.target == **id).collect();
+                unkeyed |= curves.iter().all(|c| c.keys.is_empty());
+                values.extend(curves.iter().flat_map(|c| c.keys.iter().map(|k| k.value)));
+            }
+            if unkeyed {
+                values.extend(moc.parameter(id).map(|p| p.default));
+            }
+            values.iter().any(|v| (v - values[0]).abs() > 1e-6)
+        })
+        .cloned()
+        .collect();
+    println!("{} repeating parameters: {repeating:?}; {} varied by a motion", repeating.len(), moving.len());
     let (mut enforced, mut exercised) = (0, 0);
     let (mut worst_fade, mut worst_cut, mut worst_ratio, mut pairs) = (0.0f32, 0.0f32, 0.0f32, 0);
     for (i, (a, da)) in motions.iter().enumerate() {
@@ -153,8 +178,8 @@ fn switching_between_motions_fades_without_a_larger_move_than_the_motions_make()
                 m.pose_at(b, (f + 1) as f32 / FPS).expect("pose");
                 gap = gap.max(moved(pa, m.pose()));
             }
-            let (cut, _) = switch(&mut m, a, t0, b, 0.0, frames, &repeating);
-            let (fade, travel) = switch(&mut m, a, t0, b, MIX, frames, &repeating);
+            let (cut, _) = switch(&mut m, a, t0, b, 0.0, frames, &moving);
+            let (fade, travel) = switch(&mut m, a, t0, b, MIX, frames, &moving);
             if travel > 1e-3 {
                 exercised += 1;
             }
@@ -185,7 +210,7 @@ fn switching_between_motions_fades_without_a_larger_move_than_the_motions_make()
     }
     assert!(pairs > 0, "no pair of motions was long enough to test");
     assert!(enforced > 0, "no pair had a cut large enough for the fade-versus-cut check to apply");
-    if !repeating.is_empty() {
+    if !moving.is_empty() {
         assert!(exercised > 0, "no fade moved a repeating parameter, so the shortest-arc blend went untested");
     }
     println!("{enforced} pairs checked against the cut; {exercised} fades moved a repeating parameter");

@@ -4,10 +4,9 @@
 //! that as a pop unless the two frames are the same pose. Cubism lets an author
 //! mark a parameter as *repeating*, so a motion can turn it through several
 //! whole ranges and still close; clamping such a parameter instead freezes it
-//! at an end and snaps it back at the wrap. MOC3 version 2 stores no such flag,
-//! so it is inferred from the motions (`CubismIr::repeating_parameters` in
-//! `a2d-core`), and this test is what says the inference closes the seam on a
-//! real model.
+//! at an end and snaps it back at the wrap. The flag is stored in the MOC3
+//! (section 54) and read into `CubismIr::parameter_repeats`; this test is what
+//! says the flagged set closes the seam on a real model.
 //!
 //! For every motion, physics off (it is a simulation and has its own
 //! tests), the pose at the end is compared with the pose at the start:
@@ -19,9 +18,9 @@
 //! at the maximum onto the minimum, but the keyform grid still treats the two
 //! as different positions, so a drawable whose keyforms differ between the two
 //! ends of a repeating parameter moves by that difference when a curve crosses
-//! the join. The editor's own rule for repeating parameters (the rightmost key
-//! is ignored, so the maximum *is* the minimum) would remove that, and it is
-//! not implemented. The test measures the residual directly -- the largest
+//! the join. Whether the editor's Core treats the keyform grid the same way is
+//! unverified (the editor's manual says the rightmost key is not recognised, so
+//! the maximum *is* the minimum). The test measures the residual directly -- the largest
 //! move of any visible drawable between a repeating parameter at its minimum
 //! and at its maximum, everything else at rest -- and allows that much, plus
 //! 1e-4. A model that flags nothing has no such allowance and must close to
@@ -116,29 +115,21 @@ fn every_motion_closes_its_loop_seam() {
 
 #[test]
 #[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
-fn a_model_that_stays_in_range_flags_nothing_and_every_flag_has_a_witness() {
+fn every_inferred_parameter_is_flagged() {
     let Some(ir) = load() else { return };
-    let repeating = ir.repeating_parameters();
-    for &p in &repeating {
-        let param = &ir.parameters[p];
-        // Every flag rests on a curve lying wholly at least half a span beyond one end.
-        let half = (param.maximum - param.minimum) * 0.5;
-        let witnessed = ir.motions.iter().flat_map(|m| &m.curves).any(|c| {
-            ir.motion_target(&c.target) == Some(p)
-                && !c.keys.is_empty()
-                && (c.keys.iter().all(|k| k.value <= param.minimum - half)
-                    || c.keys.iter().all(|k| k.value >= param.maximum + half))
-        });
-        assert!(witnessed, "{} is flagged without a witnessing curve", param.id);
+    let flags = ir.parameter_repeats.clone().expect("a real MOC3 carries the repeat section");
+    assert_eq!(flags.len(), ir.parameters.len());
+    // What the motions alone would suggest must be a subset of what the source
+    // marks: a parameter the motions push far outside its range but the source
+    // does not mark would be one the inference and the editor disagree about.
+    let mut without = ir.clone();
+    without.parameter_repeats = None;
+    let inferred = without.repeating_parameters();
+    for &p in &inferred {
+        assert!(flags[p], "{} is inferred to repeat but the source does not mark it", ir.parameters[p].id);
     }
-    // A model whose keys all stay inside their ranges must flag nothing: only
-    // models that loop are changed.
-    let any_outside = ir.motions.iter().flat_map(|m| &m.curves).any(|c| {
-        let Some(p) = ir.motion_target(&c.target).and_then(|i| ir.parameters.get(i)) else { return false };
-        c.keys.iter().any(|k| k.value < p.minimum || k.value > p.maximum)
-    });
-    if !any_outside {
-        assert!(repeating.is_empty(), "flagged {repeating:?} though no key leaves its range");
-    }
-    println!("{} repeating parameters", repeating.len());
+    assert_eq!(ir.repeating_parameters(), (0..flags.len()).filter(|&i| flags[i]).collect::<Vec<_>>());
+    // The two agree, so nothing is reported as a disagreement.
+    assert!(ir.repeat_degradations().is_empty(), "{:?}", ir.repeat_degradations());
+    println!("{} flagged, {} inferred", ir.repeating_parameters().len(), inferred.len());
 }

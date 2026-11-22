@@ -583,8 +583,9 @@ impl AnimatedModel for GenericCubismModel {
         for degradation in self.moc.unresolved_physics_targets() {
             report.warn(degradation);
         }
-        // A parameter wrapped rather than clamped is an inference, not something
-        // the file says; name each one so a wrong call is visible.
+        // Where the motions suggest a parameter repeats but the source says it
+        // does not (or, with no stored flags, where one is inferred), name it so
+        // a wrong call is visible.
         for degradation in self.moc.repeat_degradations() {
             report.warn(degradation);
         }
@@ -659,6 +660,10 @@ mod tests {
     fn with_motions(motions: Vec<Motion>) -> GenericCubismModel {
         let bytes = crate::moc3::tests::Builder::new().build();
         let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+        // No stored flags, so repeating parameters are inferred from the motions
+        // (the path of a package written before the flags were kept). The flagged
+        // path is covered by `flagged_model`.
+        ir.parameter_repeats = None;
         ir.motions = motions;
         GenericCubismModel::load(ir, "test")
     }
@@ -1054,6 +1059,7 @@ mod tests {
     fn with_physics(motions: Vec<Motion>, physics: Physics) -> GenericCubismModel {
         let bytes = crate::moc3::tests::Builder::new().build();
         let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+        ir.parameter_repeats = None;
         ir.motions = motions;
         ir.physics = Some(physics);
         GenericCubismModel::load(ir, "test")
@@ -1341,6 +1347,53 @@ mod tests {
             }],
             ..Motion::default()
         }
+    }
+
+    /// A model from a MOC3 whose section 54 flags `flagged`, playing the given
+    /// motions: the stored flags decide what repeats.
+    fn flagged_model(flagged: &[usize], motions: Vec<Motion>) -> GenericCubismModel {
+        let bytes = crate::moc3::tests::Builder::new().repeating(flagged).build();
+        let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+        ir.motions = motions;
+        GenericCubismModel::load(ir, "test")
+    }
+
+    #[test]
+    fn a_stored_flag_wraps_a_parameter_whose_motions_give_no_evidence() {
+        // 45 on [-30, 30] with a key inside the range: nothing to infer from.
+        let sweep45 = || Motion {
+            name: "Sweep".into(),
+            duration: 1.0,
+            curves: vec![MotionCurve {
+                target: "ParamAngleX".into(),
+                keys: vec![k(0.0, 0.0, 0.0), k(1.0, 45.0, 0.0)],
+                ..MotionCurve::default()
+            }],
+            ..Motion::default()
+        };
+        let mut flagged = flagged_model(&[0], vec![sweep45()]);
+        flagged.pose_at("Sweep", 1.0).expect("pose");
+        assert!((value(&flagged, "ParamAngleX") - -15.0).abs() < 1e-3, "{}", value(&flagged, "ParamAngleX"));
+        let mut plain = flagged_model(&[], vec![sweep45()]);
+        plain.pose_at("Sweep", 1.0).expect("pose");
+        assert_eq!(value(&plain, "ParamAngleX"), 30.0);
+    }
+
+    #[test]
+    fn a_cleared_flag_clamps_what_the_motions_would_have_made_repeat_and_says_so_once() {
+        let mut m = flagged_model(&[], vec![hold_at("Rest", 360.0)]);
+        m.pose_at("Rest", 0.0).expect("pose");
+        assert_eq!(value(&m, "ParamAngleX"), 30.0);
+        let mut report = a2d_core::LoadReport::new();
+        m.absorb_degradations(&mut report);
+        let text: Vec<String> = report.warnings().iter().map(|w| w.to_string()).collect();
+        assert_eq!(text.len(), 1, "{text:?}");
+        assert!(text[0].contains("ParamAngleX") && text[0].contains("does not mark it repeating"), "{text:?}");
+        // Marked in the source, the same motion agrees with the flag and is silent.
+        let m = flagged_model(&[0], vec![hold_at("Rest", 360.0)]);
+        let mut report = a2d_core::LoadReport::new();
+        m.absorb_degradations(&mut report);
+        assert!(report.is_empty(), "{:?}", report.warnings());
     }
 
     #[test]

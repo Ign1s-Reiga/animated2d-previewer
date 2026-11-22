@@ -107,6 +107,14 @@ mod section {
     pub const PARAMETER_MAXIMUMS: usize = 51;
     pub const PARAMETER_MINIMUMS: usize = 52;
     pub const PARAMETER_DEFAULTS: usize = 53;
+    /// One little-endian `u32` per parameter, 0 or 1: the editor's "repeat"
+    /// switch. Addressed and aligned like sections 51 to 53.
+    pub const PARAMETER_REPEATS: usize = 54;
+    /// One `u32` per parameter holding the editor's display precision (3 on
+    /// every parameter of every model examined). Not read: it affects how the
+    /// editor prints a value and nothing about how the model moves.
+    #[allow(dead_code)]
+    pub const PARAMETER_DECIMAL_PLACES: usize = 55;
     pub const GLUE_IDS: usize = 90;
     // Glue, sections 91 to 100. Each is per glue except the last three, which
     // are per pair-list entry and per glue keyform.
@@ -411,6 +419,9 @@ impl Moc3 {
             parameters.push(Parameter { id, minimum, maximum, default });
         }
 
+        let mut notes = Vec::new();
+        let parameter_repeats = read_parameter_repeats(bytes, &sections, counts.parameters, &mut notes)?;
+
         let parameter_bindings = read_parameter_bindings(bytes, &sections, &counts)?;
         let keyform_bindings = read_keyform_bindings(bytes, &sections, &parameter_bindings)?;
         let drawables = read_drawables(bytes, &sections, &counts, &drawable_ids)?;
@@ -428,7 +439,6 @@ impl Moc3 {
         let keyforms = read_keyforms(bytes, &sections, &warp_deformers, &drawables)?;
         let (glues, glue_intensities) =
             read_glues(bytes, &sections, &counts, &drawables, &keyform_bindings, &parameter_bindings)?;
-        let mut notes = Vec::new();
         let draw_order = read_draw_order(bytes, &sections, drawables.len(), &mut notes)?;
 
         // A model that predates these sections, or one whose layout moved them,
@@ -488,6 +498,7 @@ impl Moc3 {
             model: CubismIr {
                 canvas,
                 parameters,
+                parameter_repeats,
                 part_ids,
                 deformer_ids,
                 drawable_ids,
@@ -1667,6 +1678,42 @@ fn read_draw_order(
     Ok(order)
 }
 
+/// The per-parameter repeat flags, one `u32` each.
+///
+/// Strict where it is present: a section that runs past the file or holds a
+/// value other than 0 or 1 means the layout is not what this reader thinks, and
+/// a wrongly read flag would wrap a parameter that should clamp. A section the
+/// file does not have gives `None`, and a note, so repeating parameters fall
+/// back to being inferred from motions.
+fn read_parameter_repeats(
+    bytes: &[u8],
+    sections: &[u32],
+    count: u32,
+    notes: &mut Vec<String>,
+) -> Result<Option<Vec<bool>>, DecodeError> {
+    if count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let Ok(at) = section_offset(sections, section::PARAMETER_REPEATS, "parameter repeat") else {
+        notes.push("no parameter repeat flags; repeating parameters are inferred from motions".to_string());
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        match u32_at(bytes, at + i * 4)? {
+            0 => out.push(false),
+            1 => out.push(true),
+            other => {
+                return Err(DecodeError::corrupt_at(
+                    format!("parameter {i} repeat flag is {other}, not 0 or 1"),
+                    (at + i * 4) as u64,
+                ))
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
 fn read_floats(bytes: &[u8], sections: &[u32], index: usize, count: u32, what: &str) -> Result<Vec<f32>, DecodeError> {
     if count == 0 {
         return Ok(Vec::new());
@@ -1704,6 +1751,46 @@ pub(crate) mod tests {
         assert!(moc.notes[0].contains("warp opacity"), "{:?}", moc.notes);
         let complete = Moc3::parse(&Builder::new().build()).expect("fixture");
         assert!(complete.notes.is_empty(), "{:?}", complete.notes);
+    }
+
+    #[test]
+    fn parameter_repeat_flags_are_read_in_parameter_order() {
+        let moc = Moc3::parse(&Builder::new().repeating(&[1]).build()).expect("fixture");
+        assert_eq!(moc.parameter_repeats, Some(vec![false, true]));
+        let moc = Moc3::parse(&Builder::new().repeating(&[0]).build()).expect("fixture");
+        assert_eq!(moc.parameter_repeats, Some(vec![true, false]));
+        let plain = Moc3::parse(&Builder::new().build()).expect("fixture");
+        assert_eq!(plain.parameter_repeats, Some(vec![false, false]));
+        assert!(plain.notes.is_empty(), "{:?}", plain.notes);
+    }
+
+    #[test]
+    fn a_repeat_flag_other_than_zero_or_one_is_refused() {
+        let err = Moc3::parse(&Builder::new().repeating(&[1]).repeat_flag_value(2).build())
+            .expect_err("a flag of 2 is not a flag");
+        assert!(err.to_string().contains("repeat flag is 2"), "{err}");
+    }
+
+    #[test]
+    fn a_layout_without_the_repeat_section_reads_no_flags_and_says_so() {
+        let moc = Moc3::parse(&Builder::new().without_repeat_flags().build()).expect("still loads");
+        assert_eq!(moc.parameter_repeats, None);
+        assert_eq!(moc.notes.len(), 1, "{:?}", moc.notes);
+        assert!(moc.notes[0].contains("repeat flags") && moc.notes[0].contains("inferred"), "{:?}", moc.notes);
+    }
+
+    #[test]
+    fn a_repeat_section_that_runs_past_the_file_is_an_error() {
+        // Four zero bytes at the end of the file, with section 54 pointing at
+        // them: the first flag (0) reads fine and the second runs past the end,
+        // so it is the bounds check that refuses it, not the 0-or-1 check.
+        let mut bad = Builder::new().build();
+        bad.extend_from_slice(&[0u8; 4]);
+        let slot = 0x40 + section::PARAMETER_REPEATS * 4;
+        let at = (bad.len() - 4) as u32;
+        bad[slot..slot + 4].copy_from_slice(&at.to_le_bytes());
+        let err = Moc3::parse(&bad).expect_err("two flags cannot fit in four bytes");
+        assert!(err.to_string().contains("wanted four bytes"), "{err}");
     }
 
     #[test]
@@ -2132,6 +2219,12 @@ pub(crate) mod tests {
         omit_groups: bool,
         /// Leaves the drawable draw-order section out.
         omit_draw_order_track: bool,
+        /// Parameters whose repeat flag is written as non-zero.
+        repeating: Vec<usize>,
+        /// Leaves the parameter repeat section out.
+        omit_repeats: bool,
+        /// What a flagged slot holds; 1 unless a test wants it refused.
+        repeat_value: u32,
     }
 
     impl Builder {
@@ -2160,7 +2253,28 @@ pub(crate) mod tests {
                 groups: None,
                 omit_groups: false,
                 omit_draw_order_track: false,
+                repeating: Vec::new(),
+                omit_repeats: false,
+                repeat_value: 1,
             }
+        }
+
+        /// Flags these parameters (by index) as repeating in section 54.
+        pub(crate) fn repeating(mut self, parameters: &[usize]) -> Self {
+            self.repeating = parameters.to_vec();
+            self
+        }
+
+        /// Writes `value` instead of 1 into the flagged slots, to test refusal.
+        pub(crate) fn repeat_flag_value(mut self, value: u32) -> Self {
+            self.repeat_value = value;
+            self
+        }
+
+        /// Writes no parameter repeat section at all.
+        pub(crate) fn without_repeat_flags(mut self) -> Self {
+            self.omit_repeats = true;
+            self
         }
 
         /// Sets the draw order of every drawable keyform, in keyform order.
@@ -2339,6 +2453,13 @@ pub(crate) mod tests {
             offsets[section::PARAMETER_MINIMUMS] = place(&mut body, &floats(|e| e.1, &self.parameters));
             offsets[section::PARAMETER_MAXIMUMS] = place(&mut body, &floats(|e| e.2, &self.parameters));
             offsets[section::PARAMETER_DEFAULTS] = place(&mut body, &floats(|e| e.3, &self.parameters));
+
+            if !self.omit_repeats {
+                let flags: Vec<u8> = (0..self.parameters.len())
+                    .flat_map(|i| if self.repeating.contains(&i) { self.repeat_value } else { 0 }.to_le_bytes())
+                    .collect();
+                offsets[section::PARAMETER_REPEATS] = place(&mut body, &flags);
+            }
 
             // Geometry: one triangle per drawable, so the offsets and totals
             // have something to be checked against.
