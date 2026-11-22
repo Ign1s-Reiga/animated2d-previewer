@@ -29,6 +29,16 @@
 //! clip may animate the model's opacity (`CubismRenderController`, `Opacity`),
 //! which has no counterpart in the IR.
 //!
+//! Three more kinds are recognised by name so their notes say what was ignored
+//! instead of quoting a hash: a part's opacity (class `CubismPart`, `Opacity`,
+//! path `crc32("Parts/" + id)`), and the model-level eye-blink and mouth
+//! controllers (`CubismEyeBlinkController` `EyeOpening`, `CubismMouthController`
+//! `MouthOpening`). None of the six real models examined has a clip with any of
+//! these three. All three follow the SDK's motion3-to-clip conversion as read
+//! in its source, and none is confirmed against a real clip; the eye and mouth
+//! cases match class and property only (an empty path). None produces a curve: the IR has
+//! no part opacity and the runtime applies no model-level curves.
+//!
 //! # Curve values
 //!
 //! A streamed key carries a cubic segment `((c0*x + c1)*x + c2)*x + c3`, valid
@@ -53,6 +63,12 @@ use super::fade_motion::DEFAULT_FADE;
 const PARAMETER_CLASS: &str = "CubismParameter";
 /// The C# class that carries the model-wide opacity.
 const RENDER_CONTROLLER_CLASS: &str = "CubismRenderController";
+/// The C# class that carries a part's opacity.
+const PART_CLASS: &str = "CubismPart";
+/// The C# class that drives the model-level eye-opening value.
+const EYE_BLINK_CLASS: &str = "CubismEyeBlinkController";
+/// The C# class that drives the model-level mouth-opening value.
+const MOUTH_CLASS: &str = "CubismMouthController";
 /// `MonoBehaviour`'s Unity class id, as a binding's `type_id`.
 const MONO_BEHAVIOUR_TYPE: i32 = 114;
 /// A cubic may miss its next key by this fraction of `max(1, |value|)` before
@@ -63,6 +79,8 @@ const SEGMENT_TOLERANCE: f32 = 1e-3;
 #[derive(Debug, Clone, Default)]
 pub(super) struct NameTable {
     by_hash: HashMap<u32, String>,
+    /// Part paths, used only to name a part in a note.
+    parts: HashMap<u32, String>,
 }
 
 impl NameTable {
@@ -74,6 +92,15 @@ impl NameTable {
             table.add(crc32_str(&format!("Parameters/{id}")), id)?;
         }
         Ok(table)
+    }
+
+    /// Adds part ids, so a part-opacity binding can be named in a note. A
+    /// collision only costs the name, so the first id wins.
+    pub(super) fn with_parts<'a>(mut self, ids: impl IntoIterator<Item = &'a str>) -> NameTable {
+        for id in ids {
+            self.parts.entry(crc32_str(&format!("Parts/{id}"))).or_insert_with(|| id.to_string());
+        }
+        self
     }
 
     fn add(&mut self, hash: u32, id: &str) -> Result<(), DecodeError> {
@@ -97,12 +124,25 @@ impl NameTable {
     }
 }
 
+/// The property-name hashes a binding is compared with.
+#[derive(Clone, Copy)]
+struct Hashes {
+    value: u32,
+    opacity: u32,
+    eye: u32,
+    mouth: u32,
+}
+
 /// What a binding turned out to drive.
 enum Target {
     Parameter(String),
     /// A parameter-shaped binding whose path matches no parameter here.
     Unresolved,
     ModelOpacity,
+    /// A part's opacity; the id when the path names a part of this model.
+    PartOpacity(Option<String>),
+    EyeBlink,
+    LipSync,
     /// Anything else, described by script class and property hash.
     Other(String),
 }
@@ -111,9 +151,9 @@ fn classify(
     binding: &GenericBinding,
     names: &NameTable,
     script_class: &dyn Fn(PPtr) -> Option<String>,
-    value_hash: u32,
-    opacity_hash: u32,
+    hashes: &Hashes,
 ) -> Target {
+    let Hashes { value: value_hash, opacity: opacity_hash, eye: eye_hash, mouth: mouth_hash } = *hashes;
     let class = (binding.type_id == MONO_BEHAVIOUR_TYPE).then(|| script_class(binding.script)).flatten();
     let plain_flags =
         binding.is_pptr_curve == 0 && binding.is_int_curve == 0 && binding.is_serialize_reference_curve == 0;
@@ -123,6 +163,11 @@ fn classify(
             None => Target::Unresolved,
         },
         Some(RENDER_CONTROLLER_CLASS) if binding.attribute == opacity_hash => Target::ModelOpacity,
+        Some(PART_CLASS) if binding.attribute == opacity_hash => {
+            Target::PartOpacity(names.parts.get(&binding.path).cloned())
+        }
+        Some(EYE_BLINK_CLASS) if binding.attribute == eye_hash => Target::EyeBlink,
+        Some(MOUTH_CLASS) if binding.attribute == mouth_hash => Target::LipSync,
         Some(other) => Target::Other(format!("{other} property {:#010x}", binding.attribute)),
         None => Target::Other(format!("type {} property {:#010x}", binding.type_id, binding.attribute)),
     }
@@ -133,6 +178,9 @@ fn classify(
 struct Tally {
     unresolved: usize,
     opacity: usize,
+    parts: Vec<Option<String>>,
+    eye_blink: usize,
+    lip_sync: usize,
     other: BTreeMap<String, usize>,
     dense_used: bool,
     dense_unusable: usize,
@@ -284,15 +332,23 @@ pub(super) fn to_motion(
     script_class: &dyn Fn(PPtr) -> Option<String>,
     report: &mut LoadReport,
 ) -> Option<Motion> {
-    let (value_hash, opacity_hash) = (crc32_str("Value"), crc32_str("Opacity"));
+    let hashes = Hashes {
+        value: crc32_str("Value"),
+        opacity: crc32_str("Opacity"),
+        eye: crc32_str("EyeOpening"),
+        mouth: crc32_str("MouthOpening"),
+    };
     let mut tally = Tally::default();
     let mut curves: Vec<MotionCurve> = Vec::new();
     let offset = if clip.start_time.is_finite() { clip.start_time } else { 0.0 };
 
     for (index, binding) in clip.bindings.iter().enumerate() {
-        match classify(binding, names, script_class, value_hash, opacity_hash) {
+        match classify(binding, names, script_class, &hashes) {
             Target::Unresolved => tally.unresolved += 1,
             Target::ModelOpacity => tally.opacity += 1,
+            Target::PartOpacity(id) => tally.parts.push(id),
+            Target::EyeBlink => tally.eye_blink += 1,
+            Target::LipSync => tally.lip_sync += 1,
             Target::Other(what) => *tally.other.entry(what).or_insert(0) += 1,
             Target::Parameter(id) => {
                 let Some(keys) = curve_keys(clip, index, offset, &mut tally) else { continue };
@@ -314,11 +370,28 @@ pub(super) fn to_motion(
     };
     count(tally.unresolved, "binding(s) match no parameter in this model and were dropped");
     count(tally.opacity, "model-opacity curve(s) ignored (no counterpart in the model)");
+    count(tally.eye_blink, "eye-blink curve(s) ignored (model-level eye opening is not applied)");
+    count(tally.lip_sync, "lip-sync curve(s) ignored (model-level mouth opening is not applied)");
     count(tally.dense_unusable, "dense curve(s) did not fit the assumed layout and were dropped");
     count(tally.non_finite, "curve(s) held a non-finite value and were dropped");
     count(tally.no_keys, "curve(s) had no keys and were dropped");
     count(tally.duplicates, "extra curve(s) on an already-driven parameter were dropped");
     count(tally.off_segments, "segment(s) are not exactly representable as Hermite keys (cubic misses the next key)");
+    if !tally.parts.is_empty() {
+        let mut ids: Vec<&str> = tally.parts.iter().flatten().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let unnamed = tally.parts.iter().filter(|p| p.is_none()).count();
+        let mut text = format!("{} part-opacity curve(s) ignored (part opacity is not applied)", tally.parts.len());
+        if !ids.is_empty() {
+            text.push_str(&format!(" on {}", ids.join(", ")));
+        }
+        if unnamed > 0 {
+            let sep = if ids.is_empty() { " on " } else { ", " };
+            text.push_str(&format!("{sep}{unnamed} on a part not named in this bundle"));
+        }
+        notes.push(text);
+    }
     for (what, n) in &tally.other {
         notes.push(format!("{n} binding(s) on {what} ignored"));
     }
@@ -363,18 +436,24 @@ mod tests {
     const SCRIPT_PARAM: i64 = 10;
     const SCRIPT_RENDER: i64 = 11;
     const SCRIPT_OTHER: i64 = 12;
+    const SCRIPT_PART: i64 = 13;
+    const SCRIPT_EYE: i64 = 14;
+    const SCRIPT_MOUTH: i64 = 15;
 
     fn resolver(p: PPtr) -> Option<String> {
         match p.path_id {
             SCRIPT_PARAM => Some(PARAMETER_CLASS.into()),
             SCRIPT_RENDER => Some(RENDER_CONTROLLER_CLASS.into()),
             SCRIPT_OTHER => Some("SomethingElse".into()),
+            SCRIPT_PART => Some(PART_CLASS.into()),
+            SCRIPT_EYE => Some(EYE_BLINK_CLASS.into()),
+            SCRIPT_MOUTH => Some(MOUTH_CLASS.into()),
             _ => None,
         }
     }
 
     fn table() -> NameTable {
-        NameTable::new(["ParamA", "ParamB", "ParamC"]).unwrap()
+        NameTable::new(["ParamA", "ParamB", "ParamC"]).unwrap().with_parts(["PartArm", "PartHead"])
     }
 
     fn binding(path: &str, script: i64, attribute: &str) -> GenericBinding {
@@ -590,6 +669,45 @@ mod tests {
         assert_eq!(report.len(), 1, "{text}");
         assert!(text.contains("1 binding(s) match no parameter in this model"), "{text}");
         assert!(text.contains("1 model-opacity curve(s) ignored"), "{text}");
+    }
+
+    #[test]
+    fn part_opacity_eye_blink_and_lip_sync_are_named_in_notes_and_make_no_curves() {
+        let c = clip(
+            (0..6).map(|_| vec![sk(0.0, [0.0; 3], 1.0)]).collect(),
+            vec![],
+            vec![
+                binding("Parts/PartArm", SCRIPT_PART, "Opacity"),
+                binding("Parts/PartHead", SCRIPT_PART, "Opacity"),
+                binding("Parts/PartNotHere", SCRIPT_PART, "Opacity"),
+                binding("", SCRIPT_EYE, "EyeOpening"),
+                binding("", SCRIPT_MOUTH, "MouthOpening"),
+                param("ParamA"),
+            ],
+        );
+        let (m, report) = convert(&c);
+        assert_eq!(m.curves.len(), 1);
+        assert_eq!(m.curves[0].target, "ParamA");
+        let text = report.to_string();
+        assert_eq!(report.len(), 1, "{text}");
+        assert!(text.contains("3 part-opacity curve(s) ignored"), "{text}");
+        assert!(text.contains("on PartArm, PartHead, 1 on a part not named in this bundle"), "{text}");
+        assert!(text.contains("1 eye-blink curve(s) ignored"), "{text}");
+        assert!(text.contains("1 lip-sync curve(s) ignored"), "{text}");
+        assert!(!text.contains("property 0x"), "none falls into the generic bucket: {text}");
+    }
+
+    #[test]
+    fn a_part_binding_on_another_property_stays_generic() {
+        let c = clip(
+            vec![vec![sk(0.0, [0.0; 3], 1.0)], vec![sk(0.0, [0.0; 3], 1.0)]],
+            vec![],
+            vec![binding("Parts/PartArm", SCRIPT_PART, "Something"), param("ParamA")],
+        );
+        let (_, report) = convert(&c);
+        let text = report.to_string();
+        assert!(text.contains("CubismPart property"), "{text}");
+        assert!(!text.contains("part-opacity"), "{text}");
     }
 
     #[test]
