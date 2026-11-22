@@ -16,8 +16,9 @@
 //!
 //! Read today: identifiers, counts, the canvas, parameter ranges, geometry,
 //! deformers, masks, and the evaluation that turns parameter values into a
-//! posed model. Motions can be evaluated and played once something supplies them. Not
-//! yet: physics, pose files and expressions.
+//! posed model. Motions can be evaluated and played once something supplies them, and
+//! a model's physics rig is simulated during playback ([`physics`]). Not yet: pose
+//! files and expressions.
 //!
 //! The model itself is [`CubismIr`], which lives in `a2d-core` because a
 //! package stores it (§9) and `a2d-pack` may not depend on a format crate.
@@ -35,6 +36,7 @@ pub mod eval;
 pub mod moc3;
 pub mod model;
 pub(crate) mod motion;
+pub mod physics;
 
 pub use emit::CubismEmit;
 pub use eval::{CubismEval, Pose};
@@ -43,3 +45,4 @@ pub use moc3::{
     MotionCurve, Parameter, ParameterBinding, RotationDeformer, RotationKeyform, WarpDeformer,
 };
 pub use model::GenericCubismModel;
+pub use physics::PhysicsState;
