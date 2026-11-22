@@ -13,6 +13,11 @@
 //! Crossfades and per-curve fades are not applied, and part-opacity targets are
 //! not driven; only parameter curves are.
 //!
+//! A model's physics rig, when it has one, runs after the motion (or idle) has
+//! written its values and before the pose is computed, every update. Its state
+//! survives a change of motion. [`AnimatedModel::pose_at`] replays it from rest
+//! so that a pose stays a function of the timestamp alone.
+//!
 //! When no motion is playing, [`AnimatedModel::update`] drives a small idle of
 //! its own, from Cubism's conventional parameter names. That is **synthetic
 //! motion**, not the character's: it exists so a viewer shows something alive
@@ -30,7 +35,8 @@ use a2d_core::{
 use crate::emit::CubismEmit;
 use crate::eval::{CubismEval, Pose};
 use crate::moc3::CubismIr;
-use crate::motion::MotionPlayer;
+use crate::motion::{wrap_time, MotionPlayer};
+use crate::physics::PhysicsState;
 
 /// Cubism's conventional parameter names, and how the idle moves each.
 ///
@@ -45,6 +51,13 @@ const IDLE: &[(&str, f32, f32)] = &[
     ("ParamBodyAngleX", 9.5, 0.18),
     ("ParamBreath", 3.4, 1.0),
 ];
+
+/// The frame rate [`AnimatedModel::pose_at`] replays physics at.
+const POSE_AT_FPS: f32 = 60.0;
+
+/// How much of the motion before the requested time `pose_at` replays the
+/// physics over, in seconds.
+const POSE_AT_WARM_UP: f32 = 10.0;
 
 /// A Cubism model, posed and drawable.
 pub struct GenericCubismModel {
@@ -69,6 +82,8 @@ pub struct GenericCubismModel {
     pending: Option<(usize, bool, f32)>,
     expressions: Vec<ExpressionInfo>,
     texture: TextureId,
+    /// The physics simulation, if the model has a rig with anything to simulate.
+    physics: Option<PhysicsState>,
 }
 
 impl GenericCubismModel {
@@ -91,6 +106,7 @@ impl GenericCubismModel {
         let animations: Vec<AnimationInfo> =
             moc.motions.iter().map(|m| AnimationInfo { name: m.name.clone(), duration: m.duration }).collect();
         let pose = moc.pose(&values);
+        let physics = moc.physics.as_ref().and_then(|p| PhysicsState::new(p, &moc.parameters));
         let mut model = GenericCubismModel {
             moc,
             name: display_name.into(),
@@ -103,6 +119,7 @@ impl GenericCubismModel {
             pending: None,
             expressions: Vec::new(),
             texture: TextureId(0),
+            physics,
         };
         // Open on the same kind of animation the Spine side does, rather than a
         // second rule for what a standing pose is called.
@@ -133,6 +150,9 @@ impl GenericCubismModel {
         if let Some(player) = &self.motion {
             player.apply(&self.moc, &mut self.values);
         }
+        // Physics outputs stay where the chain is rather than showing the new
+        // motion's raw values for a frame (a paused step writes without moving).
+        self.step_physics(0.0);
         self.repose();
     }
 
@@ -158,6 +178,12 @@ impl GenericCubismModel {
         true
     }
 
+    /// A parameter's current value by name, as the last update left it.
+    pub fn parameter_value(&self, id: &str) -> Option<f32> {
+        let index = self.moc.parameters.iter().position(|p| p.id == id)?;
+        self.values.get(index).copied()
+    }
+
     /// Which texture page the drawables sample.
     pub fn set_texture(&mut self, texture: TextureId) {
         self.texture = texture;
@@ -166,6 +192,14 @@ impl GenericCubismModel {
     /// Drawables whose deformer chain produced nothing usable.
     pub fn unstable(&self) -> &[usize] {
         &self.pose.unstable
+    }
+
+    /// Advances the physics by `dt` seconds over the values the motion or idle
+    /// just wrote. Does nothing for a model without a rig.
+    fn step_physics(&mut self, dt: f32) {
+        if let Some(physics) = &mut self.physics {
+            physics.step(dt, &mut self.values);
+        }
     }
 
     fn repose(&mut self) {
@@ -201,11 +235,12 @@ impl AnimatedModel for GenericCubismModel {
             if let Some(player) = player {
                 player.apply(&self.moc, &mut self.values);
             }
+            self.step_physics(step);
             self.repose();
             return Ok(());
         }
 
-        if self.motion.is_none() && self.idle.is_empty() {
+        if self.motion.is_none() && self.idle.is_empty() && self.physics.is_none() {
             // Nothing drives anything: only repose if something was left off rest.
             if self.values.iter().zip(&self.moc.parameters).any(|(v, p)| *v != p.default) {
                 self.reset_values();
@@ -227,6 +262,7 @@ impl AnimatedModel for GenericCubismModel {
                 }
             }
         }
+        self.step_physics(step);
         self.repose();
         Ok(())
     }
@@ -272,12 +308,38 @@ impl AnimatedModel for GenericCubismModel {
             .ok_or_else(|| RuntimeError::UnknownAnimation(animation.to_string()))?;
         self.pending = None;
         self.motion = MotionPlayer::new(&self.moc, index, true, 1.0);
-        if let Some(player) = &mut self.motion {
-            player.seek(&self.moc, time);
+        let duration = self.moc.motions.get(index).map_or(0.0, |m| m.duration);
+        let target = wrap_time(time, duration, false);
+        // Physics is replayed from rest in fixed frames, sampling the motion at
+        // each, so the pose depends on the timestamp alone. Only the last
+        // `POSE_AT_WARM_UP` seconds are replayed, which bounds the cost however
+        // long the motion is; a chain has all but settled by then. At least one
+        // frame, so time zero shows the first frame of playback rather than a
+        // rig that has never moved.
+        let start = (target - POSE_AT_WARM_UP).max(0.0);
+        let frames = if self.physics.is_some() { (((target - start) * POSE_AT_FPS).ceil() as u32).max(1) } else { 0 };
+        if let Some(physics) = &mut self.physics {
+            physics.reset();
         }
-        self.reset_values();
-        if let Some(player) = &self.motion {
-            player.apply(&self.moc, &mut self.values);
+        for frame in 1..=frames {
+            let at = (start + frame as f32 / POSE_AT_FPS).min(target);
+            if let Some(player) = &mut self.motion {
+                player.seek(&self.moc, at);
+            }
+            self.reset_values();
+            if let Some(player) = &self.motion {
+                player.apply(&self.moc, &mut self.values);
+            }
+            self.step_physics(1.0 / POSE_AT_FPS);
+        }
+        if let Some(player) = &mut self.motion {
+            player.seek(&self.moc, target);
+        }
+        if frames == 0 {
+            self.reset_values();
+            if let Some(player) = &self.motion {
+                player.apply(&self.moc, &mut self.values);
+            }
         }
         self.repose();
         Ok(())
@@ -291,6 +353,7 @@ impl AnimatedModel for GenericCubismModel {
         if self.motion.as_ref().is_some_and(|p| is(p.motion_index())) {
             self.motion = None;
             self.reset_values();
+            self.step_physics(0.0);
             self.repose();
         }
     }
@@ -332,6 +395,7 @@ impl AnimatedModel for GenericCubismModel {
         self.idle.clear();
         self.motion = None;
         self.pending = None;
+        self.physics = None;
     }
 
     fn display_name(&self) -> &str {
@@ -342,6 +406,10 @@ impl AnimatedModel for GenericCubismModel {
         // A curve aimed at a parameter the model lacks is not applied; say so
         // rather than letting the motion play with a part of it missing.
         for degradation in self.moc.unresolved_motion_targets() {
+            report.warn(degradation);
+        }
+        // The same for a physics input or output: the rig runs without it.
+        for degradation in self.moc.unresolved_physics_targets() {
             report.warn(degradation);
         }
     }
@@ -741,5 +809,262 @@ mod tests {
         let err = m.pose_at("Nope", 0.0).unwrap_err();
         assert!(matches!(err, RuntimeError::UnknownAnimation(_)), "{err}");
         assert!(matches!(model().pose_at("S", 0.0), Err(RuntimeError::UnknownAnimation(_))));
+    }
+
+    // ---- physics ----
+
+    use a2d_core::ir::cubism::{
+        NormRange, Physics, PhysicsComponent, PhysicsGroup, PhysicsInput, PhysicsNormalization, PhysicsOutput,
+        PhysicsParticle,
+    };
+
+    /// A rig where `input` (+-30) swings a two-particle chain whose first segment
+    /// writes `output`. Held at its maximum the input gives an angle of -10
+    /// degrees, and the chain settles on an output of +0.1745 (10 degrees in
+    /// radians).
+    fn rig(input: &str, output: &str, weight: f32) -> Physics {
+        Physics {
+            gravity: (0.0, -1.0),
+            wind: (0.0, 0.0),
+            groups: vec![PhysicsGroup {
+                inputs: vec![PhysicsInput {
+                    source: input.into(),
+                    component: PhysicsComponent::Angle,
+                    weight: 100.0,
+                    reflect: false,
+                }],
+                outputs: vec![PhysicsOutput {
+                    destination: output.into(),
+                    particle: 1,
+                    component: PhysicsComponent::Angle,
+                    scale: 1.0,
+                    weight,
+                    reflect: false,
+                }],
+                particles: vec![PhysicsParticle { mobility: 1.0, delay: 1.0, acceleration: 1.0, radius: 10.0 }; 2],
+                normalization: PhysicsNormalization {
+                    position: NormRange::new(-5.0, 5.0, 0.0),
+                    angle: NormRange::new(-10.0, 10.0, 0.0),
+                },
+            }],
+        }
+    }
+
+    fn with_physics(motions: Vec<Motion>, physics: Physics) -> GenericCubismModel {
+        let bytes = crate::moc3::tests::Builder::new().build();
+        let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+        ir.motions = motions;
+        ir.physics = Some(physics);
+        GenericCubismModel::load(ir, "test")
+    }
+
+    const SETTLED: f32 = 0.174_532_93;
+
+    fn frames(m: &mut GenericCubismModel, n: usize) {
+        for _ in 0..n {
+            m.update(Duration::from_millis(16)).expect("update");
+        }
+    }
+
+    /// A motion holding `ParamAngleX` at its maximum and `ParamEyeLOpen` at `eye`.
+    fn hold_both(name: &str, eye: f32) -> Motion {
+        let curve = |target: &str, v: f32| MotionCurve {
+            target: target.into(),
+            keys: vec![k(0.0, v, 0.0), k(1.0, v, 0.0)],
+            ..MotionCurve::default()
+        };
+        Motion {
+            name: name.into(),
+            duration: 1.0,
+            curves: vec![curve("ParamAngleX", 30.0), curve("ParamEyeLOpen", eye)],
+            ..Motion::default()
+        }
+    }
+
+    #[test]
+    fn physics_runs_after_the_motion_and_overwrites_its_curve_at_full_weight() {
+        let mut m = with_physics(vec![hold_both("Idle", 0.9)], rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+        m.update(Duration::from_millis(16)).expect("update");
+        let first = value(&m, "ParamEyeLOpen");
+        assert!(first < 0.5, "the curve's 0.9 must be replaced by the chain's output, got {first}");
+        frames(&mut m, 600);
+        assert!((value(&m, "ParamEyeLOpen") - SETTLED).abs() < 2e-3, "{}", value(&m, "ParamEyeLOpen"));
+        assert!(m.unstable().is_empty());
+    }
+
+    #[test]
+    fn a_partial_weight_blends_physics_over_the_motions_curve() {
+        let mut m = with_physics(vec![hold_both("Idle", 0.9)], rig("ParamAngleX", "ParamEyeLOpen", 25.0));
+        frames(&mut m, 600);
+        // 75 % of the curve's 0.9 and 25 % of the settled output.
+        let want = 0.75 * 0.9 + 0.25 * SETTLED;
+        assert!((value(&m, "ParamEyeLOpen") - want).abs() < 2e-3, "{}", value(&m, "ParamEyeLOpen"));
+    }
+
+    #[test]
+    fn physics_keeps_running_after_a_one_shot_motion_ends() {
+        let mut m = with_physics(vec![hold_both("Idle", 0.9)], rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+        m.play_animation("Idle", PlayOptions::once()).expect("known");
+        let mut steps = 0;
+        while m.motion.is_some() && steps < 200 {
+            m.update(Duration::from_millis(100)).expect("update");
+            steps += 1;
+        }
+        assert!(m.motion.is_none());
+        // The finished frame still shows the held input, so the chain still swings.
+        let eye = value(&m, "ParamEyeLOpen");
+        assert!(eye != 0.9 && eye != 1.0 && eye > 0.0, "{eye}");
+        frames(&mut m, 5);
+        assert!(value(&m, "ParamEyeLOpen") != eye, "the chain is still settling");
+    }
+
+    #[test]
+    fn physics_runs_even_when_nothing_else_drives_the_model() {
+        // No motion, and parameter names the idle does not know: only the physics
+        // has anything to say. The input rests at 30, its maximum.
+        let bytes = crate::moc3::tests::Builder::new().build();
+        let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+        ir.parameters = vec![
+            crate::moc3::Parameter { id: "In".into(), minimum: -30.0, maximum: 30.0, default: 30.0 },
+            crate::moc3::Parameter { id: "Out".into(), minimum: 0.0, maximum: 1.0, default: 0.0 },
+        ];
+        ir.physics = Some(rig("In", "Out", 100.0));
+        let mut m = GenericCubismModel::load(ir, "test");
+        assert!(m.idle.is_empty() && m.motion.is_none());
+        frames(&mut m, 600);
+        assert!((value(&m, "Out") - SETTLED).abs() < 2e-3, "{}", value(&m, "Out"));
+    }
+
+    #[test]
+    fn a_model_without_a_rig_is_unaffected() {
+        let mut with = with_physics(vec![hold_both("Idle", 0.9)], rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+        let mut without = with_motions(vec![hold_both("Idle", 0.9)]);
+        frames(&mut with, 10);
+        frames(&mut without, 10);
+        assert_eq!(value(&without, "ParamEyeLOpen"), 0.9);
+        assert!(value(&with, "ParamEyeLOpen") != 0.9);
+        assert!(without.physics.is_none());
+    }
+
+    #[test]
+    fn switching_motions_does_not_reset_the_physics() {
+        let motions = vec![hold_both("A", 0.9), hold_both("B", 0.2)];
+        let physics = || rig("ParamAngleX", "ParamEyeLOpen", 100.0);
+        let mut m = with_physics(motions.clone(), physics());
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        frames(&mut m, 600);
+        let settled = value(&m, "ParamEyeLOpen");
+        m.play_animation("B", PlayOptions::looping()).expect("known");
+        frames(&mut m, 1);
+        assert!((value(&m, "ParamEyeLOpen") - settled).abs() < 1e-3, "the chain carries over");
+        // A model that had only just started is nowhere near that after one frame.
+        let mut fresh = with_physics(motions, physics());
+        fresh.play_animation("B", PlayOptions::looping()).expect("known");
+        frames(&mut fresh, 1);
+        assert!((value(&fresh, "ParamEyeLOpen") - settled).abs() > 0.05);
+    }
+
+    #[test]
+    fn a_paused_frame_keeps_the_physics_output_instead_of_snapping_to_the_motion() {
+        let mut m = with_physics(vec![hold_both("Idle", 0.9)], rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+        frames(&mut m, 20);
+        let moving = value(&m, "ParamEyeLOpen");
+        m.update(Duration::ZERO).expect("update");
+        assert_eq!(value(&m, "ParamEyeLOpen"), moving);
+    }
+
+    #[test]
+    fn pose_at_with_physics_is_a_function_of_the_timestamp_alone() {
+        let motions = vec![sweep("S", "ParamAngleX", 40.0), hold_both("H", 0.9)];
+        let physics = || rig("ParamAngleX", "ParamEyeLOpen", 100.0);
+        let mut fresh = with_physics(motions.clone(), physics());
+        fresh.pose_at("S", 1.0).expect("known");
+        let once = value(&fresh, "ParamEyeLOpen");
+        fresh.pose_at("S", 1.0).expect("known");
+        assert_eq!(value(&fresh, "ParamEyeLOpen"), once, "same time twice");
+
+        let mut used = with_physics(motions.clone(), physics());
+        used.play_animation("H", PlayOptions::looping()).expect("known");
+        frames(&mut used, 123);
+        used.pose_at("S", 1.0).expect("known");
+        assert_eq!(used.values, fresh.values);
+        let (mut a, mut b) = (RenderList::new(), RenderList::new());
+        used.emit(&mut a);
+        fresh.emit(&mut b);
+        for (x, y) in a.meshes().iter().zip(b.meshes()) {
+            assert_eq!(x.vertices, y.vertices);
+        }
+
+        // And it really is simulated: not the motion's own value, and a later
+        // time differs from an earlier one.
+        let mut plain = with_motions(motions);
+        plain.pose_at("S", 1.0).expect("known");
+        let rest = plain.moc().parameter("ParamEyeLOpen").expect("p").default;
+        assert_eq!(value(&plain, "ParamEyeLOpen"), rest);
+        assert!(once > 0.0 && once != rest);
+        fresh.pose_at("S", 0.25).expect("known");
+        assert!(value(&fresh, "ParamEyeLOpen") != once);
+        // Time zero shows the first frame of playback, finite.
+        fresh.pose_at("S", 0.0).expect("known");
+        assert!(value(&fresh, "ParamEyeLOpen").is_finite());
+    }
+
+    #[test]
+    fn starting_or_stopping_a_motion_does_not_pop_the_physics_outputs() {
+        let motions = vec![hold_both("A", 0.9), hold_both("B", 0.7)];
+        let mut m = with_physics(motions, rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        frames(&mut m, 120);
+        let moving = value(&m, "ParamEyeLOpen");
+        assert!(moving < 0.5);
+        m.play_animation("B", PlayOptions::looping()).expect("known");
+        assert_eq!(value(&m, "ParamEyeLOpen"), moving, "not the new curve's 0.7");
+        m.stop_animation("B");
+        assert_eq!(value(&m, "ParamEyeLOpen"), moving, "not the default");
+    }
+
+    #[test]
+    fn pose_at_replays_only_a_bounded_window_so_a_huge_motion_returns_promptly() {
+        let mut long = hold_both("L", 0.9);
+        long.duration = 1.0e9;
+        long.curves[0].keys[1].time = 1.0e9;
+        long.curves[1].keys[1].time = 1.0e9;
+        let mut m = with_physics(vec![long.clone()], rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+        let start = std::time::Instant::now();
+        m.pose_at("L", 9.0e8).expect("known");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(value(&m, "ParamEyeLOpen").is_finite());
+
+        // A long but representable motion: the window is replayed and has settled.
+        let mut mid = hold_both("M", 0.9);
+        mid.duration = 1000.0;
+        mid.curves[0].keys[1].time = 1000.0;
+        mid.curves[1].keys[1].time = 1000.0;
+        let mut m = with_physics(vec![mid], rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+        m.pose_at("M", 900.0).expect("known");
+        assert!(
+            (value(&m, "ParamEyeLOpen") - SETTLED).abs() < 2e-3,
+            "settled inside the window: {}",
+            value(&m, "ParamEyeLOpen")
+        );
+
+        // Inside the window the replay still starts from rest: half a second is
+        // 30 frames, nowhere near settled.
+        let mut posed = with_physics(vec![long], rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+        posed.pose_at("L", 0.5).expect("known");
+        assert!((value(&posed, "ParamEyeLOpen") - SETTLED).abs() > 1e-3);
+    }
+
+    #[test]
+    fn unresolved_physics_targets_are_reported() {
+        let mut m = with_physics(vec![], rig("NoSuchInput", "NoSuchOutput", 100.0));
+        let mut report = a2d_core::LoadReport::new();
+        m.absorb_degradations(&mut report);
+        let text: Vec<String> = report.warnings().iter().map(|w| w.to_string()).collect();
+        assert_eq!(text.len(), 2, "{text:?}");
+        assert!(text.iter().any(|t| t.contains("NoSuchInput")) && text.iter().any(|t| t.contains("NoSuchOutput")));
+        // The rig still loads and does nothing harmful.
+        frames(&mut m, 5);
+        assert!(m.values.iter().all(|v| v.is_finite()));
     }
 }

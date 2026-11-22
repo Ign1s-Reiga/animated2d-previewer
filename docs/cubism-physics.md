@@ -7,9 +7,9 @@ only as serialized fields of one `MonoBehaviour`. This document records **what
 that layout is** and **how each claim was established**, separately from the
 code that reads it (`crates/a2d-import/src/unity_cubism/physics.rs`).
 
-Scope of the work this records: **recover, persist and report** the rig. Nothing
-simulates it yet; the IR (`a2d-core`'s `ir::cubism::Physics`) carries it and
-playback ignores it.
+Scope of the work this records: **recover, persist and report** the rig (sections
+1 to 6), and **simulate it during playback** (section 7). The IR (`a2d-core`'s
+`ir::cubism::Physics`) carries the rig; `crates/a2d-cubism/src/physics.rs` runs it.
 
 ---
 
@@ -197,3 +197,85 @@ that writes is a package that reads.
 * Three models are all that has been seen: groups with non-angle inputs on Y,
   or X/Y outputs, do not occur in them, so those branches are exercised only by
   hand-built bodies.
+
+## 7. Simulation
+
+The simulation was written from the algorithm as the public SDK describes it
+(read for understanding, not copied) and is **checked against hand-computed
+steps, not against the official runtime**. What is pinned, and by what:
+
+| Rule | Pinned by |
+|---|---|
+| Inputs: clamp, map through a piecewise-linear normalization pivoting on the range **midpoint** (not the parameter's default), negate unless reflected, weight/100 | unit tests with hand-computed values for both sides, an asymmetric range, reflect, clamp, a range with no width |
+| The translation is rotated by the negated angle with the engines' **in-place quirk** (the new `y` uses the already-replaced `x`) | a unit test of the helper, and a chain-root test where translation and angle are both non-zero (-0.8550504 against the -0.8682409 a true rotation gives) |
+| Particle update: gravity direction `(sin A, cos A)`, delay = Delay x dt x 30, a swing of the hanging direction by a fifth of the gravity turn, velocity and force terms, the link re-imposed at its radius, the x snap below 0.001 x position maximum, velocity with mobility | a hand-computed two-step pendulum (derived independently with plain double-precision arithmetic: particle (-0.476040, 9.988663), output +0.047622 rad, then (-0.548742, 9.984933), +0.054902 rad) |
+| Outputs: segment k against segment k-1 (k = 1 against the gravity reference), reflect, scale, clamp to the parameter, blend by weight/100 against what the parameter holds | settled-chain tests (10 degrees from straight down for k = 1, parallel for k = 2), X/Y scales, clamp, weight 25 blend |
+| Equilibrium | inputs at the midpoint give output exactly 0 forever |
+| Order: physics runs after the motion or idle and before the pose, on every update path, and the state survives a change of motion | model tests, including a motion that writes the output parameter itself |
+
+### Stepping
+
+The assets this was built for come from an SDK generation that runs **exactly one
+step per frame with the frame's own `dt`**: no fixed-rate accumulator, no
+interpolation of inputs. That is what is implemented. The newer SDKs' frame-rate
+accumulator and output interpolation are deliberately not: no source seen carries
+a frame rate (see section 6).
+
+### Deliberate divergences
+
+* **Sub-stepping.** A `dt` longer than 1/30 s is split into equal steps of at most
+  1/30 s, with the inputs held constant, and the outputs are written once after
+  the last. The source steps once however long the frame was, which swings
+  further after a hitch (a window drag, a debugger stop). The model already clamps
+  a frame to 0.1 s, so this is at most three steps; a direct caller is clamped to
+  one second. At 60 Hz or 30 Hz it is exactly the source's single step.
+* **A paused frame** (`dt` of zero, which the viewer sends while paused) moves
+  nothing, but a chain that has already moved still writes its outputs from where
+  it stopped. The model rebuilds every parameter from the motion each update, so
+  writing nothing would snap hair back to the motion's values for as long as the
+  viewer is paused.
+* **Non-finite numbers.** If a group's inputs or its chain turn non-finite, that
+  group is reset to hanging at rest and writes nothing that frame; no non-finite
+  value ever reaches a parameter. A zero-length link has no direction and
+  normalizes to zero (as the Unity generation does, using a threshold of 1e-5
+  quoted from memory), where the native framework would divide by zero.
+* **`pose_at`** (preview renders, visual tests) has to be a function of the
+  timestamp alone, so it resets the chain to rest and replays it from zero to the
+  timestamp in 1/60 s frames, sampling the motion at each. Only the last 10 seconds
+  before the timestamp are replayed (`POSE_AT_WARM_UP`), so the cost is bounded
+  however long the motion is and a viewer asking for frames of a very long motion
+  cannot hang; a chain has all but settled by then (a 5 s window left a few percent of a synthetic chain's swing unsettled, hence 10). It is still a pure function
+  of the timestamp. It uses at least one
+  frame so time zero already shows the first frame of playback. It is
+  deterministic but is not the pose a viewer that had played from some other
+  starting state would show.
+* **No stabilization** at start. The SDKs' immediate-stabilization API is not
+  called by anything in the generation these assets come from, so a model begins
+  playing from hanging at rest and settles visibly in its first moments.
+* The importer drops an output whose particle index is out of range (section 4);
+  evaluation therefore never has to skip one mid-group, which is where the SDK
+  generations disagree (`break` against `continue`).
+
+### What is not established
+
+* **No comparison with the official runtime.** The likeliest place for an error
+  that every unit test would miss is a sign convention (the negate-unless-reflected
+  input, which way is down, the in-place rotation), which shows up as hair swaying
+  the wrong way. `crates/a2d-cli/tests/real_physics.rs` drives the parameter that
+  feeds the most inputs on a real model and checks the first-segment outputs swing
+  the way the derivation in its doc comment predicts, for X and angle inputs,
+  reflected and not. That checks the implementation against the algorithm as
+  understood, so it guards a mirrored sway introduced by a code change; it cannot
+  catch a misreading shared by the derivation and the code.
+* The old SDK generation's execution order (physics after the animator) is taken
+  from the controller's own contract and a newer SDK's order table, not
+  re-verified for the older one.
+* **Weighted output with no motion curve (unverified).** In the source, an output
+  parameter that no motion drives blends against its own value from the previous
+  frame; here every parameter is rebuilt from its default each update, so in a
+  motion that does not curve a weight-25 output we settle at 0.25 x physics +
+  0.75 x default, while Unity converges to full physics unless the Animator's
+  Write Defaults writes the default back. Which applies depends on an Animator
+  setting we do not know. On the first model every output is curved in only 4 of 5
+  motions, and the other two models (the only ones with weight below 100) were not
+  checked.
