@@ -321,6 +321,103 @@ pub fn cubism_package(with_motion: bool) -> a2d_pack::Package {
     package
 }
 
+/// A synthetic Cubism package for animated draw order: two overlapping opaque
+/// quads, `A` red and `B` blue, in a 2 x 2 unit canvas.
+///
+/// Both are 1.0 x 1.0 units and span y -0.5..0.5 (the same either way up);
+/// `A` covers x -0.8..0.2 and `B` x -0.2..0.8, so they overlap on x -0.2..0.2.
+/// Each samples a patch of the texture that is one solid colour (the page is
+/// red on the left half, blue on the right), so a pixel's colour names the
+/// drawable on top there.
+///
+/// `ParamOrder` runs 0 -> 1. `B`'s draw order is 500 throughout; `A`'s is 400
+/// at 0 and 600 at 1, blended linearly, so `A` is behind `B` below 0.5, ties
+/// with it at 0.5 and is in front above. `tie_order` is the model's draw-order
+/// object list, which settles that tie. Motion "idle" (one second) drives
+/// `ParamOrder` linearly 0 -> 1, so at 0 / 0.25 / 0.5 / 1.0 s it is
+/// 0 / 0.25 / 0.5 / 1.
+pub fn cubism_draw_order_package(tie_order: Vec<u32>) -> a2d_pack::Package {
+    use a2d_core::ir::cubism::{
+        Canvas, CubismIr, CurveKey, Drawable, KeyformBinding, Keyforms, Motion, MotionCurve, Parameter,
+        ParameterBinding,
+    };
+
+    let drawable = |id: &str, begin: u32, u: f32| Drawable {
+        id: id.into(),
+        parent_deformer: None,
+        // A small patch well inside one half of the page.
+        uvs: vec![(u, 0.4), (u + 0.1, 0.4), (u, 0.6), (u + 0.1, 0.6)],
+        indices: vec![0, 1, 2, 2, 1, 3],
+        keyform_begin: begin,
+        keyform_count: 2,
+        keyform_binding: 0,
+        masks: vec![],
+        flags: 0,
+        part: None,
+        texture: 0,
+    };
+    // File y runs down and the runtime flips it; the quads are symmetric in y.
+    let quad = |x0: f32, x1: f32| [x0, -0.5, x1, -0.5, x0, 0.5, x1, 0.5];
+    let mut positions = Vec::new();
+    for (x0, x1) in [(-0.8, 0.2), (-0.8, 0.2), (-0.2, 0.8), (-0.2, 0.8)] {
+        positions.extend_from_slice(&quad(x0, x1));
+    }
+
+    let mut ir = CubismIr {
+        canvas: Canvas { pixels_per_unit: 100.0, origin: (100.0, 100.0), size: (200.0, 200.0) },
+        parameters: vec![Parameter { id: "ParamOrder".into(), minimum: 0.0, maximum: 1.0, default: 0.0 }],
+        part_ids: vec![],
+        deformer_ids: vec![],
+        drawable_ids: vec!["A".into(), "B".into()],
+        glue_ids: vec![],
+        glues: vec![],
+        glue_intensities: vec![],
+        drawables: vec![drawable("A", 0, 0.1), drawable("B", 2, 0.8)],
+        parameter_bindings: vec![ParameterBinding { parameter: 0, keys: vec![0.0, 1.0] }],
+        keyform_bindings: vec![KeyformBinding { axes: vec![0] }],
+        keyforms: Keyforms { positions, warp_offsets: vec![], drawable_offsets: vec![0, 8, 16, 24] },
+        draw_order: tie_order,
+        drawable_keyform_opacities: vec![1.0; 4],
+        warp_keyform_opacities: vec![],
+        physics: None,
+        drawable_keyform_draw_orders: vec![400.0, 600.0, 500.0, 500.0],
+        ..CubismIr::default()
+    };
+    // Value 0 -> 1 over one second at slope 1 per second: exactly linear.
+    let key = |time: f32, value: f32| CurveKey { time, value, in_slope: 1.0, out_slope: 1.0, stepped: false };
+    ir.motions = vec![Motion {
+        name: "idle".into(),
+        duration: 1.0,
+        curves: vec![MotionCurve {
+            target: "ParamOrder".into(),
+            keys: vec![key(0.0, 0.0), key(1.0, 1.0)],
+            ..MotionCurve::default()
+        }],
+        ..Motion::default()
+    }];
+
+    // Red left half, blue right half, fully opaque.
+    let (w, h) = (64u32, 64u32);
+    let mut image = a2d_render::Rgba8Image::solid(w, h, [0, 0, 255, 255]);
+    for y in 0..h {
+        for x in 0..w / 2 {
+            let at = ((y * w + x) * 4) as usize;
+            image.pixels[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+    }
+    let mut package = a2d_pack::Package::from_cubism(ir, "synthetic-draw-order", "cubism-moc3-v3");
+    package.manifest.textures.push(a2d_pack::TextureEntry {
+        file: "texture_00.png".into(),
+        size: Some([w, h]),
+        premultiplied_alpha: false,
+    });
+    package.textures.push(a2d_pack::TextureFile {
+        file: "texture_00.png".into(),
+        bytes: a2d_render::encode_png(&image).expect("the page should encode"),
+    });
+    package
+}
+
 /// A headless GPU, or `None` to skip. `A2D_REQUIRE_GPU` turns the skip into a
 /// failure, for machines that should have an adapter.
 pub fn gpu() -> Option<a2d_render::GpuContext> {

@@ -181,12 +181,37 @@ mod section {
     /// its keyforms blend to. See [`RotationDeformer::base_angle`].
     pub const ROTATION_BASE_ANGLE: usize = 28;
 
-    /// The drawables in the order they are painted, back to front.
+    /// Draw-order groups, sections 81 to 85, one entry per group (count slot
+    /// 18): where the group's object list begins in the flat object arrays,
+    /// how many objects it holds directly, how many it holds counting nested
+    /// groups, and the largest and smallest draw order among its drawables.
+    pub const DRAW_GROUP_OBJECT_BEGIN: usize = 81;
+    pub const DRAW_GROUP_OBJECT_COUNT: usize = 82;
+    /// Not read: it equals the direct count whenever nothing is nested.
+    #[allow(dead_code)]
+    pub const DRAW_GROUP_TOTAL_OBJECT_COUNT: usize = 83;
+    /// Not read; recorded because on every real model they equal the maximum
+    /// and minimum of [`DRAWABLE_KEYFORM_DRAW_ORDER`], which is what makes the
+    /// grouping reading of these sections credible.
+    #[allow(dead_code)]
+    pub const DRAW_GROUP_MAX_DRAW_ORDER: usize = 84;
+    #[allow(dead_code)]
+    pub const DRAW_GROUP_MIN_DRAW_ORDER: usize = 85;
+    /// Draw-order group objects, sections 86 to 88, one entry per object (count
+    /// slot 19): the kind (0 art mesh, 1 part), the drawable or part it names,
+    /// and the group it opens when it is a part (-1 for none).
+    pub const DRAW_OBJECT_TYPE: usize = 86;
+    /// The object list of a draw-order group, as drawable indices when the
+    /// type is 0.
     ///
-    /// Slot `k` names the drawable drawn `k`-th. It is **not** a per-drawable
-    /// key saying where each one sits -- reading it that way is the inverse
-    /// permutation, and it draws the face skin over the eyes.
-    pub const DRAWABLE_DRAW_ORDER: usize = 87;
+    /// This is **not** a paint sequence: drawing it as given is wrong at rest on
+    /// three of the four models checked (on the fourth the list alone is
+    /// exact). It orders drawables only among those with an equal draw order
+    /// -- the earlier entry paints first. Reading it as a per-drawable key
+    /// instead gives the inverse permutation, which draws the face skin over
+    /// the eyes.
+    pub const DRAW_OBJECT_INDEX: usize = 87;
+    pub const DRAW_OBJECT_SELF_INDEX: usize = 88;
     pub const DRAWABLE_KEYFORM_BINDING: usize = 34;
     pub const DRAWABLE_KEYFORM_BEGIN: usize = 35;
     pub const DRAWABLE_KEYFORM_COUNT: usize = 36;
@@ -220,10 +245,11 @@ mod section {
     pub const DRAWABLE_KEYFORM_OPACITY: usize = 68;
     /// Draw order carried by each *drawable* keyform.
     ///
-    /// Identified the same way: one float per drawable keyform, spanning 499 to
-    /// 1000 with a resting value of 510. Cubism's draw order runs 0 to 1000
-    /// about a default of 500, so this is the animated order, distinct from the
-    /// fixed one in [`DRAWABLE_DRAW_ORDER`].
+    /// Identified the same way: one float per drawable keyform, spanning 200 to
+    /// 1000 across the real models measured, most values at 500. Cubism's draw
+    /// order runs 0 to 1000 about a default of 500, so this is the animated
+    /// order that decides the painting, with the
+    /// tie-break list in [`DRAW_OBJECT_INDEX`].
     pub const DRAWABLE_KEYFORM_DRAW_ORDER: usize = 69;
     /// Opacity carried by each *warp* deformer keyform.
     ///
@@ -250,6 +276,10 @@ mod count {
     pub const ROTATION_DEFORMERS: usize = 3;
     pub const DRAWABLES: usize = 4;
     pub const PARAMETERS: usize = 5;
+    /// Draw-order groups.
+    pub const DRAW_GROUPS: usize = 18;
+    /// Objects across every draw-order group.
+    pub const DRAW_OBJECTS: usize = 19;
     pub const GLUES: usize = 20;
     /// Total entries across every glue's pair list.
     pub const GLUE_PAIR_ENTRIES: usize = 21;
@@ -398,10 +428,8 @@ impl Moc3 {
         let keyforms = read_keyforms(bytes, &sections, &warp_deformers, &drawables)?;
         let (glues, glue_intensities) =
             read_glues(bytes, &sections, &counts, &drawables, &keyform_bindings, &parameter_bindings)?;
-        let draw_order = {
-            let at = section_offset(&sections, section::DRAWABLE_DRAW_ORDER, "drawable draw order")?;
-            (0..drawables.len()).map(|i| u32_at(bytes, at + i * 4)).collect::<Result<Vec<u32>, _>>()?
-        };
+        let mut notes = Vec::new();
+        let draw_order = read_draw_order(bytes, &sections, drawables.len(), &mut notes)?;
 
         // A model that predates these sections, or one whose layout moved them,
         // is read without them rather than refused: a drawn model missing its
@@ -412,12 +440,31 @@ impl Moc3 {
             read_floats(bytes, &sections, index, drawable_keyform_count, what).unwrap_or_default()
         };
         let drawable_keyform_opacities = optional(section::DRAWABLE_KEYFORM_OPACITY, "drawable opacity");
-        let drawable_keyform_draw_orders = optional(section::DRAWABLE_KEYFORM_DRAW_ORDER, "drawable draw order");
+        // The draw-order track decides paint order, so it is held to the warp
+        // opacity standard below rather than the lenient one above: only a
+        // section the file does not have is tolerated, and that is reported.
+        let drawable_keyform_draw_orders = if drawable_keyform_count == 0 {
+            Vec::new()
+        } else if section_offset(&sections, section::DRAWABLE_KEYFORM_DRAW_ORDER, "drawable draw order").is_err() {
+            notes.push("no drawable draw-order track; drawables are painted in object-list order".to_string());
+            Vec::new()
+        } else {
+            let values = read_floats(
+                bytes,
+                &sections,
+                section::DRAWABLE_KEYFORM_DRAW_ORDER,
+                drawable_keyform_count,
+                "drawable draw order",
+            )?;
+            if let Some(bad) = values.iter().find(|v| !v.is_finite()) {
+                return Err(DecodeError::corrupt(format!("a drawable keyform draw order of {bad} is not finite")));
+            }
+            values
+        };
         // Warp opacity is held to a stricter standard than the two above: it
         // hides whole subtrees, so a section that is present but runs past the
         // data, or holds a value outside [0, 1], is an error. Only a section
         // the file does not have at all is tolerated, and reported.
-        let mut notes = Vec::new();
         let warp_keyform_count = keyforms.warp_offsets.len() as u32;
         let warp_keyform_opacities = if warp_keyform_count == 0 {
             Vec::new()
@@ -1486,6 +1533,140 @@ fn counts_at(bytes: &[u8], sections: &[u32], index: usize) -> Result<u32, Decode
     u32_at(bytes, at + index * 4)
 }
 
+/// Reads the draw-order groups and returns the tie-break order: the drawables
+/// in the order their group lists them, every drawable exactly once.
+///
+/// The simple shape every real model has -- one group, every object an art
+/// mesh, no nesting, each drawable listed once -- reads straight through. Any
+/// other shape (nested groups, part objects, a second group, a repeated or
+/// out-of-range entry) is not understood well enough to paint by, so it is
+/// reported in `notes` and reduced to the art-mesh objects in list order, with
+/// whatever they leave out appended. Nothing is dropped silently, and nothing
+/// the caller indexes with can be out of range.
+fn read_draw_order(
+    bytes: &[u8],
+    sections: &[u32],
+    drawables: usize,
+    notes: &mut Vec<String>,
+) -> Result<Vec<u32>, DecodeError> {
+    let list_at = section_offset(sections, section::DRAW_OBJECT_INDEX, "draw-order object list")?;
+    if drawables == 0 {
+        return Ok(Vec::new());
+    }
+    let group_sections = [
+        section::DRAW_GROUP_OBJECT_BEGIN,
+        section::DRAW_GROUP_OBJECT_COUNT,
+        section::DRAW_OBJECT_TYPE,
+        section::DRAW_OBJECT_SELF_INDEX,
+    ];
+    let present = group_sections.iter().filter(|i| section_offset(sections, **i, "draw-order group").is_ok()).count();
+    // All or none: a file with only some of the group sections is not a layout
+    // this decoder knows, and reading the flat list from it would guess.
+    if present != 0 && present != group_sections.len() {
+        return Err(DecodeError::corrupt(format!(
+            "only {present} of the {} draw-order group sections are present; they come all together or not at all",
+            group_sections.len()
+        )));
+    }
+    let located = present == group_sections.len();
+
+    // (kind, index, self index) per object, plus (begin, count) per group.
+    let mut objects: Vec<(u32, u32, u32)> = Vec::new();
+    let mut groups: Vec<(u32, u32)> = Vec::new();
+    if located {
+        let group_count = checked_count(counts_at(bytes, sections, count::DRAW_GROUPS)?, 8, bytes, "draw-order group")?;
+        let object_count =
+            checked_count(counts_at(bytes, sections, count::DRAW_OBJECTS)?, 12, bytes, "draw-order object")?;
+        let at = |index: usize, what: &str| section_offset(sections, index, what);
+        let begin_at = at(section::DRAW_GROUP_OBJECT_BEGIN, "draw-order group")?;
+        let size_at = at(section::DRAW_GROUP_OBJECT_COUNT, "draw-order group")?;
+        for g in 0..group_count {
+            groups.push((u32_at(bytes, begin_at + g * 4)?, u32_at(bytes, size_at + g * 4)?));
+        }
+        let kind_at = at(section::DRAW_OBJECT_TYPE, "draw-order object")?;
+        let self_at = at(section::DRAW_OBJECT_SELF_INDEX, "draw-order object")?;
+        for o in 0..object_count {
+            objects.push((
+                u32_at(bytes, kind_at + o * 4)?,
+                u32_at(bytes, list_at + o * 4)?,
+                u32_at(bytes, self_at + o * 4)?,
+            ));
+        }
+    } else {
+        // A layout without the group sections still carries the list, one
+        // entry per drawable, which is how it was read before they were known.
+        for o in 0..drawables {
+            objects.push((0, u32_at(bytes, list_at + o * 4)?, u32::MAX));
+        }
+        groups.push((0, drawables as u32));
+        notes
+            .push("the source has no draw-order group sections; its object list is read as one flat group".to_string());
+    }
+
+    let mut seen = vec![false; drawables];
+    let (mut out_of_range, mut duplicates, mut non_meshes, mut nested) = (0usize, 0usize, 0usize, 0usize);
+    let mut order: Vec<u32> = Vec::with_capacity(drawables);
+    for (kind, index, self_index) in &objects {
+        if *self_index != u32::MAX {
+            nested += 1;
+        }
+        if *kind != 0 {
+            non_meshes += 1;
+            continue;
+        }
+        match seen.get_mut(*index as usize) {
+            None => out_of_range += 1,
+            Some(true) => duplicates += 1,
+            Some(slot) => {
+                *slot = true;
+                order.push(*index);
+            }
+        }
+    }
+    let missing = seen.iter().filter(|s| !**s).count();
+    let flat_group = groups.len() == 1 && groups[0] == (0, objects.len() as u32);
+    let simple = flat_group
+        && nested == 0
+        && non_meshes == 0
+        && out_of_range == 0
+        && duplicates == 0
+        && objects.len() == drawables;
+    if !simple {
+        let mut issues = Vec::new();
+        if groups.len() != 1 {
+            issues.push(format!("{} groups", groups.len()));
+        } else if !flat_group {
+            issues.push("a group that does not span its whole object list".to_string());
+        }
+        if non_meshes > 0 {
+            issues.push(format!("{non_meshes} objects that are not art meshes"));
+        }
+        if nested > 0 {
+            issues.push(format!("{nested} objects with a self index"));
+        }
+        if out_of_range > 0 {
+            issues.push(format!("{out_of_range} entries naming no drawable"));
+        }
+        if duplicates > 0 {
+            issues.push(format!("{duplicates} repeated entries"));
+        }
+        if missing > 0 {
+            issues.push(format!("{missing} drawables left out"));
+        }
+        if objects.len() != drawables {
+            issues.push(format!("{} objects for {drawables} drawables", objects.len()));
+        }
+        notes.push(format!(
+            "draw-order groups of an unsupported shape ({}); parts are ignored and drawables are painted by their \
+             own draw order, ties broken by their order in the object list",
+            issues.join(", ")
+        ));
+    }
+    // Drawables the list left out go last, in model order.
+    order.extend((0..drawables as u32).filter(|i| !seen[*i as usize]));
+    Ok(order)
+}
+
 fn read_floats(bytes: &[u8], sections: &[u32], index: usize, count: u32, what: &str) -> Result<Vec<f32>, DecodeError> {
     if count == 0 {
         return Ok(Vec::new());
@@ -1634,6 +1815,149 @@ pub(crate) mod tests {
         assert!(moc.drawables[0].masks.is_empty(), "the mask itself is not masked");
         assert_eq!(moc.drawables[1].masks, [0], "the second drawable clips to the first");
         assert_eq!(moc.drawables[1].blend_mode(), a2d_core::BlendMode::Multiply);
+    }
+
+    /// Parses a three-drawable model with the given group shape.
+    fn with_shape(objects: &[(u32, u32, u32)], groups: &[(u32, u32)]) -> Moc3 {
+        Moc3::parse(&Builder::new().drawables(3).group_shape(objects, groups).build()).expect("fixture")
+    }
+
+    const NONE: u32 = u32::MAX;
+
+    #[test]
+    fn the_simple_draw_order_group_decodes_without_a_note() {
+        // One group, every object an art mesh, no self index, each drawable
+        // once: the list is read as it stands.
+        let moc = with_shape(&[(0, 2, NONE), (0, 0, NONE), (0, 1, NONE)], &[(0, 3)]);
+        assert_eq!(moc.draw_order, [2, 0, 1]);
+        assert!(moc.notes.is_empty(), "{:?}", moc.notes);
+        // The builder's own default shape is the same thing.
+        let default = Moc3::parse(&Builder::new().drawables(3).build()).expect("fixture");
+        assert_eq!(default.draw_order, [1, 2, 0]);
+        assert!(default.notes.is_empty(), "{:?}", default.notes);
+    }
+
+    #[test]
+    fn an_unsupported_group_shape_is_reported_and_falls_back_to_the_drawable_objects() {
+        type Case = (&'static str, Vec<(u32, u32, u32)>, Vec<(u32, u32)>, [u32; 3], &'static str);
+        let cases: [Case; 6] = [
+            // A part object is dropped; the drawables keep list order.
+            (
+                "part",
+                vec![(0, 2, NONE), (1, 0, NONE), (0, 0, NONE), (0, 1, NONE)],
+                vec![(0, 4)],
+                [2, 0, 1],
+                "not art meshes",
+            ),
+            // A self index means the object opens a nested group.
+            ("self", vec![(0, 1, NONE), (0, 0, 0), (0, 2, NONE)], vec![(0, 3)], [1, 0, 2], "self index"),
+            // Two groups: the objects are still read in list order.
+            ("two groups", vec![(0, 2, NONE), (0, 1, NONE), (0, 0, NONE)], vec![(0, 2), (2, 1)], [2, 1, 0], "2 groups"),
+            // A repeat keeps its first place; the one left out goes last.
+            ("duplicate", vec![(0, 1, NONE), (0, 1, NONE), (0, 0, NONE)], vec![(0, 3)], [1, 0, 2], "repeated"),
+            // An index past the drawables is ignored; the missing one is appended.
+            (
+                "out of range",
+                vec![(0, 2, NONE), (0, 7, NONE), (0, 0, NONE)],
+                vec![(0, 3)],
+                [2, 0, 1],
+                "naming no drawable",
+            ),
+            // Fewer objects than drawables.
+            ("short", vec![(0, 2, NONE)], vec![(0, 1)], [2, 0, 1], "1 objects for 3 drawables"),
+        ];
+        for (name, objects, groups, expected, text) in cases {
+            let moc = with_shape(&objects, &groups);
+            assert_eq!(moc.draw_order, expected, "{name}");
+            assert_eq!(moc.notes.len(), 1, "{name}: {:?}", moc.notes);
+            assert!(moc.notes[0].contains("draw-order groups"), "{name}: {:?}", moc.notes);
+            assert!(moc.notes[0].contains(text), "{name}: {:?}", moc.notes);
+            // Whatever the shape, every drawable is named exactly once.
+            let mut sorted = moc.draw_order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, [0, 1, 2], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_group_that_does_not_span_its_objects_is_reported() {
+        let moc = with_shape(&[(0, 0, NONE), (0, 1, NONE), (0, 2, NONE)], &[(1, 2)]);
+        assert_eq!(moc.draw_order, [0, 1, 2]);
+        assert_eq!(moc.notes.len(), 1, "{:?}", moc.notes);
+        assert!(moc.notes[0].contains("does not span"), "{:?}", moc.notes);
+    }
+
+    #[test]
+    fn a_layout_without_the_group_sections_reads_the_flat_list_and_says_so() {
+        let moc = Moc3::parse(&Builder::new().drawables(3).without_groups().build()).expect("fixture");
+        assert_eq!(moc.draw_order, [1, 2, 0]);
+        assert_eq!(moc.notes.len(), 1, "{:?}", moc.notes);
+        assert!(moc.notes[0].contains("no draw-order group sections"), "{:?}", moc.notes);
+    }
+
+    #[test]
+    fn a_draw_order_object_count_the_file_cannot_hold_is_refused() {
+        let mut bytes = Builder::new().drawables(3).build();
+        patch_u32(&mut bytes, section::COUNTS, count::DRAW_OBJECTS, u32::MAX);
+        let err = Moc3::parse(&bytes).expect_err("an absurd count must not allocate");
+        assert!(err.to_string().contains("draw-order object"), "{err}");
+    }
+
+    #[test]
+    fn a_draw_order_section_that_runs_past_the_file_is_refused() {
+        let bytes = Builder::new().drawables(3).build();
+        let mut bad = bytes.clone();
+        // Point the object list at the last two bytes: three words cannot fit.
+        let slot = 0x40 + section::DRAW_OBJECT_INDEX * 4;
+        bad[slot..slot + 4].copy_from_slice(&((bytes.len() - 2) as u32).to_le_bytes());
+        assert!(Moc3::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn an_absent_draw_order_track_is_noted() {
+        let moc = Moc3::parse(&Builder::new().without_draw_order_track().build()).expect("still loads");
+        assert!(moc.drawable_keyform_draw_orders.is_empty());
+        assert_eq!(moc.notes.len(), 1, "{:?}", moc.notes);
+        assert!(moc.notes[0].contains("no drawable draw-order track"), "{:?}", moc.notes);
+        let complete = Moc3::parse(&Builder::new().build()).expect("fixture");
+        assert_eq!(complete.drawable_keyform_draw_orders.len(), 3);
+        assert!(complete.notes.is_empty(), "{:?}", complete.notes);
+    }
+
+    #[test]
+    fn a_truncated_draw_order_track_is_an_error() {
+        let bytes = Builder::new().build();
+        let mut bad = bytes.clone();
+        // Point section 69 at the last four bytes: three floats cannot fit.
+        let slot = 0x40 + section::DRAWABLE_KEYFORM_DRAW_ORDER * 4;
+        bad[slot..slot + 4].copy_from_slice(&((bytes.len() - 4) as u32).to_le_bytes());
+        let err = Moc3::parse(&bad).expect_err("a track past the data must not read as empty");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn a_non_finite_draw_order_is_refused() {
+        let err = Moc3::parse(&Builder::new().draw_orders(&[500.0, f32::NAN, 500.0]).build())
+            .expect_err("a NaN draw order must be refused");
+        assert!(err.to_string().contains("not finite"), "{err}");
+    }
+
+    #[test]
+    fn some_but_not_all_group_sections_is_corrupt() {
+        for index in [
+            section::DRAW_GROUP_OBJECT_BEGIN,
+            section::DRAW_GROUP_OBJECT_COUNT,
+            section::DRAW_OBJECT_TYPE,
+            section::DRAW_OBJECT_SELF_INDEX,
+        ] {
+            let mut bytes = Builder::new().drawables(3).build();
+            let slot = 0x40 + index * 4;
+            bytes[slot..slot + 4].copy_from_slice(&0u32.to_le_bytes());
+            let err = Moc3::parse(&bytes).expect_err("a partial layout must not be guessed at");
+            assert!(err.to_string().contains("draw-order group sections"), "section {index}: {err}");
+        }
+        // None at all is the legacy flat list, covered above.
+        assert!(Moc3::parse(&Builder::new().drawables(3).without_groups().build()).is_ok());
     }
 
     /// Overwrites one u32 of a built file: entry `at` of section `index`.
@@ -1795,6 +2119,19 @@ pub(crate) mod tests {
         /// Vertex count of each drawable, or none for three each. A count of
         /// zero gives an empty placeholder mesh with no indices.
         vertex_counts: Option<Vec<usize>>,
+        /// Draw order of each drawable keyform, in keyform order, or none for
+        /// the resting value of 510.
+        draw_orders: Option<Vec<f32>>,
+        /// The draw-order group objects as (kind, index, self index), or none
+        /// for one art mesh per drawable in the rotated default sequence.
+        objects: Option<Vec<(u32, u32, u32)>>,
+        /// The draw-order groups as (begin, count), or none for one group
+        /// spanning every object.
+        groups: Option<Vec<(u32, u32)>>,
+        /// Leaves the group sections 81 to 86 and 88 out.
+        omit_groups: bool,
+        /// Leaves the drawable draw-order section out.
+        omit_draw_order_track: bool,
     }
 
     impl Builder {
@@ -1818,7 +2155,40 @@ pub(crate) mod tests {
                 omit_warp_opacity: false,
                 rotation_opacities: None,
                 vertex_counts: None,
+                draw_orders: None,
+                objects: None,
+                groups: None,
+                omit_groups: false,
+                omit_draw_order_track: false,
             }
+        }
+
+        /// Sets the draw order of every drawable keyform, in keyform order.
+        /// Each drawable has three keyforms, keyed at -30, 0 and 30 on the
+        /// first parameter (six with `two_axis`).
+        pub(crate) fn draw_orders(mut self, values: &[f32]) -> Self {
+            self.draw_orders = Some(values.to_vec());
+            self
+        }
+
+        /// Sets the draw-order object list as drawable indices, every object an
+        /// art mesh with no self index, in one group spanning all of them.
+        pub(crate) fn tie_order(mut self, list: &[u32]) -> Self {
+            self.objects = Some(list.iter().map(|i| (0, *i, u32::MAX)).collect());
+            self
+        }
+
+        /// Sets the draw-order objects and groups outright.
+        pub(crate) fn group_shape(mut self, objects: &[(u32, u32, u32)], groups: &[(u32, u32)]) -> Self {
+            self.objects = Some(objects.to_vec());
+            self.groups = Some(groups.to_vec());
+            self
+        }
+
+        /// Writes only the object list, as a layout without the group sections.
+        pub(crate) fn without_groups(mut self) -> Self {
+            self.omit_groups = true;
+            self
         }
 
         /// Sets each drawable's vertex count; zero makes it an empty mesh.
@@ -1831,6 +2201,12 @@ pub(crate) mod tests {
         /// the section is written with every value one.
         pub(crate) fn warp_opacities(mut self, values: &[f32]) -> Self {
             self.warp_opacities = Some(values.to_vec());
+            self
+        }
+
+        /// Writes no drawable draw-order section at all.
+        pub(crate) fn without_draw_order_track(mut self) -> Self {
+            self.omit_draw_order_track = true;
             self
         }
 
@@ -2058,7 +2434,27 @@ pub(crate) mod tests {
             // inverse, so reading this table the wrong way round would be
             // invisible against one.
             let sequence: Vec<u32> = (0..d as u32).map(|k| (k + 1) % d as u32).collect();
-            offsets[section::DRAWABLE_DRAW_ORDER] = place(&mut body, &u32_array(&sequence));
+            let objects: Vec<(u32, u32, u32)> =
+                self.objects.clone().unwrap_or_else(|| sequence.iter().map(|i| (0, *i, u32::MAX)).collect());
+            let groups: Vec<(u32, u32)> = self.groups.clone().unwrap_or_else(|| vec![(0, objects.len() as u32)]);
+            counts[count::DRAW_GROUPS] = groups.len() as u32;
+            counts[count::DRAW_OBJECTS] = objects.len() as u32;
+            // Written even when empty, so the section is located either way.
+            let list: Vec<u32> = objects.iter().map(|o| o.1).collect();
+            offsets[section::DRAW_OBJECT_INDEX] = place(&mut body, &u32_array(&list));
+            if !self.omit_groups {
+                let begins: Vec<u32> = groups.iter().map(|g| g.0).collect();
+                let sizes: Vec<u32> = groups.iter().map(|g| g.1).collect();
+                offsets[section::DRAW_GROUP_OBJECT_BEGIN] = place(&mut body, &u32_array(&begins));
+                offsets[section::DRAW_GROUP_OBJECT_COUNT] = place(&mut body, &u32_array(&sizes));
+                offsets[section::DRAW_GROUP_TOTAL_OBJECT_COUNT] = place(&mut body, &u32_array(&sizes));
+                offsets[section::DRAW_GROUP_MAX_DRAW_ORDER] = place(&mut body, &u32_array(&vec![1000; groups.len()]));
+                offsets[section::DRAW_GROUP_MIN_DRAW_ORDER] = place(&mut body, &u32_array(&vec![0; groups.len()]));
+                let kinds: Vec<u32> = objects.iter().map(|o| o.0).collect();
+                let selves: Vec<u32> = objects.iter().map(|o| o.2).collect();
+                offsets[section::DRAW_OBJECT_TYPE] = place(&mut body, &u32_array(&kinds));
+                offsets[section::DRAW_OBJECT_SELF_INDEX] = place(&mut body, &u32_array(&selves));
+            }
             offsets[section::DRAWABLE_KEYFORM_BINDING] = place(&mut body, &u32_array(&vec![0u32; d]));
             offsets[section::DRAWABLE_KEYFORM_BEGIN] = place(&mut body, &u32_array(&d_begin));
             offsets[section::DRAWABLE_KEYFORM_COUNT] = place(&mut body, &u32_array(&vec![per_element as u32; d]));
@@ -2174,15 +2570,20 @@ pub(crate) mod tests {
             let pool_bytes: Vec<u8> = pool.iter().flat_map(|v| v.to_le_bytes()).collect();
             offsets[section::KEYFORM_POSITIONS] = place(&mut body, &pool_bytes);
 
-            if let Some(values) = &self.opacities {
+            if self.opacities.is_some() || self.draw_orders.is_some() {
                 let mut opacity = vec![1.0f32; d * per_element];
-                for (slot, v) in opacity.iter_mut().zip(values) {
+                for (slot, v) in opacity.iter_mut().zip(self.opacities.iter().flatten()) {
                     *slot = *v;
                 }
                 let bytes: Vec<u8> = opacity.iter().flat_map(|v| v.to_le_bytes()).collect();
                 offsets[section::DRAWABLE_KEYFORM_OPACITY] = place(&mut body, &bytes);
-                let orders: Vec<u8> =
-                    std::iter::repeat_n(510.0f32, d * per_element).flat_map(|v| v.to_le_bytes()).collect();
+            }
+            if !self.omit_draw_order_track {
+                let mut order = vec![510.0f32; d * per_element];
+                for (slot, v) in order.iter_mut().zip(self.draw_orders.iter().flatten()) {
+                    *slot = *v;
+                }
+                let orders: Vec<u8> = order.iter().flat_map(|v| v.to_le_bytes()).collect();
                 offsets[section::DRAWABLE_KEYFORM_DRAW_ORDER] = place(&mut body, &orders);
             }
 

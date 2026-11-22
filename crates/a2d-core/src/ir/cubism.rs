@@ -365,8 +365,11 @@ pub struct CubismIr {
     pub keyform_bindings: Vec<KeyformBinding>,
     /// The keyform coordinate pool, undivided.
     pub keyforms: Keyforms,
-    /// The drawables in the order they are painted, back to front: entry `k`
-    /// is the index of the drawable drawn `k`-th.
+    /// The tie-break order for painting: every drawable exactly once, as the
+    /// model's draw-order group lists them. It is **not** the paint sequence.
+    /// Drawables are painted back to front by their blended draw order (see
+    /// [`CubismIr::drawable_keyform_draw_orders`]) rounded to an integer, and
+    /// where two are equal the one listed earlier here is painted first.
     pub draw_order: Vec<u32>,
     /// Opacity of each drawable keyform, in the same order as
     /// [`Keyforms::drawable_offsets`]. Empty when the source carried none, in

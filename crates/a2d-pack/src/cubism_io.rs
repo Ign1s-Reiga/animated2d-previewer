@@ -74,6 +74,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     }
     validate_glues(ir)?;
     validate_warp_opacities(ir)?;
+    validate_draw_order_track(ir)?;
     validate_physics(ir)?;
     write_canvas(w, &ir.canvas);
     w.seq(&ir.parameters, write_parameter);
@@ -154,6 +155,7 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     validate_references(&ir)?;
     validate_glues(&ir)?;
     validate_warp_opacities(&ir)?;
+    validate_draw_order_track(&ir)?;
     validate_physics(&ir)?;
     Ok(ir)
 }
@@ -291,6 +293,27 @@ fn validate_warp_opacities(ir: &CubismIr) -> Result<(), DecodeError> {
     }
     if let Some(bad) = track.iter().find(|v| !(0.0..=1.0).contains(*v)) {
         return Err(DecodeError::corrupt(format!("a warp keyform opacity of {bad} is outside [0, 1]")));
+    }
+    Ok(())
+}
+
+/// The drawable draw-order track is empty or holds one finite value per
+/// drawable keyform. It decides paint order, so a short track would silently
+/// rest some drawables at 500 and a NaN would be rounded to a layer.
+fn validate_draw_order_track(ir: &CubismIr) -> Result<(), DecodeError> {
+    let track = &ir.drawable_keyform_draw_orders;
+    if track.is_empty() {
+        return Ok(());
+    }
+    if track.len() != ir.keyforms.drawable_offsets.len() {
+        return Err(DecodeError::corrupt(format!(
+            "{} drawable draw orders for {} drawable keyforms",
+            track.len(),
+            ir.keyforms.drawable_offsets.len()
+        )));
+    }
+    if let Some(bad) = track.iter().find(|v| !v.is_finite()) {
+        return Err(DecodeError::corrupt(format!("a drawable draw order of {bad} is not finite")));
     }
     Ok(())
 }
@@ -457,7 +480,11 @@ fn validate_references(ir: &CubismIr) -> Result<(), DecodeError> {
     }
     for index in &ir.draw_order {
         if *index as usize >= ir.drawables.len() {
-            return Err(out_of_range("painted drawable", *index as usize, ir.drawables.len()));
+            return Err(out_of_range(
+                "draw-order object list entry naming drawable",
+                *index as usize,
+                ir.drawables.len(),
+            ));
         }
     }
     Ok(())
@@ -875,7 +902,7 @@ mod tests {
             },
             draw_order: vec![1, 0],
             drawable_keyform_opacities: vec![1.0, 1.0, 0.0, 1.0, 0.5, 0.25],
-            drawable_keyform_draw_orders: vec![500.0; 6],
+            drawable_keyform_draw_orders: vec![500.0; 3],
             motions: vec![],
         }
     }
@@ -1409,6 +1436,66 @@ mod tests {
         bytes[at..at + 4].copy_from_slice(&9u32.to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("a dangling mesh should be refused on read");
         assert!(err.to_string().contains("mesh A"), "{err}");
+    }
+
+    #[test]
+    fn validate_warns_when_the_draw_order_track_is_empty() {
+        let text = |ir: CubismIr| {
+            Package::from_cubism(ir, "test", "x")
+                .validate()
+                .warnings()
+                .iter()
+                .map(|w| w.to_string())
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                )
+        };
+        assert!(!text(model()).contains("draw-order track"));
+        let mut ir = model();
+        ir.drawable_keyform_draw_orders.clear();
+        let warned = text(ir);
+        assert!(warned.contains("no drawable draw-order track"), "{warned}");
+        let mut ir = model();
+        ir.draw_order.clear();
+        assert!(text(ir).contains("no draw-order object list"));
+    }
+
+    #[test]
+    fn a_bad_draw_order_track_is_refused_by_the_writer_and_the_reader_alike() {
+        type Edit = fn(&mut CubismIr);
+        let cases: [(&str, Edit); 3] = [
+            ("for 3 drawable keyforms", |ir| ir.drawable_keyform_draw_orders.truncate(2)),
+            ("for 3 drawable keyforms", |ir| ir.drawable_keyform_draw_orders.push(500.0)),
+            ("not finite", |ir| ir.drawable_keyform_draw_orders[2] = f32::NAN),
+        ];
+        for (text, edit) in cases {
+            let mut ir = model();
+            edit(&mut ir);
+            let err = Package::from_cubism(ir, "test", "x").encode_model().expect_err("the writer should refuse");
+            assert!(matches!(err, DecodeError::Corrupt { .. }), "{err:?}");
+            assert!(err.to_string().contains(text), "{text}: {err}");
+        }
+
+        // The reader: patch the valid bytes. The track is 3 floats of 500.0
+        // after the opacity track; its length prefix sits just before them.
+        let good = Package::from_cubism(model(), "test", "x").encode_model().unwrap();
+        let run: Vec<u8> = [500.0f32; 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let at = good.windows(run.len()).position(|w| w == run.as_slice()).expect("draw order track");
+        let mut nan = good.clone();
+        nan[at + 4..at + 8].copy_from_slice(&f32::NAN.to_le_bytes());
+        let err = Package::decode_model(&nan).expect_err("a NaN should be refused on read");
+        assert!(err.to_string().contains("not finite"), "{err}");
+
+        // A wrong length: drop the last float of the track and shorten its
+        // length prefix to match, so the stream stays well formed and only the
+        // keyform count disagrees.
+        let mut short = good.clone();
+        short.drain(at + 8..at + 12);
+        short[at - 4..at].copy_from_slice(&2u32.to_le_bytes());
+        let err = Package::decode_model(&short).expect_err("a short track should be refused on read");
+        assert!(err.to_string().contains("2 drawable draw orders for 3"), "{err}");
     }
 
     #[test]

@@ -74,7 +74,7 @@ used by the parser:
 | 35 | drawable keyform begin | | 77 | parameter keys |
 | 36 | drawable keyform count | | 78 | vertex UVs |
 | 40 | drawable parent deformer | | 79 | vertex indices |
-| 43 | drawable vertex counts | | 87 | the paint sequence |
+| 43 | drawable vertex counts | | 87 | draw-order object list (the tie-break order, §6) |
 | 44 | drawable vertex offsets (floats) | | 90 | glue ids |
 | 45 | drawable index offsets | | 91-100 | glue, see below |
 | 46 | drawable index counts | | | |
@@ -82,6 +82,30 @@ used by the parser:
 | 39 | drawable part index | | 41 | drawable texture index |
 | 42 | drawable flags (**bytes**) | | 47 | drawable mask begin |
 | 48 | drawable mask count | | 80 | drawable mask list |
+
+Draw-order groups, sections 81 to 88, sit beside it. Per group (count slot 18):
+
+| # | Contents |
+|---|---|
+| 81 | group object begin (into the flat object arrays) |
+| 82 | group object count |
+| 83 | group total object count (counting nested groups) |
+| 84 | group maximum draw order |
+| 85 | group minimum draw order |
+
+Per object, across all groups (count slot 19):
+
+| # | Contents |
+|---|---|
+| 86 | object type: 0 art mesh, 1 part |
+| 87 | object index: the drawable (or part) it names |
+| 88 | object self index: the group a part object opens, -1 for none |
+
+Only 81, 82, 86, 87 and 88 are read; 83 to 85 are not. The reading is
+positional, taken from an independent MIT-licensed MOC3 reader's section table,
+and its indices agree with every index this document established on its own.
+Sections 84 and 85 equal the maximum and minimum of section 69 over the whole
+model on all six real models measured, which fits the grouping reading.
 
 A wrong index here fails loudly rather than returning a plausible model: each
 section is required to hold exactly the declared number of well-formed entries.
@@ -469,12 +493,38 @@ weights.
 removing it, so a decoder that paints every drawable opaque covers whatever
 should have shown through. A fully transparent drawable is not emitted at all.
 
-**Draw order** (section 69) runs 499 to 1000 about a resting 510. This is the
-artist's per-drawable value, and it is **not** the resolved back-to-front
-sequence — that is section 87, and turning draw orders into one would need the
-part tree. Section 58 holds a per-part draw order on the same 0-to-1000 scale,
-but it is 500 for all but three parts on the model measured, so it separates
-nothing. Section 69 is therefore decoded and carried but not yet used.
+**Draw order** (section 69) is the artist's per-drawable value and the thing
+motions animate. Across six real models it runs 200 to 1000, most values at a
+resting 500. It is blended with the same weights as the coordinates, and the
+paint order is derived from it:
+
+1. each drawable's blended draw order is rounded to the nearest integer
+   (non-finite counts as 500);
+2. drawables are painted back to front in ascending order;
+3. drawables with an equal value are ordered by position in the draw-order
+   object list (section 87): the earlier entry paints first.
+
+Drawables the list does not name go last. Rounding rather than truncating
+matters: the weights sum to one only within float error, so a resting 500 can
+blend to 499.99997, and truncation would invent a reorder on a model whose draw
+orders never vary.
+
+What established it: the Unity renderer component serializes the render order
+the official Cubism Core reported when the prefab was built. On four real
+models those values form a permutation of `0..n`, and the rule above, evaluated
+at the model's default parameters, reproduces them **exactly** — every pair of
+drawables agrees (67,528 / 108,345 / 230,181 / 5,151 pairs). The alternatives
+fail on the same data: section 87 painted as given differs in 362, 466, 0 and
+101 positions; ties reversed in 362, 464, 678 and 90; ties by drawable index in
+348, 465, 677 and 92. Ties are not rare — at defaults most adjacent steps along
+section 87 are equal draw orders — so the tie direction is heavily exercised.
+Two further real models carry renderer values that are not permutations (stale,
+from another revision of the model), so the rule is unchecked on them.
+
+Section 58 holds a per-part draw order on the same scale. It is 500 for all but
+a few parts, and no part is in a draw-order group on any model seen, so it takes
+no part in the ordering here. The editor manual says a part's draw order only
+takes effect once the part is grouped.
 
 ### Deformer opacity: sections 59 and 61
 
@@ -513,10 +563,13 @@ enabled flags (sections 13 and 14, and 37 and 38 for drawables), which are not
 read. A part's own opacity (pose files and part-opacity motion curves) is also
 still not applied; the bundles examined carry no such curves.
 
-### Section 87 is a sequence, not a key
+### Section 87 is the group's object list, not a paint sequence
 
-Slot `k` names the drawable painted `k`-th. It is *not* a per-drawable value
-saying where each one sits — that reading is the inverse permutation.
+Section 87 lists the drawables of the model's one draw-order group. Painting it
+as given is wrong at rest on three of the four models checked (on the fourth
+the list alone happens to be exact): it breaks ties and nothing else. Slot `k` is
+*not* a per-drawable value saying where each one sits either — that reading is
+the inverse permutation, which is what first shipped.
 
 The inverse is dangerously plausible. It is still a permutation, it still paints
 every drawable exactly once, and the result still looks broadly like the
@@ -529,9 +582,14 @@ clue that the reading was wrong rather than the data.
 The fixture pins the direction with a *rotation* rather than a reversal,
 because a reversal is its own inverse and could not tell the two apart.
 
-A model whose table repeats an entry rather than permuting cleanly — one of the
-six does — has the unnamed drawables appended in model order, so nothing goes
-unpainted.
+All six real models have exactly one group, count slot 19 equal to the drawable
+count, every object of type 0 with self index -1, and every drawable listed
+exactly once; none repeats an entry. That shape reads straight through. Any
+other (several groups, part objects, nested groups, a repeated or out-of-range
+entry) is reported as a load note and reduced to the art-mesh objects in list
+order, with any drawable left out appended in model order, so nothing goes
+unpainted. A layout without sections 81 to 88 reads the first `n` entries of
+section 87 and says so.
 
 ### Why the eyes were invisible
 
@@ -539,8 +597,8 @@ Two problems, both now fixed:
 
 1. the irises were unclipped, drawing their full quads rather than being cut to
    their own eye whites (sections 47, 48 and 80);
-2. section 87 was read as a key rather than a sequence, painting the face skin
-   over the eyes.
+2. section 87 was read as a per-drawable key rather than as a list, painting the
+   face skin over the eyes.
 
 The second was the one that mattered — the eyes were there the whole time,
 behind the face's own skin.
@@ -732,11 +790,15 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
   linear transitions back to a default state); no reference runtime was compared.
 - **Physics, pose files, expressions, hit areas.** All live outside the MOC3 and
   are not read.
-- **Animated draw order.** Section 69 is decoded but unused: turning the
-  artist's per-drawable values into a render order needs the part tree, and the
-  per-part orders in section 58 are equal on every model measured. The setup
-  sequence in section 87 is used instead, so a model that reorders during an
-  animation will not.
+- **Draw order: what is unverified.** Painting follows the rule in §6 and
+  matches the official runtime's recorded order at rest on four models, but not
+  yet anywhere a draw order is fractional or animated. Unchecked: whether Core
+  rounds, truncates or floors a fractional blend (rounding is used; every value
+  at rest is an exact integer); whether draw order blends linearly with the
+  geometry weights (assumed, as the manual says draw-order keyforms behave like
+  shape keyforms); and nested groups and part objects (type 1, a self index,
+  section 58, section 83), which no model seen uses and which are reported
+  rather than ordered. Two of the six models could not be checked at rest.
 - **Multiple texture pages.** Section 41 gives each drawable a texture index and
   is read, but the emitter still puts every mesh on one page, because nothing
   loads a second one yet. It is all zero on every model seen.
