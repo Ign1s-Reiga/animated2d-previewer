@@ -334,7 +334,9 @@ pub(super) fn to_motion(
         notes.push(format!("clip length {length} is not usable; the last key time {last_key} is used instead"));
         last_key
     };
-    notes.push(format!("fade times are unavailable; the default {DEFAULT_FADE} is used"));
+    notes.push(format!(
+        "fade times are unavailable; the stored default {DEFAULT_FADE} is not applied, crossfades use the viewer's mix duration"
+    ));
 
     if curves.is_empty() {
         report.note(format!(

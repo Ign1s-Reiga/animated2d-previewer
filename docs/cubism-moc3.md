@@ -597,8 +597,8 @@ Unverified:
   when a curve crosses the join (at most 0.0199 canvas units on this model, 0.0002
   at the seams actually measured). Not implemented; the exact rule is unknown
   without a reference runtime.
-- Crossfading between two motions should take the shortest way round a
-  repeating parameter. There is no crossfade yet.
+- Crossfading between two motions takes the shortest way round a repeating
+  parameter (then wraps); see the motions entry in section 8.
 
 ## 7. How correctness is judged without a reference runtime
 
@@ -719,9 +719,17 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
 - **Motions.** The bundles' animations are Unity `AnimationClip`s in the
   compressed muscle-clip form, not `motion3.json`. Their parameter curves are
   recovered and carried in the package as keyed Hermite segments, so a model
-  plays its own animations. What is not applied is fading: the stored fade
-  fields are kept, but playback neither crossfades nor ramps a curve, and the
-  bundles examined carried no fade data to read.
+  plays its own animations. Authored fades are not applied: the stored fade
+  fields are kept, but playback does not ramp a curve, and the bundles examined
+  carried no fade data to read. Switching motions crossfades over the host's
+  `mix_duration` instead: a sine weight `0.5 - 0.5 cos(pi t)`, each side
+  evaluated alone from the defaults and blended per parameter before physics
+  (a parameter one side leaves alone fades to or from its default; a repeating
+  one takes the shortest arc). The outgoing motion keeps playing, a loop wrap
+  does not fade, and a second switch mid-fade fades from the pose on show. The
+  shape and the 150/300 ms lengths are the Cubism-family convention and the
+  host's choice, not read from the assets (their Unity controllers specify 0.25 s
+  linear transitions back to a default state); no reference runtime was compared.
 - **Physics, pose files, expressions, hit areas.** All live outside the MOC3 and
   are not read.
 - **Animated draw order.** Section 69 is decoded but unused: turning the

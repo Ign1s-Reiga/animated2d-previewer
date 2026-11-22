@@ -10,8 +10,25 @@
 //! [`AnimatedModel::play_animation`] starts one by name, and
 //! [`AnimatedModel::pose_at`] poses the model at a timestamp. A model built
 //! straight from a MOC3 has none; one built from an imported package does.
-//! Crossfades and per-curve fades are not applied, and part-opacity targets are
-//! not driven; only parameter curves are.
+//! Part-opacity targets are not driven; only parameter curves are.
+//!
+//! # Crossfades
+//!
+//! Replacing a playing motion with a non-zero [`PlayOptions::mix_duration`]
+//! crossfades: the outgoing motion keeps playing (a looping one keeps looping,
+//! a once-motion holds its last frame) while a weight `0.5 - 0.5 cos(pi t)`
+//! of the elapsed fraction `t` of the mix moves from 0 to 1. Each side is
+//! evaluated alone from the parameter defaults and every parameter becomes
+//! `a + (b - a) * w`, so a parameter only one side drives fades to or from its
+//! default, and a repeating parameter blends along the shortest arc. A mix of
+//! zero is a cut. A loop wrap does not fade. The blend happens before physics,
+//! which therefore sees continuous inputs. Replacing a motion again before the
+//! fade is done fades from the pose the model was showing (a snapshot of the
+//! blended values), so nothing jumps.
+//!
+//! The fade times a motion may carry (`Motion::fade_in` and the per-curve
+//! overrides in the IR) are stored but not applied: the assets this was built
+//! against have none, so the length of a fade is the host's choice.
 //!
 //! A model's physics rig, when it has one, runs after the motion (or idle) has
 //! written its values and before the pose is computed, every update. Its state
@@ -59,6 +76,50 @@ const POSE_AT_FPS: f32 = 60.0;
 /// physics over, in seconds.
 const POSE_AT_WARM_UP: f32 = 10.0;
 
+/// A queued motion and how to start it.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    index: usize,
+    looping: bool,
+    speed: f32,
+    /// Crossfade length in seconds when it takes over; zero cuts.
+    mix: f32,
+}
+
+/// What the outgoing side of a crossfade shows.
+#[derive(Debug, Clone)]
+enum FadeFrom {
+    /// A motion that keeps advancing under the fade.
+    Player(MotionPlayer),
+    /// The values the model showed when a second switch interrupted a fade.
+    Frozen(Vec<f32>),
+}
+
+/// A crossfade in progress.
+#[derive(Debug, Clone)]
+struct Fade {
+    from: FadeFrom,
+    elapsed: f32,
+    duration: f32,
+    /// Per parameter, the signed distance `b - a` (a multiple of the range
+    /// away from the plain difference) chosen last frame for a repeating
+    /// parameter. The arc is kept continuous from frame to frame: it is the
+    /// shortest at the start, and afterwards the one nearest the previous.
+    arcs: Vec<Option<f32>>,
+}
+
+impl Fade {
+    /// The incoming side's weight: a sine ease from 0 to 1.
+    fn weight(&self) -> f32 {
+        let t = if self.duration > 0.0 { (self.elapsed / self.duration).clamp(0.0, 1.0) } else { 1.0 };
+        0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+    }
+
+    fn is_done(&self) -> bool {
+        self.elapsed >= self.duration
+    }
+}
+
 /// A Cubism model, posed and drawable.
 pub struct GenericCubismModel {
     /// The normalized model. A MOC3 is one way to obtain it and a package is
@@ -76,10 +137,14 @@ pub struct GenericCubismModel {
     /// The motion currently playing, if any. While set it owns the parameters it
     /// drives and the synthetic idle stays off.
     motion: Option<MotionPlayer>,
-    /// A motion queued behind the current one, as `(index, looping, speed)`. It
-    /// takes over when the current motion finishes, or at the next loop wrap of
-    /// a looping one. A newer queued call replaces it.
-    pending: Option<(usize, bool, f32)>,
+    /// A motion queued behind the current one. It takes over when the current
+    /// motion finishes, or at the next loop wrap of a looping one. A newer
+    /// queued call replaces it.
+    pending: Option<Pending>,
+    /// The crossfade from a replaced motion into `motion`, while one is running.
+    fading: Option<Fade>,
+    /// Per parameter: whether motions wrap it instead of clamping it.
+    repeating: Vec<bool>,
     expressions: Vec<ExpressionInfo>,
     texture: TextureId,
     /// The physics simulation, if the model has a rig with anything to simulate.
@@ -106,6 +171,12 @@ impl GenericCubismModel {
         let animations: Vec<AnimationInfo> =
             moc.motions.iter().map(|m| AnimationInfo { name: m.name.clone(), duration: m.duration }).collect();
         let pose = moc.pose(&values);
+        let mut repeating = vec![false; moc.parameters.len()];
+        for index in moc.repeating_parameters() {
+            if let Some(slot) = repeating.get_mut(index) {
+                *slot = true;
+            }
+        }
         let physics = moc.physics.as_ref().and_then(|p| PhysicsState::new(p, &moc.parameters));
         let mut model = GenericCubismModel {
             moc,
@@ -117,6 +188,8 @@ impl GenericCubismModel {
             animations,
             motion: None,
             pending: None,
+            fading: None,
+            repeating,
             expressions: Vec::new(),
             texture: TextureId(0),
             physics,
@@ -126,7 +199,7 @@ impl GenericCubismModel {
         if let Some(index) =
             preferred_animation(&model.animations).and_then(|name| model.animations.iter().position(|a| a.name == name))
         {
-            model.start_motion(index, true, 1.0);
+            model.start_motion(index, true, 1.0, 0.0);
         }
         model
     }
@@ -142,18 +215,81 @@ impl GenericCubismModel {
         }
     }
 
-    fn start_motion(&mut self, index: usize, looping: bool, speed: f32) {
-        self.motion = MotionPlayer::new(&self.moc, index, looping, speed);
+    /// Starts motion `index`, crossfading from what plays now over `mix` seconds
+    /// when there is something to fade from. A zero (or non-finite) `mix`, or no
+    /// motion playing, cuts.
+    fn start_motion(&mut self, index: usize, looping: bool, speed: f32, mix: f32) {
+        let incoming = MotionPlayer::new(&self.moc, index, looping, speed);
+        let from = if mix > 0.0 && mix.is_finite() && incoming.is_some() { self.fade_source() } else { None };
+        self.fading = from.map(|from| Fade { from, elapsed: 0.0, duration: mix, arcs: Vec::new() });
+        self.motion = incoming;
         // Pose the first frame now, so the model does not open at rest for one
-        // update before the motion takes over.
-        self.reset_values();
-        if let Some(player) = &self.motion {
-            player.apply(&self.moc, &mut self.values);
-        }
+        // update before the motion takes over. A fade starts at weight 0, so this
+        // frame is the outgoing pose and nothing jumps.
+        self.write_motion_values();
         // Physics outputs stay where the chain is rather than showing the new
         // motion's raw values for a frame (a paused step writes without moving).
         self.step_physics(0.0);
         self.repose();
+    }
+
+    /// What a fade starting now would fade away from: the motion playing, or, if
+    /// that is itself mid-fade, the blended values on show.
+    fn fade_source(&mut self) -> Option<FadeFrom> {
+        let player = self.motion.as_ref()?;
+        if self.fading.is_some() {
+            Some(FadeFrom::Frozen(self.motion_values()))
+        } else {
+            Some(FadeFrom::Player(player.clone()))
+        }
+    }
+
+    /// The parameter values the current motion (and the fade into it, if any)
+    /// asks for, from the defaults, before physics. Defaults when no motion plays.
+    fn motion_values(&mut self) -> Vec<f32> {
+        let mut b: Vec<f32> = self.moc.parameters.iter().map(|p| p.default).collect();
+        let Some(player) = &self.motion else { return b };
+        player.apply(&self.moc, &mut b);
+        let Some(mut fade) = self.fading.take() else { return b };
+        let w = fade.weight();
+        let a = match &fade.from {
+            FadeFrom::Player(p) => {
+                let mut a: Vec<f32> = self.moc.parameters.iter().map(|p| p.default).collect();
+                p.apply(&self.moc, &mut a);
+                a
+            }
+            FadeFrom::Frozen(v) => v.clone(),
+        };
+        fade.arcs.resize(self.moc.parameters.len(), None);
+        for (i, (param, out)) in self.moc.parameters.iter().zip(b.iter_mut()).enumerate() {
+            let Some(&from) = a.get(i) else { continue };
+            *out = if self.repeating.get(i).copied().unwrap_or(false) {
+                let span = param.maximum - param.minimum;
+                let mut d = *out - from;
+                if span.is_finite() && span > 0.0 && d.is_finite() {
+                    // The shortest way round at the start, then whichever way
+                    // round is nearest last frame's, so a side sweeping past the
+                    // other's opposite point does not flip the arc mid-fade.
+                    let reference = fade.arcs[i].unwrap_or(0.0);
+                    d -= span * ((d - reference) / span).round();
+                    fade.arcs[i] = Some(d);
+                }
+                param.wrap(from + d * w)
+            } else {
+                from + (*out - from) * w
+            };
+        }
+        self.fading = Some(fade);
+        b
+    }
+
+    /// Resets every parameter and writes the motion's (blended) values.
+    fn write_motion_values(&mut self) {
+        let values = self.motion_values();
+        // Zipped rather than copied: after `dispose` there are no values to write.
+        for (slot, v) in self.values.iter_mut().zip(values) {
+            *slot = v;
+        }
     }
 
     pub fn moc(&self) -> &CubismIr {
@@ -217,24 +353,36 @@ impl AnimatedModel for GenericCubismModel {
         if let Some(player) = &mut self.motion {
             leftover = player.advance(&self.moc, step);
         }
+        if let Some(fade) = &mut self.fading {
+            fade.elapsed += step;
+            if let FadeFrom::Player(outgoing) = &mut fade.from {
+                outgoing.advance(&self.moc, step);
+            }
+        }
         if let Some(over) = leftover {
-            if let Some((index, looping, speed)) = self.pending.take() {
-                self.start_motion(index, looping, speed);
+            if let Some(next) = self.pending.take() {
+                // Fade from where the old motion ended, rather than from its
+                // wrapped-around start.
+                if let Some(player) = &mut self.motion {
+                    player.hold_end(&self.moc);
+                }
+                self.start_motion(next.index, next.looping, next.speed, next.mix);
                 // Carry the time that was past the old pass's end into the new
                 // one, so the handover does not stall for the overshoot.
                 if let Some(player) = &mut self.motion {
                     player.advance(&self.moc, over);
+                }
+                if let Some(fade) = &mut self.fading {
+                    fade.elapsed += over;
                 }
             }
         }
         if self.motion.as_ref().is_some_and(|p| p.is_finished()) {
             // A motion that does not loop leaves the track empty (see
             // `PlayOptions::once`) once its final frame has been shown.
-            let player = self.motion.take();
-            self.reset_values();
-            if let Some(player) = player {
-                player.apply(&self.moc, &mut self.values);
-            }
+            self.write_motion_values();
+            self.motion = None;
+            self.fading = None;
             self.step_physics(step);
             self.repose();
             return Ok(());
@@ -248,12 +396,15 @@ impl AnimatedModel for GenericCubismModel {
             }
             return Ok(());
         }
-        self.reset_values();
-        if let Some(player) = &self.motion {
+        if self.motion.is_some() {
             // The motion owns its parameters, and the idle stays off so the two
             // never fight over one.
-            player.apply(&self.moc, &mut self.values);
+            self.write_motion_values();
+            if self.fading.as_ref().is_some_and(Fade::is_done) {
+                self.fading = None;
+            }
         } else {
+            self.reset_values();
             for (index, period, span, rest, _) in &self.idle {
                 let phase = self.elapsed / period * std::f32::consts::TAU;
                 let value = rest + phase.sin() * span;
@@ -271,13 +422,17 @@ impl AnimatedModel for GenericCubismModel {
         self.moc.emit(&self.pose, self.texture, out);
     }
 
-    /// Only `looping`, `speed` and `queued` are honoured: there is one track,
-    /// and crossfade and delay are not implemented.
+    /// Only `looping`, `speed`, `mix_duration` and `queued` are honoured: there
+    /// is one track, and delay is not implemented.
+    ///
+    /// A non-zero `mix_duration` crossfades from the motion playing now (see the
+    /// module documentation); zero, or nothing playing, cuts.
     ///
     /// A queued call while a motion plays waits behind it, starting when a
     /// non-looping motion finishes or a looping one next wraps, and replaces any
-    /// older queued entry. With nothing playing it starts at once. A call that
-    /// is not queued discards whatever was waiting.
+    /// older queued entry; its own `mix_duration` is the crossfade from the end
+    /// of the motion it waited for. With nothing playing it starts at once. A
+    /// call that is not queued discards whatever was waiting.
     fn play_animation(&mut self, name: &str, opts: PlayOptions) -> Result<(), RuntimeError> {
         let index = self
             .animations
@@ -285,10 +440,11 @@ impl AnimatedModel for GenericCubismModel {
             .position(|a| a.name == name)
             .ok_or_else(|| RuntimeError::UnknownAnimation(name.to_string()))?;
         if opts.queued && self.motion.is_some() {
-            self.pending = Some((index, opts.looping, opts.speed));
+            self.pending =
+                Some(Pending { index, looping: opts.looping, speed: opts.speed, mix: opts.mix_duration.as_secs_f32() });
         } else {
             self.pending = None;
-            self.start_motion(index, opts.looping, opts.speed);
+            self.start_motion(index, opts.looping, opts.speed, opts.mix_duration.as_secs_f32());
         }
         Ok(())
     }
@@ -299,7 +455,8 @@ impl AnimatedModel for GenericCubismModel {
     /// `time` is clamped to the motion (not wrapped), matching the Spine side:
     /// asking for the end shows the final frame. Afterwards the motion is the
     /// current one, looping, with its playhead at `time`; anything queued is
-    /// dropped. The synthetic idle is not applied.
+    /// dropped, as is any crossfade: the pose is the motion alone at full weight.
+    /// The synthetic idle is not applied.
     fn pose_at(&mut self, animation: &str, time: f32) -> Result<(), RuntimeError> {
         let index = self
             .animations
@@ -307,6 +464,7 @@ impl AnimatedModel for GenericCubismModel {
             .position(|a| a.name == animation)
             .ok_or_else(|| RuntimeError::UnknownAnimation(animation.to_string()))?;
         self.pending = None;
+        self.fading = None;
         self.motion = MotionPlayer::new(&self.moc, index, true, 1.0);
         let duration = self.moc.motions.get(index).map_or(0.0, |m| m.duration);
         let target = wrap_time(time, duration, false);
@@ -347,12 +505,24 @@ impl AnimatedModel for GenericCubismModel {
 
     fn stop_animation(&mut self, name: &str) {
         let is = |i: usize| self.animations.get(i).is_some_and(|a| a.name == name);
-        if self.pending.is_some_and(|(i, _, _)| is(i)) {
+        let drop_pending = self.pending.is_some_and(|p| is(p.index));
+        let drop_outgoing =
+            self.fading.as_ref().is_some_and(|f| matches!(&f.from, FadeFrom::Player(p) if is(p.motion_index())));
+        let drop_current = self.motion.as_ref().is_some_and(|p| is(p.motion_index()));
+        if drop_pending {
             self.pending = None;
         }
-        if self.motion.as_ref().is_some_and(|p| is(p.motion_index())) {
+        if drop_current {
             self.motion = None;
+            self.fading = None;
             self.reset_values();
+            self.step_physics(0.0);
+            self.repose();
+        } else if drop_outgoing {
+            // Stopping the motion being faded out ends the fade: what is left is
+            // the incoming motion alone.
+            self.fading = None;
+            self.write_motion_values();
             self.step_physics(0.0);
             self.repose();
         }
@@ -394,6 +564,7 @@ impl AnimatedModel for GenericCubismModel {
         self.values.clear();
         self.idle.clear();
         self.motion = None;
+        self.fading = None;
         self.pending = None;
         self.physics = None;
     }
@@ -1155,5 +1326,371 @@ mod tests {
         let text: Vec<String> = report.warnings().iter().map(|w| w.to_string()).collect();
         assert_eq!(text.len(), 1, "{text:?}");
         assert!(text[0].contains("ParamAngleX") && text[0].contains("repeating"), "{text:?}");
+    }
+
+    // ---- crossfades ----
+
+    fn mix(seconds: f32) -> PlayOptions {
+        PlayOptions::looping().with_mix(Duration::from_secs_f32(seconds))
+    }
+
+    /// Advances by `seconds` in sub-steps of at most 1/16 s (an exact binary
+    /// fraction), because `update` caps a single step at 0.1 s.
+    fn step(m: &mut GenericCubismModel, seconds: f32) {
+        let n = (seconds * 16.0).ceil().max(1.0) as u32;
+        for _ in 0..n {
+            m.update(Duration::from_secs_f32(seconds / n as f32)).expect("update");
+        }
+    }
+
+    #[test]
+    fn a_crossfade_follows_the_sine_weight() {
+        // w = 0.5 - 0.5 cos(pi t): 0.146447, 0.5, 0.853553, 1 at t = 0.25 .. 1.
+        // value = 0 + (8 - 0) * w.
+        let mut m = with_three(vec![hold("A", "ParamExtra", 0.0), hold("B", "ParamExtra", 8.0)]);
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        step(&mut m, 0.1);
+        m.play_animation("B", mix(1.0)).expect("known");
+        for want in [1.171_573, 4.0, 6.828_427, 8.0] {
+            step(&mut m, 0.25);
+            assert!((value(&m, "ParamExtra") - want).abs() < 1e-4, "{} vs {want}", value(&m, "ParamExtra"));
+        }
+        assert!(m.fading.is_none(), "the fade is dropped once it reaches 1");
+        step(&mut m, 0.25);
+        assert_eq!(value(&m, "ParamExtra"), 8.0);
+    }
+
+    #[test]
+    fn a_parameter_only_the_outgoing_motion_drives_fades_to_its_default() {
+        let a = Motion {
+            curves: vec![
+                hold("", "ParamEyeLOpen", 0.25).curves.remove(0),
+                hold("", "ParamExtra", 0.0).curves.remove(0),
+            ],
+            ..hold("A", "ParamExtra", 0.0)
+        };
+        let mut m = with_three(vec![a, hold("B", "ParamExtra", 8.0)]);
+        let d = m.moc().parameter("ParamEyeLOpen").expect("present").default;
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        step(&mut m, 0.1);
+        assert!((value(&m, "ParamEyeLOpen") - 0.25).abs() < 1e-6);
+        m.play_animation("B", mix(1.0)).expect("known");
+        step(&mut m, 0.25);
+        let w = 0.146_446_6;
+        let want = 0.25 + (d - 0.25) * w;
+        assert!((value(&m, "ParamEyeLOpen") - want).abs() < 1e-5, "{} vs {want}", value(&m, "ParamEyeLOpen"));
+        step(&mut m, 0.75);
+        assert!((value(&m, "ParamEyeLOpen") - d).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_first_frame_after_a_switch_shows_no_jump() {
+        let mut m = with_three(vec![hold("A", "ParamExtra", 0.0), hold("B", "ParamExtra", 8.0)]);
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        step(&mut m, 0.1);
+        let (values, pose) = (m.values.clone(), m.pose.clone());
+        m.play_animation("B", mix(0.5)).expect("known");
+        assert_eq!(m.values, values);
+        assert_eq!(m.pose, pose);
+    }
+
+    #[test]
+    fn a_zero_mix_is_a_cut() {
+        let mut m = with_three(vec![hold("A", "ParamExtra", 0.0), hold("B", "ParamExtra", 8.0)]);
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        step(&mut m, 0.1);
+        m.play_animation("B", PlayOptions::looping()).expect("known");
+        assert!(m.fading.is_none());
+        assert_eq!(value(&m, "ParamExtra"), 8.0);
+    }
+
+    #[test]
+    fn nothing_playing_means_nothing_to_fade_from() {
+        let mut m = with_three(vec![hold("B", "ParamExtra", 8.0)]);
+        m.motion = None;
+        m.play_animation("B", mix(1.0)).expect("known");
+        assert!(m.fading.is_none());
+        assert_eq!(value(&m, "ParamExtra"), 8.0);
+    }
+
+    #[test]
+    fn the_outgoing_motion_keeps_advancing_under_the_fade() {
+        // A sweeps ParamExtra 0 -> 8 at 4 per second; B leaves it alone, so its
+        // side is the default 2. A frozen outgoing motion would give
+        // 0 + (2 - 0) * w = 0.2929 instead.
+        let mut m = with_three(vec![sweep("A", "ParamExtra", 8.0), hold("B", "ParamAngleX", 10.0)]);
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", mix(1.0)).expect("known");
+        step(&mut m, 0.25);
+        // a = 4 * 0.25 = 1, b = 2.
+        let want = 1.0 + (2.0 - 1.0) * 0.146_446_6;
+        assert!((value(&m, "ParamExtra") - want).abs() < 1e-5, "{}", value(&m, "ParamExtra"));
+    }
+
+    #[test]
+    fn a_once_motion_holds_its_last_frame_while_it_fades_out() {
+        let mut m = with_three(vec![sweep("A", "ParamExtra", 8.0), hold("B", "ParamAngleX", 10.0)]);
+        m.play_animation("A", PlayOptions::once()).expect("known");
+        step(&mut m, 0.1);
+        for _ in 0..18 {
+            step(&mut m, 0.1);
+        }
+        m.play_animation("B", mix(2.0)).expect("known");
+        // A ends 0.1 s into the fade and holds 8; B does not drive ParamExtra
+        // (default 2). At 1 s of 2 s, w = 0.5: 8 + (2 - 8) * 0.5 = 5.
+        for _ in 0..10 {
+            step(&mut m, 0.1);
+        }
+        assert!((value(&m, "ParamExtra") - 5.0).abs() < 1e-3, "{}", value(&m, "ParamExtra"));
+    }
+
+    #[test]
+    fn a_queued_handover_crossfades_from_the_end_of_the_first_motion() {
+        let mut m = with_three(vec![hold("Wave", "ParamExtra", 0.0), hold("Idle", "ParamExtra", 8.0)]);
+        m.play_animation("Wave", PlayOptions::once()).expect("known");
+        m.play_animation("Idle", mix(0.5).queued()).expect("known");
+        // Wave is one second long; until it ends nothing fades.
+        for _ in 0..3 {
+            step(&mut m, 0.25);
+            assert_eq!(value(&m, "ParamExtra"), 0.0);
+            assert!(m.fading.is_none());
+        }
+        step(&mut m, 0.25);
+        assert_eq!(value(&m, "ParamExtra"), 0.0, "the handover frame is still the outgoing pose");
+        // 0.125 s into a 0.5 s mix: w = 0.146447.
+        step(&mut m, 0.125);
+        assert!((value(&m, "ParamExtra") - 8.0 * 0.146_446_6).abs() < 1e-4, "{}", value(&m, "ParamExtra"));
+        step(&mut m, 0.5);
+        assert_eq!(value(&m, "ParamExtra"), 8.0);
+        assert!(m.fading.is_none());
+    }
+
+    #[test]
+    fn repeating_parameters_blend_along_the_shortest_arc() {
+        // 29 and -29 are two units apart round the loop of [-30, 30], so half way
+        // is the seam, not 0.
+        let motions = || vec![hold_at("A", 29.0), hold_at("B", -29.0), hold_at("Marker", 360.0)];
+        let mut m = with_motions(motions());
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", mix(1.0)).expect("known");
+        step(&mut m, 0.5);
+        let v = value(&m, "ParamAngleX");
+        assert!((v.abs() - 30.0).abs() < 1e-3, "{v}");
+        // A quarter of the way in (w = 0.146447) it is 29 + 2 * w.
+        let mut m = with_motions(motions());
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", mix(1.0)).expect("known");
+        step(&mut m, 0.25);
+        let want = 29.0 + 2.0 * 0.146_446_6;
+        assert!((value(&m, "ParamAngleX") - want).abs() < 1e-3, "{}", value(&m, "ParamAngleX"));
+    }
+
+    #[test]
+    fn pose_at_mid_fade_equals_pose_at_on_a_fresh_model() {
+        let motions = || vec![hold("A", "ParamExtra", 0.0), sweep("B", "ParamExtra", 8.0)];
+        let mut used = with_three(motions());
+        used.play_animation("A", PlayOptions::looping()).expect("known");
+        used.play_animation("B", mix(1.0)).expect("known");
+        step(&mut used, 0.25);
+        assert!(used.fading.is_some());
+        used.pose_at("B", 1.0).expect("pose");
+        assert!(used.fading.is_none(), "pose_at drops the fade");
+        let mut fresh = with_three(motions());
+        fresh.pose_at("B", 1.0).expect("pose");
+        assert_eq!(used.values, fresh.values);
+        assert_eq!(used.pose, fresh.pose);
+        step(&mut used, 0.25);
+        assert!(used.fading.is_none());
+    }
+
+    #[test]
+    fn a_loop_wrap_after_a_completed_crossfade_does_not_fade() {
+        let mut m = with_three(vec![hold("A", "ParamExtra", 0.0), sweep("S", "ParamExtra", 8.0)]);
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("S", mix(0.5)).expect("known");
+        step(&mut m, 0.5);
+        assert!(m.fading.is_none(), "the real crossfade is complete");
+        step(&mut m, 1.25);
+        // 1.75 s into S: 4 * 1.75 = 7.
+        assert!((value(&m, "ParamExtra") - 7.0).abs() < 1e-4, "{}", value(&m, "ParamExtra"));
+        step(&mut m, 0.5);
+        // 2.25 s wraps to 0.25 s: 1.0, with no fade and no pull toward the default 2.
+        assert!(m.fading.is_none());
+        assert!((value(&m, "ParamExtra") - 1.0).abs() < 1e-4, "{}", value(&m, "ParamExtra"));
+    }
+
+    #[test]
+    fn a_looping_handover_with_an_overshooting_step_fades_from_the_end_of_the_pass() {
+        // A loops 0 -> 8 over 2 s; B holds 0. One 0.1 s step from 1.9375 s ends
+        // the pass 0.0375 s ago.
+        let mut m = with_three(vec![sweep("A", "ParamExtra", 8.0), hold("B", "ParamExtra", 0.0)]);
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", mix(1.0).queued()).expect("known");
+        step(&mut m, 1.9375);
+        assert!(m.fading.is_none());
+        m.update(Duration::from_secs_f32(0.1)).expect("update");
+        let over = 0.0375;
+        let fade = m.fading.as_ref().expect("the handover started a fade");
+        assert!((fade.elapsed - over).abs() < 1e-3, "the overshoot counts toward the fade: {}", fade.elapsed);
+        assert!((m.motion.as_ref().expect("B plays").playhead() - over).abs() < 1e-3);
+        // The outgoing side holds the end of the pass (8), not its wrapped start
+        // (0.15); w = 0.5 - 0.5 cos(pi * 0.0375) = 0.003466.
+        let want = 8.0 - 8.0 * 0.003_466;
+        assert!((value(&m, "ParamExtra") - want).abs() < 1e-3, "{} vs {want}", value(&m, "ParamExtra"));
+    }
+
+    #[test]
+    fn a_one_shot_that_ends_mid_fade_shows_its_last_blended_frame_then_the_idle() {
+        let mut m = with_three(vec![hold("A", "ParamExtra", 0.0), hold("B", "ParamExtra", 8.0)]);
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", PlayOptions::once().with_mix(Duration::from_secs(2))).expect("known");
+        step(&mut m, 1.0);
+        // B ended at 1 s of a 2 s fade: the last frame is the blend at w = 0.5.
+        assert!(m.motion.is_none() && m.fading.is_none());
+        assert!((value(&m, "ParamExtra") - 4.0).abs() < 1e-4, "{}", value(&m, "ParamExtra"));
+        step(&mut m, 0.0625);
+        assert_eq!(value(&m, "ParamExtra"), 2.0, "then the parameter is back at rest, as after any one-shot");
+    }
+
+    #[test]
+    fn playing_after_dispose_does_not_panic() {
+        let mut m = with_three(vec![hold("A", "ParamExtra", 0.0), hold("B", "ParamExtra", 8.0)]);
+        m.dispose();
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", mix(1.0)).expect("known");
+        step(&mut m, 0.25);
+        m.pose_at("A", 0.5).expect("pose");
+    }
+
+    #[test]
+    fn a_sweep_past_the_incoming_sides_opposite_point_does_not_flip_the_arc() {
+        // A turns 28 -> 32 over 2 s on [-30, 30] (32 wraps to -28), crossing the
+        // seam at 1 s, while B holds 0 whose opposite point is that seam. Taking
+        // the shortest arc afresh each frame would flip it there: at w = 0.5 the
+        // output would jump from 14.95 to -14.95. Keeping the arc continuous moves
+        // it by the sweep step plus the weight step times the span only.
+        let motions = || {
+            let spin = Motion {
+                name: "A".into(),
+                duration: 2.0,
+                curves: vec![MotionCurve {
+                    target: "ParamAngleX".into(),
+                    keys: vec![k(0.0, 28.0, 2.0), k(2.0, 32.0, 2.0)],
+                    ..MotionCurve::default()
+                }],
+                ..Motion::default()
+            };
+            vec![spin, hold_at("B", 0.0), hold_at("Marker", 360.0)]
+        };
+        let mut m = with_motions(motions());
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", mix(2.0)).expect("known");
+        let dt = 1.0 / 16.0;
+        let bound = 2.0 * dt + 60.0 * (std::f32::consts::FRAC_PI_2 / 2.0) * dt + 1e-3;
+        let circular = |x: f32, y: f32| {
+            let d = (x - y).rem_euclid(60.0);
+            d.min(60.0 - d)
+        };
+        let mut last = value(&m, "ParamAngleX");
+        for _ in 0..32 {
+            step(&mut m, dt);
+            let now = value(&m, "ParamAngleX");
+            assert!(circular(now, last) <= bound, "{last} -> {now}");
+            last = now;
+        }
+        assert!(value(&m, "ParamAngleX").abs() < 1e-3, "ends at B's 0");
+    }
+
+    #[test]
+    fn physics_sees_the_blended_inputs_with_no_step_during_a_fade() {
+        // The input goes from -30 to 30 in 0.3 s at 60 Hz. The weight's steepest
+        // slope is pi / 2 per mix, so a frame may move it by at most
+        // 60 * (pi / 2 / 0.3) * (1 / 60) = 5.236, against 60 for a cut. The rig's
+        // output must equal a fresh simulation fed the hand-blended input
+        // sequence -30 + 60 * w(k dt).
+        let physics = rig("ParamAngleX", "ParamEyeLOpen", 100.0);
+        let mut m = with_physics(vec![hold_at("A", -30.0), hold_at("B", 30.0)], physics);
+        let (x, eye) = (
+            m.moc().parameters.iter().position(|p| p.id == "ParamAngleX").expect("present"),
+            m.moc().parameters.iter().position(|p| p.id == "ParamEyeLOpen").expect("present"),
+        );
+        let mut reference =
+            PhysicsState::new(m.moc().physics.as_ref().expect("rig"), &m.moc().parameters).expect("a rig to simulate");
+        let defaults: Vec<f32> = m.moc().parameters.iter().map(|p| p.default).collect();
+        let mut feed = |input: f32, dt: f32| {
+            let mut v = defaults.clone();
+            v[x] = input;
+            reference.step(dt, &mut v);
+            v[eye]
+        };
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        feed(-30.0, 0.0);
+        let warm = Duration::from_millis(16).as_secs_f32();
+        for _ in 0..30 {
+            m.update(Duration::from_millis(16)).expect("update");
+            feed(-30.0, warm);
+        }
+        m.play_animation("B", mix(0.3)).expect("known");
+        let mut want_eye = feed(-30.0, 0.0);
+        assert!((m.values[eye] - want_eye).abs() < 1e-5);
+        let dt = Duration::from_secs_f32(1.0 / 60.0).as_secs_f32();
+        let mut elapsed = 0.0f32;
+        let mut last = value(&m, "ParamAngleX");
+        let mut worst = 0.0f32;
+        for _ in 0..30 {
+            m.update(Duration::from_secs_f32(1.0 / 60.0)).expect("update");
+            elapsed += dt;
+            let t = (elapsed / 0.3).min(1.0);
+            let w = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
+            want_eye = feed(-30.0 + 60.0 * w, dt);
+            assert!(
+                (m.values[eye] - want_eye).abs() < 1e-4,
+                "physics output {} vs hand-blended simulation {want_eye}",
+                m.values[eye]
+            );
+            let now = value(&m, "ParamAngleX");
+            worst = worst.max((now - last).abs());
+            last = now;
+        }
+        assert!(worst < 5.3, "{worst}");
+        assert!(worst > 1.0, "the fade must actually move it: {worst}");
+        assert!((last - 30.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn switching_again_mid_fade_fades_from_what_was_on_show() {
+        let mut m =
+            with_three(vec![hold("A", "ParamExtra", 0.0), hold("B", "ParamExtra", 8.0), hold("C", "ParamExtra", 6.0)]);
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", mix(1.0)).expect("known");
+        step(&mut m, 0.5);
+        assert!((value(&m, "ParamExtra") - 4.0).abs() < 1e-4);
+        m.play_animation("C", mix(1.0)).expect("known");
+        assert!((value(&m, "ParamExtra") - 4.0).abs() < 1e-4, "no jump on the second switch");
+        step(&mut m, 0.5);
+        // 4 + (6 - 4) * 0.5
+        assert!((value(&m, "ParamExtra") - 5.0).abs() < 1e-4, "{}", value(&m, "ParamExtra"));
+        step(&mut m, 0.5);
+        assert!((value(&m, "ParamExtra") - 6.0).abs() < 1e-4);
+        assert!(m.fading.is_none());
+    }
+
+    #[test]
+    fn stopping_mid_fade_clears_it() {
+        let mut m = with_three(vec![hold("A", "ParamExtra", 0.0), hold("B", "ParamExtra", 8.0)]);
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", mix(1.0)).expect("known");
+        step(&mut m, 0.25);
+        m.stop_animation("B");
+        assert!(m.fading.is_none() && m.motion.is_none());
+        assert_eq!(value(&m, "ParamExtra"), 2.0);
+        // Stopping the outgoing motion instead cuts to the incoming one.
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", mix(1.0)).expect("known");
+        step(&mut m, 0.25);
+        m.stop_animation("A");
+        assert!(m.fading.is_none() && m.motion.is_some());
+        step(&mut m, 0.1);
+        assert_eq!(value(&m, "ParamExtra"), 8.0);
     }
 }
