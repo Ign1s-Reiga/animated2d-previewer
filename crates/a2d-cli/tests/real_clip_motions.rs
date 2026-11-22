@@ -15,6 +15,9 @@ use a2d_core::LoadReport;
 use a2d_pack::Package;
 use a2d_unity::{AnimationClip, Bundle, ClassId, SerializedFile};
 
+#[path = "support/mod.rs"]
+mod support;
+
 fn bundle_bytes() -> Option<Vec<u8>> {
     let path = std::env::var("A2D_FIXTURE_CUBISM").ok()?;
     Some(std::fs::read(&path).unwrap_or_else(|e| panic!("A2D_FIXTURE_CUBISM points at {path:?}: {e}")))
@@ -99,20 +102,15 @@ fn clips_become_motions_that_target_real_parameters_and_survive_a_package() {
     }
 
     // Through the filesystem and back, then the package validation the
-    // `validate` command runs. Notes recorded at import are expected; anything
-    // else would be a real problem with the package.
+    // `validate` command runs. Notes recorded at import and the repeat notes for
+    // inferred looping parameters are expected; anything else would be a real
+    // problem with the package.
     let dir = std::env::temp_dir().join(format!("a2d-clip-motions-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     package.write_to(&dir).expect("the package should write");
     let reloaded = Package::read_from(&dir).expect("the package should read back");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(reloaded.model.as_cubism().expect("cubism").motions, ir.motions, "motions must survive a round trip");
-    let problems: Vec<String> = reloaded
-        .validate()
-        .warnings()
-        .iter()
-        .map(|w| w.to_string())
-        .filter(|w| !w.starts_with("recorded at import:"))
-        .collect();
+    let problems = support::unexpected_validate_warnings(&reloaded);
     assert!(problems.is_empty(), "validate reported: {problems:#?}");
 }

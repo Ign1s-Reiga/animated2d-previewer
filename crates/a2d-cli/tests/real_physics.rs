@@ -15,6 +15,10 @@
 
 use a2d_core::ir::cubism::CubismIr;
 use a2d_core::LoadReport;
+
+#[path = "support/mod.rs"]
+mod support;
+
 use a2d_pack::{Package, PackageModel};
 
 fn import() -> Option<(Package, LoadReport)> {
@@ -72,14 +76,9 @@ fn recovered_physics_survives_a_package_byte_for_byte_and_validates() {
     assert_eq!(back.physics, model(&package).physics);
     assert_eq!(Package::from_cubism(back, "x", "y").encode_model().expect("re-encode"), first);
 
-    // Notes recorded at import are expected; anything else is a real problem.
-    let problems: Vec<String> = package
-        .validate()
-        .warnings()
-        .iter()
-        .map(|w| w.to_string())
-        .filter(|w| !w.starts_with("recorded at import:"))
-        .collect();
+    // Expected: notes recorded at import and the repeat notes `validate`
+    // re-derives for inferred looping parameters. Anything else is a real problem.
+    let problems = support::unexpected_validate_warnings(&package);
     assert!(problems.is_empty(), "validate reported: {problems:#?}");
 }
 

@@ -575,3 +575,25 @@ pub fn cubism_deformation_package() -> a2d_pack::Package {
     package.textures.push(a2d_pack::TextureFile { file: "texture_00.png".into(), bytes: Fixture::png(64, 64) });
     package
 }
+
+/// `validate` warnings that are not expected on an imported real model.
+///
+/// Expected: notes recorded at import, and exactly the per-parameter
+/// "treated as repeating" notes the model itself derives (a MOC3 v2 stores no
+/// repeat flag, so `validate` re-derives them via `repeat_degradations`).
+/// Anything else is returned.
+pub fn unexpected_validate_warnings(package: &a2d_pack::Package) -> Vec<String> {
+    let expected: Vec<String> = package
+        .model
+        .as_cubism()
+        .map(|ir| ir.repeat_degradations().iter().map(|d| d.to_string()).collect())
+        .unwrap_or_default();
+    package
+        .validate()
+        .warnings()
+        .iter()
+        .map(|w| w.to_string())
+        .filter(|w| !w.starts_with("recorded at import:"))
+        .filter(|w| !expected.contains(w))
+        .collect()
+}
