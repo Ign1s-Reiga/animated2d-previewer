@@ -329,6 +329,26 @@ impl Viewer {
         Ok(())
     }
 
+    /// Plays an idle variation once on the active model, then returns to
+    /// `selected` (the animation the user chose), looping.
+    ///
+    /// Fails without touching playback when either name is unknown.
+    pub fn start_idle_variation(
+        &mut self,
+        variation: &str,
+        selected: Option<&str>,
+        mix: Duration,
+    ) -> Result<(), ViewerError> {
+        start_idle_variation(self.models[self.active].model.as_mut(), variation, selected, mix)?;
+        Ok(())
+    }
+
+    /// Restarts the active model's idle timer, so a variation does not fire
+    /// right after the user chose an animation.
+    pub fn reset_idle(&mut self) {
+        self.models[self.active].idle.reset();
+    }
+
     /// Advances the active model, and returns an idle variation when one is due.
     ///
     /// The caller decides what to do with it; the viewer does not queue it
@@ -389,9 +409,163 @@ impl Viewer {
     }
 }
 
+/// Plays `variation` once, then queues `selected` back, looping.
+///
+/// The variation must not loop: Spine advances its queue only when a
+/// non-looping entry completes (Cubism also advances at a loop wrap), so a
+/// looping variation would never hand back on Spine. Both names are checked
+/// first, so a bad name cannot leave the model half-switched.
+fn start_idle_variation(
+    model: &mut dyn AnimatedModel,
+    variation: &str,
+    selected: Option<&str>,
+    mix: Duration,
+) -> Result<(), a2d_core::RuntimeError> {
+    for name in std::iter::once(variation).chain(selected) {
+        if !model.animations().iter().any(|a| a.name == name) {
+            return Err(a2d_core::RuntimeError::UnknownAnimation(name.to_string()));
+        }
+    }
+    model.play_animation(variation, PlayOptions::once().with_mix(mix))?;
+    if let Some(name) = selected {
+        model.play_animation(name, PlayOptions::looping().with_mix(mix).queued())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records every `PlayOptions` it is handed.
+    #[derive(Default)]
+    struct Recorder {
+        played: Vec<(String, PlayOptions)>,
+        animations: Vec<a2d_core::AnimationInfo>,
+    }
+
+    fn recorder() -> Recorder {
+        let animations = ["Fidget", "Stand"]
+            .into_iter()
+            .map(|n| a2d_core::AnimationInfo { name: n.into(), duration: 1.0 })
+            .collect();
+        Recorder { played: Vec::new(), animations }
+    }
+
+    impl AnimatedModel for Recorder {
+        fn update(&mut self, _dt: Duration) -> Result<(), a2d_core::RuntimeError> {
+            Ok(())
+        }
+        fn emit(&self, _out: &mut RenderList) {}
+        fn play_animation(&mut self, n: &str, o: PlayOptions) -> Result<(), a2d_core::RuntimeError> {
+            self.played.push((n.to_string(), o));
+            Ok(())
+        }
+        fn stop_animation(&mut self, _n: &str) {}
+        fn set_expression(&mut self, _n: &str) -> Result<(), a2d_core::RuntimeError> {
+            Ok(())
+        }
+        fn animations(&self) -> &[a2d_core::AnimationInfo] {
+            &self.animations
+        }
+        fn expressions(&self) -> &[a2d_core::ExpressionInfo] {
+            &[]
+        }
+        fn bounds(&self) -> Aabb {
+            Aabb::EMPTY
+        }
+        fn hit_test(&self, _x: f32, _y: f32) -> Option<a2d_core::HitAreaId> {
+            None
+        }
+        fn dispose(&mut self) {}
+        fn display_name(&self) -> &str {
+            "recorder"
+        }
+    }
+
+    #[test]
+    fn a_variation_plays_once_then_the_idle_is_queued_looping() {
+        let mut model = recorder();
+        let mix = Duration::from_millis(300);
+        start_idle_variation(&mut model, "Fidget", Some("Stand"), mix).unwrap();
+
+        assert_eq!(model.played.len(), 2);
+        assert_eq!(model.played[0].0, "Fidget");
+        assert_eq!(model.played[0].1, PlayOptions::once().with_mix(mix));
+        assert_eq!(model.played[1].0, "Stand");
+        assert_eq!(model.played[1].1, PlayOptions::looping().with_mix(mix).queued());
+    }
+
+    #[test]
+    fn a_variation_without_a_selected_animation_queues_nothing() {
+        let mut model = recorder();
+        start_idle_variation(&mut model, "Fidget", None, Duration::ZERO).unwrap();
+        assert_eq!(model.played.len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_name_fails_before_touching_playback() {
+        let mut model = recorder();
+        assert!(start_idle_variation(&mut model, "Fidget", Some("Gone"), Duration::ZERO).is_err());
+        assert!(start_idle_variation(&mut model, "Gone", Some("Stand"), Duration::ZERO).is_err());
+        assert!(model.played.is_empty());
+    }
+
+    fn spine_model() -> a2d_runtime::GenericSpineModel {
+        use a2d_core::ir::ids::BoneId;
+        use a2d_core::ir::spine::{Animation, Bone, ScalarKey, SpineIr, Timeline};
+        use a2d_core::Interpolation;
+        let anim = |name: &str, duration: f32, to: f32| Animation {
+            name: name.into(),
+            duration,
+            timelines: vec![Timeline::BoneRotate {
+                bone: BoneId(0),
+                keys: vec![
+                    ScalarKey { time: 0.0, value: 0.0, interp: Interpolation::Linear },
+                    ScalarKey { time: duration, value: to, interp: Interpolation::Linear },
+                ],
+            }],
+        };
+        let mut ir = SpineIr {
+            bones: vec![Bone::new("root", None)],
+            animations: vec![anim("stand", 1.0, 10.0), anim("fidget", 0.5, 90.0)],
+            ..Default::default()
+        };
+        ir.rebuild_derived();
+        a2d_runtime::GenericSpineModel::load(Arc::new(ir), "rig")
+    }
+
+    fn current_name(model: &a2d_runtime::GenericSpineModel) -> String {
+        let index = model.state().track(0).and_then(|t| t.current()).map(|e| e.animation).unwrap();
+        model.animations()[index].name.clone()
+    }
+
+    #[test]
+    fn a_spine_variation_hands_back_to_the_selected_animation() {
+        let mix = Duration::from_millis(300);
+        let mut model = spine_model();
+        model.play_animation("stand", PlayOptions::looping()).unwrap();
+        start_idle_variation(&mut model, "fidget", Some("stand"), mix).unwrap();
+        assert_eq!(current_name(&model), "fidget");
+        for _ in 0..10 {
+            model.update(Duration::from_millis(100)).unwrap();
+        }
+        assert_eq!(current_name(&model), "stand");
+    }
+
+    #[test]
+    fn a_looping_variation_never_hands_back_on_spine() {
+        // The control: this is what the host did before, and it is stuck.
+        let mix = Duration::from_millis(300);
+        let mut model = spine_model();
+        model.play_animation("stand", PlayOptions::looping()).unwrap();
+        model.play_animation("fidget", PlayOptions::looping().with_mix(mix)).unwrap();
+        model.play_animation("stand", PlayOptions::looping().with_mix(mix).queued()).unwrap();
+        for _ in 0..10 {
+            model.update(Duration::from_millis(100)).unwrap();
+        }
+        assert_eq!(current_name(&model), "fidget");
+    }
 
     /// A model whose extent grows partway through its animation, like a rig
     /// that swings a weapon well past its standing silhouette.

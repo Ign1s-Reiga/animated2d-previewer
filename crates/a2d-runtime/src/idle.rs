@@ -108,8 +108,8 @@ impl IdleDirector {
 
     /// Advances the idle timer. Returns a variation to play when one is due.
     ///
-    /// The caller is expected to play it once, queued back into the default
-    /// idle; this type only decides *what* and *when*.
+    /// The caller is expected to play it once and then return to the animation
+    /// the user selected; this type only decides *what* and *when*.
     pub fn update(&mut self, dt: f32) -> Option<String> {
         if self.variations.is_empty() {
             return None;

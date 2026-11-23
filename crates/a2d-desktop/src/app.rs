@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use a2d_core::{LoadReport, PlayOptions, Vec2};
+use a2d_core::{LoadReport, Vec2};
 use a2d_render::{GpuContext, RenderError, Viewport};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -568,19 +568,14 @@ impl App {
         self.last_frame = now;
 
         let paused = self.state.is_paused();
-        let standing_idle = self.state.animation_name().map(str::to_string);
+        let selected = self.state.animation_name().map(str::to_string);
         let Some(active) = &mut self.active else { return };
 
         match active.viewer.update(dt, paused) {
             Ok(Some(variation)) => {
                 // Play the variation once, then queue the standing idle back.
-                let _ = active.viewer.play(&variation, IDLE_MIX);
-                if let Some(name) = standing_idle {
-                    let _ = active
-                        .viewer
-                        .active_mut()
-                        .model
-                        .play_animation(&name, PlayOptions::looping().with_mix(IDLE_MIX).queued());
+                if let Err(e) = active.viewer.start_idle_variation(&variation, selected.as_deref(), IDLE_MIX) {
+                    self.report.note(format!("idle variation {variation:?} could not start: {e}"));
                 }
             }
             Ok(None) => {}
@@ -687,6 +682,7 @@ impl App {
         let Some(name) = self.state.animation_name().map(str::to_string) else { return };
         if let Some(active) = &mut self.active {
             let _ = active.viewer.play(&name, MANUAL_MIX);
+            active.viewer.reset_idle();
         }
     }
 
@@ -704,6 +700,7 @@ impl App {
         if let Some(name) = name {
             let _ = active.viewer.play(&name, Duration::ZERO);
         }
+        active.viewer.reset_idle();
     }
 
     fn save_config(&mut self, report: &mut LoadReport) {
