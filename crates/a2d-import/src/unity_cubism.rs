@@ -29,6 +29,7 @@
 //! maps each of these back to the path it was authored under.
 
 mod clip_motion;
+mod drivers;
 mod fade_motion;
 mod handover;
 mod physics;
@@ -152,6 +153,9 @@ pub fn inspect_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<CubismInv
         .map(|o| o.name.clone().unwrap_or_else(|| format!("controller#{}", o.path_id)))
         .collect();
 
+    let physics = recover_physics(&file, &inventory, report);
+    drivers::note_unapplied(&file, &inventory, report);
+
     let out = CubismInventory {
         unity_revision: bundle.unity_revision.clone(),
         object_count: inventory.objects.len(),
@@ -164,7 +168,7 @@ pub fn inspect_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<CubismInv
         parts: inventory.by_script("CubismPart").count(),
         drawables: inventory.by_script("CubismDrawable").count(),
         fade_sources,
-        physics: recover_physics(&file, &inventory, report),
+        physics,
     };
 
     if out.moc.is_none() {

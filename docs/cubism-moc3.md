@@ -888,8 +888,23 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
   shape and the 150/300 ms lengths are the Cubism-family convention and the
   host's choice, not read from the assets (their Unity controllers specify 0.25 s
   linear transitions back to a default state); no reference runtime was compared.
-- **Physics, pose files, expressions, hit areas.** All live outside the MOC3 and
-  are not read.
+- **Pose files, expressions, hit areas.** All live outside the MOC3 and are not
+  read. (Physics is read: the rig is recovered from the bundle's physics
+  controller and simulated during playback.)
+- **Look-at rig: present, not applied, reported.** Every model seen carries the
+  SDK's look-at controller (additive blend, damping 0.15, a target child object)
+  and four or five look parameters, each an axis and a factor on a model
+  parameter (the angle and eye-ball ones). Established by reading the bundle
+  bytes of six models: the script class histogram, and component bodies that fit
+  the field layout to the byte (a 32-byte controller, an 8-byte parameter). At
+  the target position stored in the prefab the rig adds a constant, tiny offset
+  (at most about 0.55 degrees of head angle, 1.8 % of eye-ball range, and exactly
+  zero on four of the six); nothing in a bundle moves the target, only game code
+  could, which is unverified. Not applied, so playback matches the source at its
+  stored target to within that offset. The import names the rig in a note, with
+  the parameters it drives. The same note mechanism covers eye blink, mouth,
+  harmonic motion, breath, an expression list and pose parts, which none of the
+  six models carries (their blinks, breath and mouth are keyed in the clips).
 - **Draw order: what is unverified.** Painting follows the rule in §6 and
   matches the official runtime's recorded order at rest on four models, but not
   yet anywhere a draw order is fractional or animated. Unchecked: whether Core
