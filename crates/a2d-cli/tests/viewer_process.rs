@@ -155,7 +155,8 @@ fn the_viewer_draws_a_window_and_saves_its_settings_on_the_way_out() {
 
     let model = config.active_model().unwrap_or_else(|| panic!("no model was recorded in {config:?}"));
     assert_eq!(model.package, package, "the opened package should be remembered");
-    assert_eq!(model.animation.as_deref(), Some("idle"), "the playing animation should be remembered");
+    // The default animation is not stored: only a choice that differs from it is.
+    assert_eq!(model.animation, None, "the default animation should not be pinned in the config");
     assert!(config.window.size.0 > 0 && config.window.size.1 > 0, "a window size should be recorded");
     assert!(config.window.position.is_some(), "a window position should be recorded");
 }

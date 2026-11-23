@@ -196,6 +196,7 @@ impl LoadedModel {
             package: self.package_path.clone(),
             display_name: self.model.display_name().to_string(),
             animations: self.model.animations().iter().map(|a| a.name.clone()).collect(),
+            default_animation: self.model.default_animation().map(str::to_string),
             reopenable: self.reopenable,
         }
     }
