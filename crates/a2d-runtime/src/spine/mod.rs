@@ -25,6 +25,13 @@ pub use state::AnimationState;
 /// mutable pose and animation state, so several characters can share one
 /// decode. The spec's single `GenericSpineModel` is split this way for the same
 /// reason Spine itself splits `SkeletonData` from `Skeleton`.
+///
+/// Queued entries follow the shared contract of [`PlayOptions::queued`] and
+/// [`PlayOptions::handover_at`]. One difference from the Cubism model: a
+/// takeover that happens while the track is still crossfading out an older
+/// entry drops that older mix, so the pose snaps to the new crossfade instead
+/// of fading from the blended pose. Chained mixing is not implemented because
+/// Spine data never carries handovers.
 #[derive(Debug)]
 pub struct GenericSpineModel {
     ir: Arc<SpineIr>,
@@ -43,8 +50,11 @@ pub struct GenericSpineModel {
 impl GenericSpineModel {
     /// Builds a playable model from decoded IR.
     pub fn load(ir: Arc<SpineIr>, display_name: impl Into<String>) -> Self {
-        let animations =
-            ir.animations.iter().map(|a| AnimationInfo { name: a.name.clone(), duration: a.duration }).collect();
+        let animations = ir
+            .animations
+            .iter()
+            .map(|a| AnimationInfo { name: a.name.clone(), duration: a.duration, then: None })
+            .collect();
         let expressions = ir.skins.iter().map(|s| ExpressionInfo { name: s.name.clone() }).collect();
         let pose = SkeletonPose::new(ir.clone());
         GenericSpineModel {
@@ -162,7 +172,8 @@ impl AnimatedModel for GenericSpineModel {
         let delay = opts.delay.as_secs_f32();
         let mix = opts.mix_duration.as_secs_f32();
         if opts.queued {
-            self.state.add_animation(track, index, opts.looping, speed, delay, mix);
+            let at = opts.handover_at.map(|d| d.as_secs_f32());
+            self.state.add_animation_at(track, index, opts.looping, speed, delay, mix, at);
         } else {
             self.state.set_animation(track, index, opts.looping, speed, delay, mix);
         }
@@ -174,6 +185,14 @@ impl AnimatedModel for GenericSpineModel {
         if let Ok(index) = self.animation_index(name) {
             self.state.stop_animation(index);
         }
+    }
+
+    /// Track 0's current entry. It changes when a crossfade into a new entry
+    /// starts, including a queued takeover, and is `None` once a one-shot has
+    /// ended with nothing queued.
+    fn current_animation(&self) -> Option<&str> {
+        let entry = self.state.track(0)?.current()?;
+        self.ir.animations.get(entry.animation).map(|a| a.name.as_str())
     }
 
     fn set_expression(&mut self, name: &str) -> Result<(), RuntimeError> {
@@ -496,5 +515,51 @@ mod tests {
         }
         let playing = m.state().track(0).unwrap().current().unwrap().animation;
         assert_eq!(m.ir().animations[playing].name, "wave");
+    }
+
+    #[test]
+    fn current_animation_follows_play_takeover_end_and_stop() {
+        let mut m = model();
+        assert_eq!(m.current_animation(), None);
+        m.play_animation("idle", PlayOptions::once().with_mix(Duration::from_millis(100))).unwrap();
+        assert_eq!(m.current_animation(), Some("idle"));
+        m.play_animation("wave", PlayOptions::looping().queued()).unwrap();
+        assert_eq!(m.current_animation(), Some("idle"), "queued, not yet taken over");
+        for _ in 0..12 {
+            m.update(Duration::from_millis(100)).unwrap();
+        }
+        assert_eq!(m.current_animation(), Some("wave"));
+        m.stop_animation("wave");
+        assert_eq!(m.current_animation(), None);
+        m.play_animation("idle", PlayOptions::once()).unwrap();
+        for _ in 0..30 {
+            m.update(Duration::from_millis(100)).unwrap();
+        }
+        assert_eq!(m.current_animation(), None, "a finished one-shot leaves the track empty");
+    }
+
+    #[test]
+    fn a_queued_animation_takes_over_a_looping_one_at_its_wrap_through_the_model() {
+        let mut m = model();
+        m.play_animation("idle", PlayOptions::looping()).unwrap();
+        m.play_animation("wave", PlayOptions::looping().queued()).unwrap();
+        m.update(Duration::from_millis(100)).unwrap();
+        assert_eq!(m.current_animation(), Some("idle"));
+        for _ in 0..60 {
+            m.update(Duration::from_millis(100)).unwrap();
+        }
+        assert_eq!(m.current_animation(), Some("wave"));
+    }
+
+    #[test]
+    fn a_handover_time_reaches_the_state_through_the_model() {
+        let mut m = model();
+        m.play_animation("idle", PlayOptions::looping()).unwrap();
+        let at = Duration::from_millis(50);
+        m.play_animation("wave", PlayOptions::looping().queued().with_handover_at(at)).unwrap();
+        m.update(Duration::from_millis(20)).unwrap();
+        assert_eq!(m.current_animation(), Some("idle"));
+        m.update(Duration::from_millis(40)).unwrap();
+        assert_eq!(m.current_animation(), Some("wave"));
     }
 }

@@ -24,7 +24,24 @@ pub struct PlayOptions {
     /// Delay before the animation starts, measured from the call.
     pub delay: Duration,
     /// Append after what is already queued on the track instead of replacing it.
+    ///
+    /// A queued entry takes over at the end of the current pass of the entry
+    /// ahead of it: for a once entry when it finishes, for a looping entry at
+    /// its next loop wrap. [`PlayOptions::handover_at`] moves that moment
+    /// earlier.
+    ///
+    /// The end of a pass follows the playing direction. At a negative speed
+    /// the playhead starts at the end of the animation and runs towards 0: a
+    /// once entry ends when it reaches 0 and a looping entry wraps there. At
+    /// speed 0 a pass never ends, so nothing queued behind it takes over.
     pub queued: bool,
+    /// For a `queued` entry: the takeover (the start of the crossfade) happens
+    /// when the playhead of the entry ahead of it reaches this time, measured
+    /// within its current pass. `None` is the end of the pass. Ignored for an
+    /// entry that is not queued. A runtime that cannot honour it (a playhead
+    /// running backwards, or a time past the end of the pass) falls back to the
+    /// end of the pass.
+    pub handover_at: Option<Duration>,
 }
 
 impl Default for PlayOptions {
@@ -36,6 +53,7 @@ impl Default for PlayOptions {
             speed: 1.0,
             delay: Duration::ZERO,
             queued: false,
+            handover_at: None,
         }
     }
 }
@@ -71,8 +89,20 @@ impl PlayOptions {
         self
     }
 
+    /// Appends after what is already on the track instead of replacing it.
+    ///
+    /// The entry takes over at the end of the current pass of the entry ahead
+    /// of it: for a once entry when it finishes, for a looping entry at its
+    /// next loop wrap, or at [`PlayOptions::with_handover_at`] if given.
     pub fn queued(mut self) -> Self {
         self.queued = true;
+        self
+    }
+
+    /// For a queued entry, start the takeover when the entry ahead reaches
+    /// `at` into its current pass instead of at its end.
+    pub fn with_handover_at(mut self, at: Duration) -> Self {
+        self.handover_at = Some(at);
         self
     }
 }
@@ -83,6 +113,8 @@ pub struct AnimationInfo {
     pub name: String,
     /// Length of one pass, in seconds.
     pub duration: f32,
+    /// What the source says follows this animation, if it says anything.
+    pub then: Option<Handover>,
 }
 
 /// A scripted return from one animation to another.
@@ -162,6 +194,10 @@ pub trait AnimatedModel {
     /// Appends this model's current frame to `out`.
     fn emit(&self, out: &mut RenderList);
 
+    /// Starts `name`. A `queued` entry waits behind the one ahead of it and
+    /// takes over at the end of that entry's current pass (when a once entry
+    /// finishes, at a looping entry's next wrap), or at
+    /// [`PlayOptions::handover_at`] if given; see [`PlayOptions::queued`].
     fn play_animation(&mut self, name: &str, opts: PlayOptions) -> Result<(), RuntimeError>;
 
     /// Stops `name` wherever it is playing. Unknown names are a no-op, since
@@ -193,6 +229,14 @@ pub trait AnimatedModel {
         preferred_animation(self.animations())
     }
 
+    /// The animation that most recently took over track 0: it changes when a
+    /// crossfade into a new animation starts, including a queued takeover, and
+    /// is `None` when nothing plays. Default `None`, for a model that does not
+    /// track it.
+    fn current_animation(&self) -> Option<&str> {
+        None
+    }
+
     /// Scales the whole model. A negative component mirrors it.
     ///
     /// Default is to ignore it, for a model that cannot be mirrored meaningfully.
@@ -222,7 +266,7 @@ pub trait AnimatedModel {
 #[cfg(test)]
 mod tests {
     fn named(names: &[&str]) -> Vec<AnimationInfo> {
-        names.iter().map(|n| AnimationInfo { name: (*n).to_string(), duration: 1.0 }).collect()
+        names.iter().map(|n| AnimationInfo { name: (*n).to_string(), duration: 1.0, then: None }).collect()
     }
 
     #[test]
@@ -326,5 +370,48 @@ mod tests {
         assert_eq!(o.delay, Duration::from_millis(50));
         assert!(o.queued);
         assert!(!o.looping);
+        assert_eq!(o.handover_at, None);
+    }
+
+    #[test]
+    fn with_handover_at_sets_the_takeover_time() {
+        let o = PlayOptions::once().queued().with_handover_at(Duration::from_millis(750));
+        assert_eq!(o.handover_at, Some(Duration::from_millis(750)));
+        assert!(o.queued);
+    }
+
+    #[test]
+    fn current_animation_defaults_to_none() {
+        struct Bare;
+        impl AnimatedModel for Bare {
+            fn update(&mut self, _: Duration) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+            fn emit(&self, _: &mut RenderList) {}
+            fn play_animation(&mut self, _: &str, _: PlayOptions) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+            fn stop_animation(&mut self, _: &str) {}
+            fn set_expression(&mut self, _: &str) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+            fn animations(&self) -> &[AnimationInfo] {
+                &[]
+            }
+            fn expressions(&self) -> &[ExpressionInfo] {
+                &[]
+            }
+            fn bounds(&self) -> Aabb {
+                Aabb::EMPTY
+            }
+            fn hit_test(&self, _: f32, _: f32) -> Option<HitAreaId> {
+                None
+            }
+            fn dispose(&mut self) {}
+            fn display_name(&self) -> &str {
+                "bare"
+            }
+        }
+        assert_eq!(Bare.current_animation(), None);
     }
 }

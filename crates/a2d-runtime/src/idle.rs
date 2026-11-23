@@ -135,7 +135,7 @@ mod tests {
     use super::*;
 
     fn animations(names: &[&str]) -> Vec<AnimationInfo> {
-        names.iter().map(|n| AnimationInfo { name: (*n).to_string(), duration: 1.0 }).collect()
+        names.iter().map(|n| AnimationInfo { name: (*n).to_string(), duration: 1.0, then: None }).collect()
     }
 
     #[test]

@@ -128,6 +128,38 @@ impl MotionPlayer {
         self.looping = false;
     }
 
+    /// Detaches this player from its pass at `at` seconds: the playhead goes
+    /// there and the motion stops looping, so advancing it further plays out
+    /// the rest of the pass and clamps at the end. Used for the outgoing side
+    /// of a handover that starts before the pass ends.
+    pub fn detach_at(&mut self, ir: &CubismIr, at: f32) {
+        self.seek(ir, at);
+        self.looping = false;
+    }
+
+    /// Whether advancing by `dt` wall-clock seconds moves the playhead across
+    /// `at` (seconds into the pass), and if so how much of `dt` was past it.
+    ///
+    /// Only a forward playhead can cross: `None` for a zero or negative speed,
+    /// for an `at` that is not within `[0, duration)`, for a playhead already
+    /// beyond `at`, and for a step of no time. A step that lands exactly on `at`
+    /// crosses, with an overshoot of zero. Does not move the playhead.
+    pub fn crossing(&self, ir: &CubismIr, dt: f32, at: f32) -> Option<f32> {
+        let m = ir.motions.get(self.motion)?;
+        if dt.is_nan()
+            || dt <= 0.0
+            || self.speed.is_nan()
+            || self.speed <= 0.0
+            || !at.is_finite()
+            || at < 0.0
+            || at >= m.duration
+        {
+            return None;
+        }
+        let raw = self.time + dt * self.speed;
+        (self.time <= at && raw >= at).then(|| (raw - at) / self.speed)
+    }
+
     /// Whether a non-looping motion has reached its end.
     pub fn is_finished(&self) -> bool {
         self.finished

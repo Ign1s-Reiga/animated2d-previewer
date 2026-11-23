@@ -26,6 +26,12 @@
 //! fade is done fades from the pose the model was showing (a snapshot of the
 //! blended values), so nothing jumps.
 //!
+//! A queued motion with a handover time ([`PlayOptions::handover_at`]) starts
+//! its crossfade when the outgoing motion's playhead crosses that time; the
+//! outgoing motion then plays out the rest of its pass under the fade (it does
+//! not loop and clamps at its end), and the time past the crossing is carried
+//! into both the incoming playhead and the fade.
+//!
 //! The fade times a motion may carry (`Motion::fade_in` and the per-curve
 //! overrides in the IR) are stored but not applied: the assets this was built
 //! against have none, so the length of a fade is the host's choice.
@@ -84,6 +90,9 @@ struct Pending {
     speed: f32,
     /// Crossfade length in seconds when it takes over; zero cuts.
     mix: f32,
+    /// Seconds into the outgoing motion's pass at which it takes over, instead
+    /// of at the end of the pass.
+    handover_at: Option<f32>,
 }
 
 /// What the outgoing side of a crossfade shows.
@@ -168,8 +177,15 @@ impl GenericCubismModel {
             }
         }
 
-        let animations: Vec<AnimationInfo> =
-            moc.motions.iter().map(|m| AnimationInfo { name: m.name.clone(), duration: m.duration }).collect();
+        let animations: Vec<AnimationInfo> = moc
+            .motions
+            .iter()
+            .map(|m| AnimationInfo {
+                name: m.name.clone(),
+                duration: m.duration,
+                then: moc.handovers.iter().find(|h| h.from == m.name).map(|h| h.handover.clone()),
+            })
+            .collect();
         let pose = moc.pose(&values);
         let mut repeating = vec![false; moc.parameters.len()];
         for index in moc.repeating_parameters() {
@@ -196,12 +212,21 @@ impl GenericCubismModel {
         };
         // Open on the same kind of animation the Spine side does, rather than a
         // second rule for what a standing pose is called.
-        if let Some(index) =
-            preferred_animation(&model.animations).and_then(|name| model.animations.iter().position(|a| a.name == name))
+        if let Some(index) = model.default_name().and_then(|name| model.animations.iter().position(|a| a.name == name))
         {
             model.start_motion(index, true, 1.0, 0.0);
         }
         model
+    }
+
+    /// The source's default motion when it names one of the motions, else the
+    /// shared name heuristic.
+    fn default_name(&self) -> Option<&str> {
+        self.moc
+            .default_motion
+            .as_deref()
+            .filter(|name| self.animations.iter().any(|a| a.name == *name))
+            .or_else(|| preferred_animation(&self.animations))
     }
 
     /// Puts every parameter back to its default.
@@ -350,13 +375,43 @@ impl AnimatedModel for GenericCubismModel {
         let step = dt.as_secs_f32().min(0.1);
         self.elapsed += step;
         let mut leftover = None;
-        if let Some(player) = &mut self.motion {
-            leftover = player.advance(&self.moc, step);
+        // A queued entry with a handover time takes over when the playhead
+        // crosses it, part-way through this step; the crossing leaves the
+        // outgoing player un-advanced here and is resolved below.
+        let crossing = match (&self.motion, &self.pending) {
+            (Some(player), Some(next)) => {
+                next.handover_at.and_then(|at| player.crossing(&self.moc, step, at).map(|over| (at, over)))
+            }
+            _ => None,
+        };
+        if crossing.is_none() {
+            if let Some(player) = &mut self.motion {
+                leftover = player.advance(&self.moc, step);
+            }
         }
         if let Some(fade) = &mut self.fading {
             fade.elapsed += step;
             if let FadeFrom::Player(outgoing) = &mut fade.from {
                 outgoing.advance(&self.moc, step);
+            }
+        }
+        if let Some((at, over)) = crossing {
+            if let Some(next) = self.pending.take() {
+                // The outgoing motion plays on from `at` as a non-looping player
+                // that clamps at its end, so the fade runs under the rest of it.
+                if let Some(player) = &mut self.motion {
+                    player.detach_at(&self.moc, at);
+                    player.advance(&self.moc, over);
+                }
+                self.start_motion(next.index, next.looping, next.speed, next.mix);
+                // Carry the time past `at` into the new motion and the fade, so
+                // the result does not depend on where the step boundaries fell.
+                if let Some(player) = &mut self.motion {
+                    player.advance(&self.moc, over);
+                }
+                if let Some(fade) = &mut self.fading {
+                    fade.elapsed += over;
+                }
             }
         }
         if let Some(over) = leftover {
@@ -433,6 +488,13 @@ impl AnimatedModel for GenericCubismModel {
     /// older queued entry; its own `mix_duration` is the crossfade from the end
     /// of the motion it waited for. With nothing playing it starts at once. A
     /// call that is not queued discards whatever was waiting.
+    ///
+    /// [`PlayOptions::handover_at`] makes a queued entry take over when the
+    /// outgoing motion's playhead reaches that time within its pass, with the
+    /// outgoing motion playing on (and clamping at its end) under the fade. It
+    /// falls back to the end-of-pass rule for a backwards or stationary
+    /// outgoing motion, for a time outside `[0, duration)`, and when the
+    /// playhead is already past it.
     fn play_animation(&mut self, name: &str, opts: PlayOptions) -> Result<(), RuntimeError> {
         let index = self
             .animations
@@ -440,8 +502,13 @@ impl AnimatedModel for GenericCubismModel {
             .position(|a| a.name == name)
             .ok_or_else(|| RuntimeError::UnknownAnimation(name.to_string()))?;
         if opts.queued && self.motion.is_some() {
-            self.pending =
-                Some(Pending { index, looping: opts.looping, speed: opts.speed, mix: opts.mix_duration.as_secs_f32() });
+            self.pending = Some(Pending {
+                index,
+                looping: opts.looping,
+                speed: opts.speed,
+                mix: opts.mix_duration.as_secs_f32(),
+                handover_at: opts.handover_at.map(|d| d.as_secs_f32()),
+            });
         } else {
             self.pending = None;
             self.start_motion(index, opts.looping, opts.speed, opts.mix_duration.as_secs_f32());
@@ -518,6 +585,12 @@ impl AnimatedModel for GenericCubismModel {
             self.reset_values();
             self.step_physics(0.0);
             self.repose();
+            // What was queued behind it takes over at once, as on the Spine
+            // side. Nothing is playing to fade from, so it is a cut whatever mix
+            // it asked for.
+            if let Some(next) = self.pending.take() {
+                self.start_motion(next.index, next.looping, next.speed, 0.0);
+            }
         } else if drop_outgoing {
             // Stopping the motion being faded out ends the fade: what is left is
             // the incoming motion alone.
@@ -571,6 +644,15 @@ impl AnimatedModel for GenericCubismModel {
 
     fn display_name(&self) -> &str {
         &self.name
+    }
+
+    fn default_animation(&self) -> Option<&str> {
+        self.default_name()
+    }
+
+    fn current_animation(&self) -> Option<&str> {
+        let player = self.motion.as_ref()?;
+        self.animations.get(player.motion_index()).map(|a| a.name.as_str())
     }
 
     fn absorb_degradations(&self, report: &mut a2d_core::LoadReport) {
@@ -953,6 +1035,334 @@ mod tests {
         assert_eq!(player.motion_index(), 1);
         // Ten steps is 1.0 s; A ended at 0.95 s, so B is 0.05 s in.
         assert!((player.playhead() - 0.05).abs() < 1e-3, "{}", player.playhead());
+    }
+
+    // ---- handovers, the default motion and the current animation ----
+
+    fn handover(from: &str, to: &str, at: f32, mix: f32) -> a2d_core::ir::cubism::MotionHandover {
+        a2d_core::ir::cubism::MotionHandover {
+            from: from.into(),
+            handover: a2d_core::Handover { animation: to.into(), at, mix },
+        }
+    }
+
+    fn with_source(
+        motions: Vec<Motion>,
+        default_motion: Option<&str>,
+        handovers: Vec<a2d_core::ir::cubism::MotionHandover>,
+    ) -> GenericCubismModel {
+        let bytes = crate::moc3::tests::Builder::new().build();
+        let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+        ir.parameter_repeats = None;
+        ir.parameters.push(crate::moc3::Parameter {
+            id: "ParamExtra".into(),
+            minimum: 0.0,
+            maximum: 10.0,
+            default: 2.0,
+        });
+        ir.motions = motions;
+        ir.default_motion = default_motion.map(str::to_string);
+        ir.handovers = handovers;
+        GenericCubismModel::load(ir, "test")
+    }
+
+    /// One second, `ParamExtra` rising linearly from 0 to 10.
+    fn ramp(name: &str) -> Motion {
+        Motion {
+            name: name.into(),
+            duration: 1.0,
+            curves: vec![MotionCurve {
+                target: "ParamExtra".into(),
+                keys: vec![k(0.0, 0.0, 10.0), k(1.0, 10.0, 10.0)],
+                ..MotionCurve::default()
+            }],
+            ..Motion::default()
+        }
+    }
+
+    /// A model playing `A` (the ramp) once with `B` (a hold at 4) queued behind
+    /// it to take over at `at` over `mix`.
+    fn queued_ramp(at: Option<f32>, mix: f32) -> GenericCubismModel {
+        let mut m = with_source(vec![ramp("A"), hold("B", "ParamExtra", 4.0)], None, Vec::new());
+        m.play_animation("A", PlayOptions::once()).expect("known");
+        let mut opts = PlayOptions::looping().with_mix(Duration::from_secs_f32(mix)).queued();
+        if let Some(at) = at {
+            opts = opts.with_handover_at(Duration::from_secs_f32(at));
+        }
+        m.play_animation("B", opts).expect("known");
+        m
+    }
+
+    fn steps(m: &mut GenericCubismModel, n: usize, dt: Duration) {
+        for _ in 0..n {
+            m.update(dt).expect("update");
+        }
+    }
+
+    /// 1/16 s, exact in f32; an update caps a step at 0.1 s.
+    const STEP: Duration = Duration::from_micros(62_500);
+
+    #[test]
+    fn then_comes_from_the_handovers() {
+        let m = with_source(
+            vec![hold("A", "ParamExtra", 1.0), hold("B", "ParamExtra", 2.0)],
+            None,
+            vec![handover("A", "B", 0.75, 0.25)],
+        );
+        let a = &m.animations()[0];
+        assert_eq!(a.then, Some(a2d_core::Handover { animation: "B".into(), at: 0.75, mix: 0.25 }));
+        assert_eq!(m.animations()[1].then, None);
+    }
+
+    #[test]
+    fn the_default_animation_is_the_sources_default_motion_when_it_names_one() {
+        let motions =
+            || vec![hold("A", "ParamExtra", 1.0), hold("Idle", "ParamExtra", 2.0), hold("C", "ParamExtra", 3.0)];
+        let m = with_source(motions(), Some("C"), Vec::new());
+        assert_eq!(m.default_animation(), Some("C"));
+        assert_eq!(m.current_animation(), Some("C"), "it also opens on it");
+        // Absent, or naming nothing the model has: the name heuristic.
+        assert_eq!(with_source(motions(), None, Vec::new()).default_animation(), Some("Idle"));
+        let m = with_source(motions(), Some("Gone"), Vec::new());
+        assert_eq!(m.default_animation(), Some("Idle"));
+        assert_eq!(m.current_animation(), Some("Idle"));
+    }
+
+    #[test]
+    fn the_current_animation_follows_play_stop_and_the_end_of_a_once_motion() {
+        let mut m = with_source(vec![hold("A", "ParamExtra", 1.0), hold("B", "ParamExtra", 2.0)], None, Vec::new());
+        assert_eq!(m.current_animation(), Some("A"));
+        m.play_animation("B", PlayOptions::once()).expect("known");
+        assert_eq!(m.current_animation(), Some("B"));
+        steps(&mut m, 18, STEP);
+        assert_eq!(m.current_animation(), None, "a finished once motion leaves the track empty");
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.stop_animation("A");
+        assert_eq!(m.current_animation(), None);
+        assert_eq!(model().current_animation(), None);
+    }
+
+    #[test]
+    fn a_queued_takeover_at_the_end_of_a_pass_changes_the_current_animation_then() {
+        let mut m = queued_ramp(None, 0.0);
+        steps(&mut m, 14, STEP);
+        assert_eq!(m.current_animation(), Some("A"), "0.875 s into a one second pass");
+        steps(&mut m, 2, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
+        assert_eq!(value(&m, "ParamExtra"), 4.0);
+    }
+
+    #[test]
+    fn a_queued_entry_with_a_handover_time_starts_its_crossfade_exactly_there() {
+        // A rises 0 -> 10 over one second (10 per second); B holds 4; the fade is
+        // one second long and eased by w = 0.5 - 0.5 cos(pi t). Steps are 1/16 s,
+        // exact in f32, and the handover is at 0.5 s.
+        let mut m = queued_ramp(Some(0.5), 1.0);
+        steps(&mut m, 6, STEP);
+        // 0.375 s: before it. A alone.
+        assert_eq!(m.current_animation(), Some("A"));
+        assert!((value(&m, "ParamExtra") - 3.75).abs() < 1e-5);
+        steps(&mut m, 2, STEP);
+        // 0.5 s: the step lands on it. B has taken over, at weight 0, so A shows: 5.
+        assert_eq!(m.current_animation(), Some("B"));
+        assert!((value(&m, "ParamExtra") - 5.0).abs() < 1e-5, "{}", value(&m, "ParamExtra"));
+        steps(&mut m, 2, STEP);
+        // 0.625 s: fade 0.125 s in, t = 0.125, w = 0.5 - 0.5 cos(pi/8) = 0.0380602.
+        // A is at 6.25, so 6.25 + (4 - 6.25) * 0.0380602 = 6.1643645.
+        assert!((value(&m, "ParamExtra") - 6.164_364_5).abs() < 1e-4, "{}", value(&m, "ParamExtra"));
+    }
+
+    #[test]
+    fn the_outgoing_motion_keeps_moving_during_the_fade_and_clamps_at_its_end() {
+        let mut m = queued_ramp(Some(0.5), 1.0);
+        steps(&mut m, 18, STEP);
+        // 1.125 s: 0.625 s into the fade, t = 0.625, w = 0.5 + 0.5 cos(3pi/8) =
+        // 0.6913417. A has clamped at its end (10) rather than looping back to
+        // 0.125 s -> 1.25: 10 + (4 - 10) * 0.6913417 = 5.8519498.
+        assert!(m.fading.is_some());
+        assert!((value(&m, "ParamExtra") - 5.851_95).abs() < 1e-4, "{}", value(&m, "ParamExtra"));
+        // The fade ends one second after it began, at 1.5 s: B alone.
+        steps(&mut m, 6, STEP);
+        assert!(m.fading.is_none());
+        assert!((value(&m, "ParamExtra") - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_overshoot_is_carried_so_step_size_does_not_matter() {
+        // The handover at 0.53 s falls inside a step whichever size is used.
+        let run = |dt: Duration, n: usize| {
+            let mut m = queued_ramp(Some(0.53), 1.0);
+            steps(&mut m, n, dt);
+            m
+        };
+        let big = Duration::from_secs_f64(1.0 / 16.0);
+        let small = Duration::from_secs_f64(1.0 / 64.0);
+        for (n_big, n_small) in [(12, 48), (16, 64), (20, 80)] {
+            let (a, b) = (run(big, n_big), run(small, n_small));
+            assert_eq!(a.current_animation(), Some("B"));
+            assert!(
+                (value(&a, "ParamExtra") - value(&b, "ParamExtra")).abs() < 1e-5,
+                "{n_big}: {} vs {}",
+                value(&a, "ParamExtra"),
+                value(&b, "ParamExtra")
+            );
+            let (pa, pb) = (a.motion.as_ref().expect("B"), b.motion.as_ref().expect("B"));
+            assert!((pa.playhead() - pb.playhead()).abs() < 1e-5, "the incoming playhead carries it too");
+        }
+        // And against the formula at 1.0 s: 0.47 s into the fade, A at its end.
+        let m = run(big, 16);
+        let w = 0.5 - 0.5 * (std::f32::consts::PI * 0.47).cos();
+        assert!((value(&m, "ParamExtra") - (10.0 + (4.0 - 10.0) * w)).abs() < 1e-4);
+        assert!((m.motion.as_ref().expect("B").playhead() - 0.47).abs() < 1e-5);
+    }
+
+    #[test]
+    fn without_a_handover_time_the_takeover_waits_for_the_end_of_the_pass() {
+        let mut m = queued_ramp(None, 0.5);
+        steps(&mut m, 8, STEP);
+        assert_eq!(m.current_animation(), Some("A"));
+        steps(&mut m, 8, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
+        // The outgoing side is held at its last frame: 10 at weight 0.
+        assert!((value(&m, "ParamExtra") - 10.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_queued_entry_behind_a_looping_one_takes_over_at_the_loop_wrap() {
+        let mut m = with_source(vec![hold("A", "ParamExtra", 5.0), hold("B", "ParamExtra", 9.0)], None, Vec::new());
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", PlayOptions::looping().queued()).expect("known");
+        steps(&mut m, 14, STEP);
+        assert_eq!(m.current_animation(), Some("A"));
+        steps(&mut m, 2, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
+        assert_eq!(value(&m, "ParamExtra"), 9.0);
+    }
+
+    #[test]
+    fn a_handover_time_works_behind_a_looping_entry_in_its_current_pass() {
+        let mut m = with_source(vec![ramp("A"), hold("B", "ParamExtra", 4.0)], None, Vec::new());
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        m.play_animation("B", PlayOptions::looping().queued().with_handover_at(Duration::from_millis(500)))
+            .expect("known");
+        steps(&mut m, 8, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
+    }
+
+    #[test]
+    fn a_handover_time_already_passed_waits_for_the_end_of_the_pass() {
+        let mut m = with_source(vec![ramp("A"), hold("B", "ParamExtra", 4.0)], None, Vec::new());
+        m.play_animation("A", PlayOptions::looping()).expect("known");
+        steps(&mut m, 12, STEP);
+        m.play_animation("B", PlayOptions::looping().queued().with_handover_at(Duration::from_millis(500)))
+            .expect("known");
+        steps(&mut m, 2, STEP);
+        assert_eq!(m.current_animation(), Some("A"), "0.875 s: the 0.5 s mark is behind it");
+        steps(&mut m, 2, STEP);
+        assert_eq!(m.current_animation(), Some("B"), "taken over at the wrap");
+    }
+
+    #[test]
+    fn stopping_the_current_motion_promotes_the_queued_one() {
+        let mut m = queued_ramp(None, 1.0);
+        steps(&mut m, 2, STEP);
+        m.stop_animation("A");
+        assert_eq!(m.current_animation(), Some("B"));
+        assert!(m.pending.is_none() && m.fading.is_none(), "a cut: there is nothing left to fade from");
+        assert!((value(&m, "ParamExtra") - 4.0).abs() < 1e-5);
+        // Stopping the queued entry instead leaves the current one alone.
+        let mut m = queued_ramp(None, 1.0);
+        m.stop_animation("B");
+        assert!(m.pending.is_none());
+        assert_eq!(m.current_animation(), Some("A"));
+    }
+
+    #[test]
+    fn a_handover_time_of_zero_takes_over_on_the_first_update() {
+        let mut m = queued_ramp(Some(0.0), 1.0);
+        assert_eq!(m.current_animation(), Some("A"));
+        steps(&mut m, 1, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
+        // Fade and incoming playhead start one step in; A is at 0.0625 * 10.
+        assert!((m.motion.as_ref().expect("B").playhead() - 0.0625).abs() < 1e-6);
+        assert!((m.fading.as_ref().expect("fading").elapsed - 0.0625).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_handover_crossing_scales_the_overshoot_by_the_outgoing_speed() {
+        // A at speed 2, handover at 0.55 s. Four steps of 1/16 s reach 0.5; the
+        // fifth would reach 0.625, so 0.075 s of motion time (0.0375 s of wall
+        // time) lies past the mark.
+        let mut m = with_source(vec![ramp("A"), hold("B", "ParamExtra", 4.0)], None, Vec::new());
+        m.play_animation("A", PlayOptions::once().with_speed(2.0)).expect("known");
+        m.play_animation(
+            "B",
+            PlayOptions::looping()
+                .with_mix(Duration::from_secs(1))
+                .queued()
+                .with_handover_at(Duration::from_secs_f32(0.55)),
+        )
+        .expect("known");
+        steps(&mut m, 4, STEP);
+        assert_eq!(m.current_animation(), Some("A"));
+        steps(&mut m, 1, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
+        let over = 0.0375;
+        assert!((m.motion.as_ref().expect("B").playhead() - over).abs() < 1e-5);
+        let fade = m.fading.as_ref().expect("fading");
+        assert!((fade.elapsed - over).abs() < 1e-5);
+        let FadeFrom::Player(outgoing) = &fade.from else { panic!("outgoing keeps playing") };
+        assert!((outgoing.playhead() - 0.625).abs() < 1e-5, "{}", outgoing.playhead());
+        // A shows 6.25; B 4; weight 0.5 - 0.5 cos(pi * 0.0375).
+        let w = 0.5 - 0.5 * (std::f32::consts::PI * over).cos();
+        assert!((value(&m, "ParamExtra") - (6.25 + (4.0 - 6.25) * w)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_stationary_outgoing_motion_never_hands_over() {
+        for at in [None, Some(0.5)] {
+            let mut m = with_source(vec![ramp("A"), hold("B", "ParamExtra", 4.0)], None, Vec::new());
+            m.play_animation("A", PlayOptions::looping().with_speed(0.0)).expect("known");
+            let mut opts = PlayOptions::looping().queued();
+            if let Some(at) = at {
+                opts = opts.with_handover_at(Duration::from_secs_f32(at));
+            }
+            m.play_animation("B", opts).expect("known");
+            steps(&mut m, 64, STEP);
+            assert_eq!(m.current_animation(), Some("A"));
+            assert!(m.pending.is_some());
+        }
+    }
+
+    #[test]
+    fn a_backwards_looping_entry_hands_over_when_it_wraps_at_zero() {
+        let mut m = with_source(vec![ramp("A"), hold("B", "ParamExtra", 4.0)], None, Vec::new());
+        m.play_animation("A", PlayOptions::looping().with_speed(-1.0)).expect("known");
+        m.play_animation("B", PlayOptions::looping().queued()).expect("known");
+        steps(&mut m, 15, STEP);
+        assert_eq!(m.current_animation(), Some("A"));
+        steps(&mut m, 1, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
+    }
+
+    #[test]
+    fn a_handover_time_past_the_pass_or_a_backwards_playhead_falls_back_to_the_end_of_the_pass() {
+        let mut m = with_source(vec![ramp("A"), hold("B", "ParamExtra", 4.0)], None, Vec::new());
+        m.play_animation("A", PlayOptions::once()).expect("known");
+        m.play_animation("B", PlayOptions::looping().queued().with_handover_at(Duration::from_secs(5))).expect("known");
+        steps(&mut m, 14, STEP);
+        assert_eq!(m.current_animation(), Some("A"));
+        steps(&mut m, 2, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
+
+        let mut m = with_source(vec![ramp("A"), hold("B", "ParamExtra", 4.0)], None, Vec::new());
+        m.play_animation("A", PlayOptions::once().with_speed(-1.0)).expect("known");
+        m.play_animation("B", PlayOptions::looping().queued().with_handover_at(Duration::from_millis(500)))
+            .expect("known");
+        steps(&mut m, 14, STEP);
+        assert_eq!(m.current_animation(), Some("A"), "0.5 s is crossed going backwards, and ignored");
+        steps(&mut m, 2, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
     }
 
     #[test]

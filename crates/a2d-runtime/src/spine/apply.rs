@@ -60,6 +60,22 @@ pub fn apply_animation(
     }
 }
 
+/// Fires only the event timelines of `animation` in `(last_time, time]`,
+/// leaving the pose untouched.
+pub fn collect_animation_events(
+    pose: &SkeletonPose,
+    animation: &Animation,
+    last_time: f32,
+    time: f32,
+    events: &mut Vec<FiredEvent>,
+) {
+    for timeline in &animation.timelines {
+        if let Timeline::Event { keys } = timeline {
+            collect_events(pose, keys, last_time, time, events);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_timeline(
     pose: &mut SkeletonPose,
