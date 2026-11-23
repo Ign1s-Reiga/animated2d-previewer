@@ -411,9 +411,8 @@ impl Viewer {
 
 /// Plays `variation` once, then queues `selected` back, looping.
 ///
-/// The variation must not loop: Spine advances its queue only when a
-/// non-looping entry completes (Cubism also advances at a loop wrap), so a
-/// looping variation would never hand back on Spine. Both names are checked
+/// The variation must not loop: a looping one would only hand back at its next
+/// wrap, replaying the variation for a pass before the idle returns. Both names are checked
 /// first, so a bad name cannot leave the model half-switched.
 fn start_idle_variation(
     model: &mut dyn AnimatedModel,
@@ -447,7 +446,7 @@ mod tests {
     fn recorder() -> Recorder {
         let animations = ["Fidget", "Stand"]
             .into_iter()
-            .map(|n| a2d_core::AnimationInfo { name: n.into(), duration: 1.0 })
+            .map(|n| a2d_core::AnimationInfo { name: n.into(), duration: 1.0, then: None })
             .collect();
         Recorder { played: Vec::new(), animations }
     }
@@ -554,17 +553,23 @@ mod tests {
     }
 
     #[test]
-    fn a_looping_variation_never_hands_back_on_spine() {
-        // The control: this is what the host did before, and it is stuck.
+    fn a_looping_variation_hands_back_only_at_its_wrap_on_spine() {
+        // The control for `start_idle_variation`: a looping variation plays a
+        // whole extra pass before the idle returns, which is why the host plays
+        // it once.
         let mix = Duration::from_millis(300);
         let mut model = spine_model();
         model.play_animation("stand", PlayOptions::looping()).unwrap();
         model.play_animation("fidget", PlayOptions::looping().with_mix(mix)).unwrap();
         model.play_animation("stand", PlayOptions::looping().with_mix(mix).queued()).unwrap();
-        for _ in 0..10 {
+        for _ in 0..4 {
             model.update(Duration::from_millis(100)).unwrap();
         }
-        assert_eq!(current_name(&model), "fidget");
+        assert_eq!(current_name(&model), "fidget", "0.4 s into a 0.5 s pass");
+        for _ in 0..2 {
+            model.update(Duration::from_millis(100)).unwrap();
+        }
+        assert_eq!(current_name(&model), "stand", "past the wrap");
     }
 
     /// A model whose extent grows partway through its animation, like a rig
@@ -614,7 +619,10 @@ mod tests {
     }
 
     fn reaching() -> Reaching {
-        Reaching { animations: vec![a2d_core::AnimationInfo { name: "Stand".into(), duration: 1.0 }], at: 0.0 }
+        Reaching {
+            animations: vec![a2d_core::AnimationInfo { name: "Stand".into(), duration: 1.0, then: None }],
+            at: 0.0,
+        }
     }
 
     #[test]

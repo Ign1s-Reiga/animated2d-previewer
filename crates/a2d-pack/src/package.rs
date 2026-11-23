@@ -107,8 +107,11 @@ impl Package {
         manifest.source_format = source_format.into();
         manifest.animations =
             ir.motions.iter().map(|m| AnimationEntry { name: m.name.clone(), duration: m.duration }).collect();
-        let infos: Vec<AnimationInfo> =
-            ir.motions.iter().map(|m| AnimationInfo { name: m.name.clone(), duration: m.duration }).collect();
+        let infos: Vec<AnimationInfo> = ir
+            .motions
+            .iter()
+            .map(|m| AnimationInfo { name: m.name.clone(), duration: m.duration, then: None })
+            .collect();
         // The source's own default wins; the name heuristic is the fallback.
         manifest.default_animation =
             ir.default_motion.clone().or_else(|| preferred_animation(&infos).map(str::to_string));
@@ -283,8 +286,11 @@ fn source_format_of(ir: &SpineIr) -> String {
 }
 
 fn default_animation_of(ir: &SpineIr) -> Option<String> {
-    let infos: Vec<AnimationInfo> =
-        ir.animations.iter().map(|a| AnimationInfo { name: a.name.clone(), duration: a.duration }).collect();
+    let infos: Vec<AnimationInfo> = ir
+        .animations
+        .iter()
+        .map(|a| AnimationInfo { name: a.name.clone(), duration: a.duration, then: None })
+        .collect();
     preferred_animation(&infos).map(str::to_string)
 }
 
