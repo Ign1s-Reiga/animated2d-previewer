@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod animation_clip;
+pub mod animator_controller;
 pub mod bundle;
 pub mod crc32;
 pub mod curve;
@@ -33,6 +34,7 @@ pub mod serialized;
 pub mod texture;
 
 pub use animation_clip::{AnimationClip, ClipEvent, DenseClip, GenericBinding, StreamedKey};
+pub use animator_controller::{animator_controller_pptr, AnimatorController};
 pub use bundle::{Bundle, Compression, Node};
 pub use crc32::{crc32, crc32_str};
 pub use curve::{AnimationCurve, Keyframe};
