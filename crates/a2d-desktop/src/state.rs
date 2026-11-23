@@ -19,6 +19,9 @@ pub struct ModelEntry {
     pub display_name: String,
     /// Animation names, in the order the selector cycles through them.
     pub animations: Vec<String>,
+    /// The animation the model opens on, when it names one. Selected on a
+    /// fresh start and on a model switch; absent or unlisted means the first.
+    pub default_animation: Option<String>,
     /// Whether `package` can be opened again from a bare path on the next start.
     ///
     /// False for a model the caller decoded itself (a raw bundle, or a package
@@ -113,10 +116,13 @@ impl ViewerState {
             .filter(|p| state.models.iter().any(|m| m.package == *p))
             .map(std::path::Path::to_path_buf)
             .or_else(|| config.active_model().map(|m| m.package.clone()));
+        if let Some(at) = wanted.as_ref().and_then(|w| state.models.iter().position(|m| m.package == *w)) {
+            state.active = at;
+        }
+        // Precedence: a remembered animation for the model wins (applied
+        // below); otherwise the model's default; otherwise the first entry.
+        state.animation = state.default_animation_index();
         if let Some(wanted) = wanted {
-            if let Some(at) = state.models.iter().position(|m| m.package == wanted) {
-                state.active = at;
-            }
             if let Some(settings) = config.models.iter().find(|m| m.package == wanted) {
                 state.scale = settings.scale.clamp(MIN_SCALE, MAX_SCALE);
                 state.offset = Vec2::new(settings.offset.0, settings.offset.1);
@@ -128,6 +134,17 @@ impl ViewerState {
         }
         state.dirty = false;
         state
+    }
+
+    /// Index of the active model's default animation, or 0 when it names none
+    /// or names one the list lacks.
+    fn default_animation_index(&self) -> usize {
+        self.active_model()
+            .and_then(|m| {
+                let name = m.default_animation.as_deref()?;
+                m.animations.iter().position(|a| a == name)
+            })
+            .unwrap_or(0)
     }
 
     /// Folds the current state back into a config for saving.
@@ -142,7 +159,12 @@ impl ViewerState {
         let at = config.add_or_select(&model.package);
         let entry = ModelConfig {
             package: model.package.clone(),
-            animation: self.animation_name().map(str::to_string),
+            // Only a choice that differs from the default is remembered, so
+            // later improvements to a model's default still reach it.
+            animation: self
+                .animation_name()
+                .filter(|_| self.animation != self.default_animation_index())
+                .map(str::to_string),
             scale: self.scale,
             offset: (self.offset.x, self.offset.y),
             flip_x: self.flip_x,
@@ -217,7 +239,7 @@ impl ViewerState {
         self.active = index;
         // A different character has different animations, so the current index
         // would otherwise point at an unrelated one.
-        self.animation = 0;
+        self.animation = self.default_animation_index();
         self.dirty = true;
         true
     }
@@ -373,6 +395,7 @@ mod tests {
             package: PathBuf::from(format!("{name}.a2dpack")),
             display_name: name.to_string(),
             animations: animations.iter().map(|a| a.to_string()).collect(),
+            default_animation: None,
             reopenable: true,
         }
     }
@@ -382,6 +405,90 @@ mod tests {
             models: vec![entry("hero", &["idle", "walk", "wave"]), entry("villain", &["idle", "laugh"])],
             ..ViewerState::default()
         }
+    }
+
+    fn with_default(mut e: ModelEntry, name: &str) -> ModelEntry {
+        e.default_animation = Some(name.to_string());
+        e
+    }
+
+    #[test]
+    fn a_fresh_start_selects_the_models_default_animation() {
+        let models = vec![with_default(entry("hero", &["emote", "idle", "walk"]), "idle")];
+        let s = ViewerState::from_config(&Config::default(), models);
+        assert_eq!(s.animation_name(), Some("idle"));
+        assert!(!s.is_dirty());
+    }
+
+    #[test]
+    fn switching_model_selects_the_new_models_default() {
+        let mut s = state();
+        s.models[1] = with_default(entry("villain", &["laugh", "idle"]), "idle");
+        assert!(s.select_model(1));
+        assert_eq!(s.animation_name(), Some("idle"));
+        assert_eq!(s.animation_index(), 1);
+    }
+
+    #[test]
+    fn a_remembered_animation_beats_the_default() {
+        let models = vec![with_default(entry("hero", &["emote", "idle", "walk"]), "idle")];
+        let mut config = Config::default();
+        let mut model = ModelConfig::new(models[0].package.clone());
+        model.animation = Some("walk".into());
+        config.models.push(model);
+        config.active = 0;
+        let s = ViewerState::from_config(&config, models);
+        assert_eq!(s.animation_name(), Some("walk"));
+    }
+
+    #[test]
+    fn a_preferred_model_not_first_opens_on_its_default() {
+        let models = vec![entry("hero", &["a", "b", "c"]), with_default(entry("villain", &["laugh", "idle"]), "idle")];
+        let s = ViewerState::from_config_preferring(
+            &Config::default(),
+            models,
+            Some(std::path::Path::new("villain.a2dpack")),
+        );
+        assert_eq!(s.active_index(), 1);
+        assert_eq!(s.animation_name(), Some("idle"));
+    }
+
+    #[test]
+    fn a_config_naming_an_unloadable_package_uses_the_first_models_default() {
+        let models = vec![with_default(entry("hero", &["emote", "idle"]), "idle")];
+        let mut config = Config::default();
+        config.models.push(ModelConfig::new("gone.a2dpack"));
+        config.active = 0;
+        let s = ViewerState::from_config(&config, models);
+        assert_eq!(s.active_index(), 0);
+        assert_eq!(s.animation_name(), Some("idle"));
+    }
+
+    #[test]
+    fn only_a_non_default_animation_is_remembered() {
+        let mut s = ViewerState::from_config(
+            &Config::default(),
+            vec![with_default(entry("hero", &["emote", "idle", "walk"]), "idle")],
+        );
+        let mut config = Config::default();
+        s.write_into(&mut config);
+        assert_eq!(config.active_model().unwrap().animation, None);
+        s.select_animation_by_name("walk");
+        s.write_into(&mut config);
+        assert_eq!(config.active_model().unwrap().animation.as_deref(), Some("walk"));
+    }
+
+    #[test]
+    fn an_absent_or_unknown_default_selects_the_first_animation() {
+        let none = ViewerState::from_config(&Config::default(), vec![entry("a", &["emote", "idle"])]);
+        assert_eq!(none.animation_index(), 0);
+        let unknown = vec![with_default(entry("a", &["emote", "idle"]), "gone")];
+        let mut s = ViewerState::from_config(&Config::default(), unknown);
+        assert_eq!(s.animation_index(), 0);
+        s.models.push(with_default(entry("b", &["x", "y"]), "missing"));
+        s.select_animation(1);
+        s.select_model(1);
+        assert_eq!(s.animation_index(), 0);
     }
 
     #[test]
