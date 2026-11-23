@@ -206,6 +206,27 @@ fn a_missing_texture_is_reported_rather_than_failing_the_import() {
 }
 
 #[test]
+fn validate_prints_the_default_motion_and_the_handovers_of_a_cubism_package() {
+    use a2d_core::ir::cubism::{Motion, MotionHandover};
+    let mut package = support::cubism_package(true);
+    let a2d_pack::PackageModel::Cubism(ir) = &mut package.model else { panic!("a Cubism package") };
+    ir.motions.push(Motion { name: "wave".into(), duration: 3.0, ..Motion::default() });
+    ir.default_motion = Some("idle".into());
+    ir.handovers.push(MotionHandover {
+        from: "wave".into(),
+        handover: a2d_core::Handover { animation: "idle".into(), at: 2.75, mix: 0.25 },
+    });
+    let dir = temp_dir("validate-handovers");
+    let package_dir = dir.path().join("model.a2dpack");
+    package.write_to(&package_dir).expect("the package should write");
+
+    let text = capture(|out| a2d_cli::validate(out, &package_dir).map(|_| ()).map_err(|e| e.to_string()));
+    assert!(text.contains("default motion: idle"), "{text}");
+    assert!(text.contains("wave -> idle  at 2.750 s, mix 0.250 s"), "{text}");
+    assert!(text.contains("does not apply them yet"), "validate must say handovers are not played: {text}");
+}
+
+#[test]
 fn validate_reports_a_package_with_warnings_via_its_return_value() {
     let dir = temp_dir("validate-status");
     let mut fixture = Fixture::spine_json();

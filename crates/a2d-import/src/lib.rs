@@ -16,5 +16,8 @@ pub mod unity_spine;
 pub use detect::{classify, AssetKind};
 pub use games::{guess_importer, Importer};
 pub use generic::{normalize_asset_stem, SpineSourceSet};
-pub use unity_cubism::{import_bundle, inspect_bundle, CubismInventory, MocPayload, MotionEntry, TextureEntry};
+pub use unity_cubism::{
+    import_bundle, inspect_bundle, inspect_handovers, CubismInventory, HandoverInspection, MocPayload, MotionEntry,
+    TextureEntry,
+};
 pub use unity_spine::{inspect_spine_bundle, SpineInventory, SpineTextAsset, SpineTextureEntry};

@@ -30,9 +30,10 @@
 
 mod clip_motion;
 mod fade_motion;
+mod handover;
 mod physics;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use a2d_core::ir::cubism::{Motion, Physics};
 use a2d_core::{DecodeError, Degradation, LoadReport};
@@ -40,8 +41,8 @@ use a2d_pack::manifest::TextureEntry as PackTextureEntry;
 use a2d_pack::package::TextureFile;
 use a2d_pack::Package;
 use a2d_unity::{
-    behaviour_body, behaviour_owner_name, AnimationClip, Bundle, ClassId, Inventory, ObjectInfo, PPtr, Reader,
-    SerializedFile,
+    animator_controller_pptr, behaviour_body, behaviour_owner_name, AnimationClip, AnimatorController, Bundle, ClassId,
+    Inventory, ObjectInfo, PPtr, Reader, SerializedFile,
 };
 
 /// The `.moc3` payload plus how it was found.
@@ -311,7 +312,12 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
     })?;
     let file = SerializedFile::parse(bundle.node_data(node)?)?;
 
-    model.motions = recover_motions(&file, &Inventory::build(&file), report);
+    let inventory = Inventory::build(&file);
+    let set = recover_motions(&file, &inventory, report);
+    let recovered = recover_handovers(&file, &inventory, &set, report);
+    model.motions = set.motions;
+    model.default_motion = recovered.default_motion;
+    model.handovers = recovered.handovers;
     // Curves aimed at ids the model lacks (model-level opacity, say) are kept
     // and playback skips them; saying so here keeps that visible at import.
     for degradation in model.unresolved_motion_targets() {
@@ -320,6 +326,11 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
     // A parameter the motions suggest should repeat but the source does not
     // mark (or, with no stored flags, one inferred to repeat); say so.
     for degradation in model.repeat_degradations() {
+        report.warn(degradation);
+    }
+    // Handovers are stored and nothing plays them yet. Re-derived on every load
+    // and validation, so `record_warnings` keeps it out of the manifest.
+    for degradation in model.handover_degradations() {
         report.warn(degradation);
     }
     // Recovered once, while inspecting, so its notes are not reported twice.
@@ -368,12 +379,189 @@ fn record_warnings(package: &mut Package, report: &LoadReport) {
             let mut all = ir.unresolved_motion_targets();
             all.extend(ir.unresolved_physics_targets());
             all.extend(ir.repeat_degradations());
+            all.extend(ir.handover_degradations());
             all
         }
         _ => Vec::new(),
     };
     package.manifest.import_warnings =
         report.warnings().iter().filter(|w| !rederived.contains(w)).map(|w| w.to_string()).collect();
+}
+
+/// The default motion and handovers of a bundle, found without assembling a
+/// package, and the notes about how they were found.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HandoverInspection {
+    pub default_motion: Option<String>,
+    pub handovers: Vec<a2d_core::ir::cubism::MotionHandover>,
+    /// Why a controller, a state or a handover was not read. Only notes about
+    /// the controller: motion recovery's own notes are not included.
+    pub notes: Vec<Degradation>,
+}
+
+/// Recovers the default motion and handovers the way `import_bundle` does, but
+/// stops there: it decodes the bundle's motions (clips and fade data) and its
+/// animator controller, and builds no textures and no package.
+pub fn inspect_handovers(bytes: &[u8]) -> Result<HandoverInspection, DecodeError> {
+    let bundle = Bundle::parse(bytes)?;
+    let node = bundle.nodes.iter().find(|n| n.is_serialized()).ok_or_else(|| DecodeError::Reconstruction {
+        game: "unity_cubism".into(),
+        message: "the bundle holds no serialized file".into(),
+    })?;
+    let file = SerializedFile::parse(bundle.node_data(node)?)?;
+    let inventory = Inventory::build(&file);
+    // Motion recovery's notes belong to the motions, which `inspect` lists itself.
+    let set = recover_motions(&file, &inventory, &mut LoadReport::new());
+    let mut notes = LoadReport::new();
+    let recovered = recover_handovers(&file, &inventory, &set, &mut notes);
+    Ok(HandoverInspection {
+        default_motion: recovered.default_motion,
+        handovers: recovered.handovers,
+        notes: notes.warnings().to_vec(),
+    })
+}
+
+/// What motion recovery found: the motions, and for each `AnimationClip` object
+/// (by path id) the motion it became.
+struct MotionSet {
+    motions: Vec<Motion>,
+    /// Clip object to the final (de-duplicated) name of its motion, so a
+    /// controller's clip pointer is followed to its motion without comparing
+    /// strings.
+    by_clip: HashMap<i64, String>,
+    /// Clip objects set aside because fade data supplied their motion.
+    fade_covered: HashSet<i64>,
+}
+
+/// Follows each of a controller's clip pointers to the motion it became, or
+/// says why it became none.
+fn resolve_clips(pointers: &[PPtr], set: &MotionSet) -> Vec<Result<handover::ClipMotion, handover::ClipGap>> {
+    use handover::ClipGap;
+    pointers
+        .iter()
+        .map(|pointer| {
+            if !pointer.is_local() {
+                return Err(ClipGap::OtherFile);
+            }
+            match set.by_clip.get(&pointer.path_id) {
+                Some(name) => set
+                    .motions
+                    .iter()
+                    .find(|m| &m.name == name)
+                    .map(|m| handover::ClipMotion { name: m.name.clone(), duration: m.duration })
+                    .ok_or(ClipGap::NotConverted),
+                None if set.fade_covered.contains(&pointer.path_id) => Err(ClipGap::FromFadeData),
+                None => Err(ClipGap::NotConverted),
+            }
+        })
+        .collect()
+}
+
+/// Reads the default motion and the handovers from the model's controller.
+///
+/// The controller is the one the model's `Animator` component points at; with
+/// no such pointer, a bundle holding exactly one controller uses it. Several
+/// candidates and no way to choose is a note, never a pick. A controller clip
+/// is followed to its motion through the `AnimationClip` object it points at.
+fn recover_handovers(
+    file: &SerializedFile,
+    inventory: &Inventory,
+    set: &MotionSet,
+    report: &mut LoadReport,
+) -> handover::Recovered {
+    let Some(path_id) = pick_controller(file, inventory, report) else { return handover::Recovered::default() };
+    let label = inventory
+        .objects
+        .iter()
+        .find(|o| o.path_id == path_id)
+        .and_then(|o| o.name.clone())
+        .unwrap_or_else(|| format!("controller#{path_id}"));
+    let parsed = file
+        .find_object(path_id)
+        .ok_or_else(|| DecodeError::corrupt("the controller vanished between passes".to_string()))
+        .and_then(|o| AnimatorController::parse(file.object_data(o)?));
+    let controller = match parsed {
+        Ok(c) => c,
+        Err(error) => {
+            report.note(format!("controller {label:?} was not decoded, so no default motion or handovers: {error}"));
+            return handover::Recovered::default();
+        }
+    };
+    handover::recover(&controller, &resolve_clips(&controller.clips, set), report)
+}
+
+/// The path id of the controller to read, or `None` after saying why there is
+/// none. A bundle with no controller says nothing: `inspect` lists them.
+fn pick_controller(file: &SerializedFile, inventory: &Inventory, report: &mut LoadReport) -> Option<i64> {
+    let controllers: Vec<i64> = inventory.by_class(ClassId::ANIMATOR_CONTROLLER).map(|o| o.path_id).collect();
+    if controllers.is_empty() {
+        return None;
+    }
+    let mut referenced: Vec<i64> = Vec::new();
+    let mut foreign: Vec<String> = Vec::new();
+    for info in inventory.by_class(ClassId::ANIMATOR) {
+        let pointer = file
+            .find_object(info.path_id)
+            .ok_or_else(|| DecodeError::corrupt("an Animator vanished between passes".to_string()))
+            .and_then(|o| animator_controller_pptr(file.object_data(o)?));
+        match pointer {
+            // An Animator with no controller names nothing and conflicts with nothing.
+            Ok(p) if p.is_null() => {}
+            Ok(p) if p.is_local() && controllers.contains(&p.path_id) => {
+                if !referenced.contains(&p.path_id) {
+                    referenced.push(p.path_id);
+                }
+            }
+            Ok(p) => foreign.push(if p.is_local() {
+                match inventory.objects.iter().find(|o| o.path_id == p.path_id) {
+                    Some(o) => format!("a {}", o.type_label()),
+                    None => "an object the bundle does not hold".to_string(),
+                }
+            } else {
+                "an object in another file".to_string()
+            }),
+            Err(error) => report.note(format!("an Animator component was not read: {error}")),
+        }
+    }
+    pick_among(&controllers, &referenced, &foreign, report)
+}
+
+/// The choice of [`pick_controller`], apart from the bundle: `referenced` are
+/// the controllers an Animator names, `foreign` what the other pointers name
+/// instead, `all` every controller there is.
+fn pick_among(all: &[i64], referenced: &[i64], foreign: &[String], report: &mut LoadReport) -> Option<i64> {
+    // A pointer at something that is not a controller of this bundle (an
+    // override controller, an object in another file) means the model plays
+    // something this does not read; the only controller is not its stand-in.
+    if !foreign.is_empty() {
+        report.note(format!(
+            "an Animator's controller pointer names {} rather than an AnimatorController of this bundle; \
+             no default motion or handovers are recovered",
+            foreign.join(", ")
+        ));
+        return None;
+    }
+    match (referenced, all) {
+        ([one], _) => Some(*one),
+        ([], [one]) => {
+            report.note("no Animator names the bundle's only controller; it is read anyway");
+            Some(*one)
+        }
+        ([], _) => {
+            report.note(format!(
+                "the bundle holds {} controllers and no Animator names one; no default motion or handovers are recovered",
+                all.len()
+            ));
+            None
+        }
+        (several, _) => {
+            report.note(format!(
+                "the model's Animator components name {} different controllers; no default motion or handovers are recovered",
+                several.len()
+            ));
+            None
+        }
+    }
 }
 
 /// Recovers the physics rig from the model's `CubismPhysicsController`.
@@ -432,7 +620,9 @@ fn physics_if_enabled(
 /// One that fails is reported by name and left out; the others are unaffected.
 /// The result is sorted by name, with duplicate names made unique, so the
 /// package serializes the same way on every run.
-fn recover_motions(file: &SerializedFile, inventory: &Inventory, report: &mut LoadReport) -> Vec<Motion> {
+///
+/// The set also records which `AnimationClip` object became which motion.
+fn recover_motions(file: &SerializedFile, inventory: &Inventory, report: &mut LoadReport) -> MotionSet {
     let items = inventory.by_script("CubismFadeMotionData").map(|info| {
         let label = info.name.clone().unwrap_or_else(|| format!("fade#{}", info.path_id));
         let body = file
@@ -445,8 +635,13 @@ fn recover_motions(file: &SerializedFile, inventory: &Inventory, report: &mut Lo
     });
     let (mut motions, covered) = motions_from_bodies(items, report);
     let from_clips = clip_motions(file, inventory, &covered, report);
-    merge_motions(&mut motions, from_clips, report);
-    motions
+    let by_clip = merge_motions(&mut motions, from_clips, report);
+    let fade_covered = inventory
+        .by_class(ClassId::ANIMATION_CLIP)
+        .filter(|o| is_covered(&covered, &o.name.clone().unwrap_or_else(|| format!("clip#{}", o.path_id))))
+        .map(|o| o.path_id)
+        .collect();
+    MotionSet { motions, by_clip, fade_covered }
 }
 
 /// Adds clip-derived motions to the fade-derived ones and puts the whole list
@@ -454,17 +649,28 @@ fn recover_motions(file: &SerializedFile, inventory: &Inventory, report: &mut Lo
 ///
 /// The stable sort keeps bundle order between equal names, so the result is
 /// the same on every run.
-fn merge_motions(motions: &mut Vec<Motion>, from_clips: Vec<Motion>, report: &mut LoadReport) {
+fn merge_motions(
+    motions: &mut Vec<Motion>,
+    from_clips: Vec<(i64, Motion)>,
+    report: &mut LoadReport,
+) -> HashMap<i64, String> {
     if from_clips.is_empty() {
-        return;
+        return HashMap::new();
     }
-    motions.extend(from_clips);
-    motions.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut names: Vec<String> = motions.iter().map(|m| m.name.clone()).collect();
+    let mut all: Vec<(Option<i64>, Motion)> = motions.drain(..).map(|m| (None, m)).collect();
+    all.extend(from_clips.into_iter().map(|(id, m)| (Some(id), m)));
+    all.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+    let mut names: Vec<String> = all.iter().map(|(_, m)| m.name.clone()).collect();
     fade_motion::dedupe_names(&mut names, report);
-    for (motion, name) in motions.iter_mut().zip(names) {
-        motion.name = name;
+    let mut by_clip = HashMap::new();
+    for ((id, mut motion), name) in all.into_iter().zip(names) {
+        motion.name = name.clone();
+        if let Some(id) = id {
+            by_clip.insert(id, name);
+        }
+        motions.push(motion);
     }
+    by_clip
 }
 
 /// Whether a clip's own name is among the lower-cased stems of fade motions
@@ -483,7 +689,7 @@ fn clip_motions(
     inventory: &Inventory,
     covered: &HashSet<String>,
     report: &mut LoadReport,
-) -> Vec<Motion> {
+) -> Vec<(i64, Motion)> {
     let pending: Vec<&ObjectInfo> = inventory
         .by_class(ClassId::ANIMATION_CLIP)
         .filter(|o| {
@@ -539,7 +745,11 @@ fn clip_motions(
             .ok_or_else(|| DecodeError::corrupt("the AnimationClip vanished between passes".to_string()))
             .and_then(|object| AnimationClip::parse(file.object_data(object)?));
         match clip {
-            Ok(clip) => motions.extend(clip_motion::to_motion(&clip, &names, &script_class, report)),
+            Ok(clip) => {
+                if let Some(motion) = clip_motion::to_motion(&clip, &names, &script_class, report) {
+                    motions.push((info.path_id, motion));
+                }
+            }
             Err(error) => report.note(format!("motion {label:?} was not recovered from its AnimationClip: {error}")),
         }
     }
@@ -679,6 +889,31 @@ mod tests {
     }
 
     #[test]
+    fn the_stored_not_applied_note_is_reported_at_import_and_not_persisted() {
+        use a2d_core::ir::cubism::MotionHandover;
+        let motions = vec![
+            Motion { name: "Idle".into(), duration: 4.0, ..Motion::default() },
+            Motion { name: "Wave".into(), duration: 2.0, ..Motion::default() },
+        ];
+        let mut package = cubism_package(motions);
+        let a2d_pack::PackageModel::Cubism(ir) = &mut package.model else { panic!("cubism package expected") };
+        ir.handovers.push(MotionHandover {
+            from: "Wave".into(),
+            handover: a2d_core::Handover { animation: "Idle".into(), at: 1.75, mix: 0.25 },
+        });
+        let mut report = LoadReport::new();
+        for d in ir.handover_degradations() {
+            report.warn(d);
+        }
+        report.note("kept");
+        assert!(report.to_string().contains("does not apply them yet"), "{report}");
+        record_warnings(&mut package, &report);
+        assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
+        // Package validation reports it too.
+        assert!(package.validate().to_string().contains("does not apply them yet"));
+    }
+
+    #[test]
     fn repeat_notes_are_reported_at_import_and_not_persisted_because_they_are_rederived() {
         use a2d_core::ir::cubism::{CurveKey, Motion, MotionCurve, Parameter};
         let key = |t: f32, v: f32| CurveKey { time: t, value: v, in_slope: 0.0, out_slope: 0.0, stepped: false };
@@ -782,15 +1017,69 @@ mod tests {
 
         let stub = |name: &str| Motion { name: name.into(), duration: 1.0, ..Motion::default() };
         let mut merge_report = LoadReport::new();
-        merge_motions(&mut motions, uncovered.iter().map(|n| stub(n)).collect(), &mut merge_report);
+        let by_clip = merge_motions(
+            &mut motions,
+            uncovered.iter().enumerate().map(|(i, n)| (i as i64, stub(n))).collect(),
+            &mut merge_report,
+        );
         let names: Vec<&str> = motions.iter().map(|m| m.name.as_str()).collect();
         // Byte order puts the upper-case fade-derived names first; the clash
         // between the two `idle` clips is resolved by suffix.
         assert_eq!(names, ["Hero", "Idle_02", "broken", "idle", "idle_2"]);
+        // Each clip finds its own motion by object, whatever the rename did.
+        let by = |i: i64| by_clip.get(&i).map(String::as_str);
+        assert_eq!((by(0), by(1), by(2)), (Some("idle"), Some("broken"), Some("idle_2")));
         assert_eq!(merge_report.len(), 1);
         assert!(merge_report.to_string().contains("renamed"), "{merge_report}");
         let text = report.to_string();
         assert!(text.contains("\"broken\"") && text.contains("not recovered"), "{text}");
+    }
+
+    #[test]
+    fn the_controller_is_the_one_an_animator_names_else_the_only_one_else_none() {
+        let mut r = LoadReport::new();
+        assert_eq!(pick_among(&[7, 8], &[8], &[], &mut r), Some(8));
+        assert_eq!(pick_among(&[7], &[7], &[], &mut r), Some(7));
+        assert!(r.is_empty());
+        assert_eq!(pick_among(&[7, 8], &[], &[], &mut r), None);
+        assert_eq!(pick_among(&[7, 8], &[7, 8], &[], &mut r), None);
+        let text = r.to_string();
+        assert!(text.contains("2 controllers and no Animator names one"), "{text}");
+        assert!(text.contains("name 2 different controllers"), "{text}");
+    }
+
+    #[test]
+    fn a_pointer_at_something_else_is_a_note_and_never_falls_back_to_the_only_controller() {
+        let mut r = LoadReport::new();
+        let foreign = ["a AnimatorOverrideController".to_string()];
+        assert_eq!(pick_among(&[7], &[], &foreign, &mut r), None);
+        assert_eq!(pick_among(&[7], &[7], &foreign, &mut r), None, "a second Animator does not rescue the first");
+        let text = r.to_string();
+        assert!(text.contains("AnimatorOverrideController rather than an AnimatorController"), "{text}");
+    }
+
+    #[test]
+    fn using_the_only_controller_with_no_animator_naming_it_is_said() {
+        let mut r = LoadReport::new();
+        assert_eq!(pick_among(&[7], &[], &[], &mut r), Some(7));
+        assert!(r.to_string().contains("no Animator names the bundle's only controller"), "{r}");
+    }
+
+    #[test]
+    fn clip_pointers_resolve_by_object_with_a_reason_when_they_do_not() {
+        use handover::ClipGap;
+        let motions = vec![
+            Motion { name: "Pose".into(), duration: 2.0, ..Motion::default() },
+            Motion { name: "Pose_2".into(), duration: 3.0, ..Motion::default() },
+        ];
+        let by_clip = HashMap::from([(10, "Pose".to_string()), (11, "Pose_2".to_string())]);
+        let set = MotionSet { motions, by_clip, fade_covered: HashSet::from([12]) };
+        let local = |id| PPtr { file_index: 0, path_id: id };
+        let resolved = resolve_clips(&[local(11), PPtr { file_index: 1, path_id: 10 }, local(12), local(13)], &set);
+        assert_eq!(resolved[0], Ok(handover::ClipMotion { name: "Pose_2".into(), duration: 3.0 }));
+        assert_eq!(resolved[1], Err(ClipGap::OtherFile));
+        assert_eq!(resolved[2], Err(ClipGap::FromFadeData));
+        assert_eq!(resolved[3], Err(ClipGap::NotConverted));
     }
 
     #[test]

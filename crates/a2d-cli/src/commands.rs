@@ -263,6 +263,7 @@ pub fn validate(out: &mut dyn std::io::Write, package_dir: &Path) -> Result<bool
     writeln!(out, "  textures:      {}/{}", package.textures.len(), package.manifest.textures.len())?;
     if let Some(ir) = package.model.as_cubism() {
         writeln!(out, "  physics:       {}", physics_summary(ir.physics.as_ref()))?;
+        print_handovers(out, ir)?;
     }
 
     let report = package.validate();
@@ -1008,8 +1009,8 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<()
     }
     for motion in &inventory.motions {
         // Whether fade data survives decides how much of a motion's original
-        // authoring is available; inspect does not decode, so it only says what
-        // is present.
+        // authoring is available. This listing decodes no motion; it only says
+        // what is present (the handover section below does decode them).
         let fade = if motion.has_fade_data { "  (fade data present)" } else { "  (clip only, no fade data)" };
         writeln!(out, "    {}{fade}", motion.name)?;
     }
@@ -1018,11 +1019,54 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<()
 
     print_controllers_and_sources(out, &inventory)?;
 
+    // The default motion and handovers exist only once motions are decoded, so
+    // this decodes the clips and the animator controller (not textures, and no
+    // package) and reports what the controller yielded and why not more.
+    if inventory.is_cubism() {
+        match a2d_import::inspect_handovers(bytes) {
+            Ok(found) => {
+                print_default_and_handovers(out, found.default_motion.as_deref(), &found.handovers)?;
+                for note in &found.notes {
+                    writeln!(out, "    note: {note}")?;
+                }
+            }
+            Err(e) => writeln!(out, "\n  default motion / handovers: not reconstructed - {e}")?,
+        }
+    }
+
     print_report(out, &report)?;
     writeln!(
         out,
         "\nThis reports what the bundle holds. `animated2d import` reconstructs a loadable \npackage from it, and `animated2d preview` opens it directly."
     )?;
+    Ok(())
+}
+
+/// The default motion and the handovers, shared by `inspect` and `validate`.
+fn print_handovers(out: &mut dyn std::io::Write, ir: &a2d_core::ir::cubism::CubismIr) -> std::io::Result<()> {
+    print_default_and_handovers(out, ir.default_motion.as_deref(), &ir.handovers)
+}
+
+fn print_default_and_handovers(
+    out: &mut dyn std::io::Write,
+    default_motion: Option<&str>,
+    handovers: &[a2d_core::ir::cubism::MotionHandover],
+) -> std::io::Result<()> {
+    match default_motion {
+        Some(name) => writeln!(out, "\n  default motion: {name}")?,
+        None => writeln!(out, "\n  default motion: (none recovered)")?,
+    }
+    if handovers.is_empty() {
+        return writeln!(out, "  handovers:      (none)");
+    }
+    writeln!(out, "  handovers:")?;
+    for h in handovers {
+        writeln!(
+            out,
+            "    {} -> {}  at {:.3} s, mix {:.3} s",
+            h.from, h.handover.animation, h.handover.at, h.handover.mix
+        )?;
+    }
     Ok(())
 }
 

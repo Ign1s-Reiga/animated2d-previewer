@@ -749,6 +749,19 @@ impl CubismIr {
         self.repeat_evidence().into_iter().map(|e| e.parameter).collect()
     }
 
+    /// A note that the handovers are carried but not played, while that is so.
+    /// Reported wherever the model is loaded, and re-derived rather than stored,
+    /// so it disappears from every package the moment playback applies them.
+    pub fn handover_degradations(&self) -> Vec<crate::Degradation> {
+        if self.handovers.is_empty() {
+            return Vec::new();
+        }
+        vec![crate::Degradation::Note(format!(
+            "{} handover(s) between motions are stored in the package, but playback does not apply them yet",
+            self.handovers.len()
+        ))]
+    }
+
     /// Notes on repeating parameters, reported by the model, the importer and
     /// package validation alike so a guess that may be wrong stays visible.
     ///
@@ -856,6 +869,19 @@ mod tests {
             ..Motion::default()
         };
         CubismIr { parameters: vec![param("A"), param("B")], motions: vec![motion], ..CubismIr::default() }
+    }
+
+    #[test]
+    fn handovers_are_reported_as_stored_not_applied_only_when_there_are_some() {
+        let mut ir = CubismIr::default();
+        assert!(ir.handover_degradations().is_empty());
+        ir.handovers.push(MotionHandover {
+            from: "a".into(),
+            handover: Handover { animation: "b".into(), at: 1.0, mix: 0.25 },
+        });
+        let notes = ir.handover_degradations();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].to_string().contains("does not apply them yet"), "{}", notes[0]);
     }
 
     #[test]
