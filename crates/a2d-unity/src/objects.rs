@@ -42,7 +42,7 @@ impl PPtr {
         self.file_index == 0 && self.path_id != 0
     }
 
-    fn read(r: &mut Reader<'_>) -> Result<PPtr, DecodeError> {
+    pub(crate) fn read(r: &mut Reader<'_>) -> Result<PPtr, DecodeError> {
         Ok(PPtr { file_index: r.i32()?, path_id: r.i64()? })
     }
 }
