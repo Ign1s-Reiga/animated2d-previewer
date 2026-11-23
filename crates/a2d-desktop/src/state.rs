@@ -55,6 +55,9 @@ pub struct ViewerState {
     models: Vec<ModelEntry>,
     active: usize,
     animation: usize,
+    /// The animation actually showing when it is not the pick: an emotion that
+    /// has handed back to the default. `None` while the pick is what shows.
+    shown: Option<usize>,
     paused: bool,
     scale: f32,
     offset: Vec2,
@@ -72,6 +75,7 @@ impl Default for ViewerState {
             models: Vec::new(),
             active: 0,
             animation: 0,
+            shown: None,
             paused: false,
             scale: 1.0,
             offset: Vec2::ZERO,
@@ -192,6 +196,35 @@ impl ViewerState {
         self.active_model()?.animations.get(self.animation).map(String::as_str)
     }
 
+    /// Index of the animation actually showing: the pick, until a handover moves it.
+    pub fn shown_index(&self) -> usize {
+        self.shown.unwrap_or(self.animation)
+    }
+
+    /// Name of the animation actually showing.
+    pub fn shown_name(&self) -> Option<&str> {
+        self.active_model()?.animations.get(self.shown_index()).map(String::as_str)
+    }
+
+    /// Records what the model reports it is showing. Returns whether that
+    /// changed what [`ViewerState::shown_index`] says, so the tray can follow.
+    ///
+    /// Called every frame, so the common case -- nothing changed -- compares
+    /// strings and allocates nothing. Not a user choice: it neither marks the
+    /// config dirty nor moves the pick, which is what Tab continues from and
+    /// what is remembered.
+    pub fn note_shown(&mut self, name: Option<&str>) -> bool {
+        let Some(name) = name else { return false };
+        if self.shown_name() == Some(name) {
+            return false;
+        }
+        let Some(at) = self.active_model().and_then(|m| m.animations.iter().position(|a| a == name)) else {
+            return false;
+        };
+        self.shown = (at != self.animation).then_some(at);
+        true
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused
     }
@@ -240,6 +273,7 @@ impl ViewerState {
         // A different character has different animations, so the current index
         // would otherwise point at an unrelated one.
         self.animation = self.default_animation_index();
+        self.shown = None;
         self.dirty = true;
         true
     }
@@ -261,10 +295,13 @@ impl ViewerState {
 
     pub fn select_animation(&mut self, index: usize) -> bool {
         let count = self.active_model().map_or(0, |m| m.animations.len());
-        if index >= count || index == self.animation {
+        // Picking what is already picked does nothing, unless it has since handed
+        // back to something else: then it is a request to play it again.
+        if index >= count || (index == self.animation && self.shown.is_none_or(|s| s == index)) {
             return false;
         }
         self.animation = index;
+        self.shown = None;
         self.dirty = true;
         true
     }
@@ -276,6 +313,7 @@ impl ViewerState {
             return false;
         };
         self.animation = at;
+        self.shown = None;
         self.dirty = true;
         true
     }
@@ -861,5 +899,81 @@ mod tests {
         let mut config = Config::default();
         s.write_into(&mut config);
         assert!(config.models.is_empty());
+    }
+
+    fn emotion_state() -> ViewerState {
+        ViewerState {
+            models: vec![with_default(entry("hero", &["idle", "smile", "bow"]), "idle")],
+            ..ViewerState::default()
+        }
+    }
+
+    #[test]
+    fn the_shown_animation_follows_a_handover_while_the_pick_stays() {
+        let mut s = emotion_state();
+        s.select_animation_by_name("smile");
+        s.clear_dirty();
+        assert_eq!(s.shown_name(), Some("smile"));
+        assert!(!s.note_shown(Some("smile")), "nothing changed");
+        assert!(s.note_shown(Some("idle")), "the emotion handed back to the default");
+        assert_eq!(s.shown_name(), Some("idle"));
+        assert_eq!(s.shown_index(), 0);
+        assert_eq!(s.animation_name(), Some("smile"), "the pick is the user's");
+        assert!(!s.is_dirty(), "following playback is not a choice to remember");
+        assert!(!s.note_shown(Some("idle")));
+        assert!(!s.note_shown(Some("no such animation")));
+        assert!(!s.note_shown(None));
+    }
+
+    #[test]
+    fn next_continues_from_the_pick_not_from_what_it_returned_to() {
+        let mut s = emotion_state();
+        s.select_animation_by_name("smile");
+        s.note_shown(Some("idle"));
+        assert!(s.next_animation());
+        assert_eq!(s.animation_name(), Some("bow"), "smile, not idle, was the last pick");
+        assert_eq!(s.shown_name(), Some("bow"), "a new pick shows as itself at once");
+    }
+
+    #[test]
+    fn the_config_remembers_the_pick_not_the_returned_to_animation() {
+        let mut s = emotion_state();
+        s.select_animation_by_name("smile");
+        s.note_shown(Some("idle"));
+        let mut config = Config::default();
+        s.write_into(&mut config);
+        assert_eq!(config.active_model().unwrap().animation.as_deref(), Some("smile"));
+        // A remembered emotion is picked again on the next start.
+        let again = ViewerState::from_config(&config, s.models().to_vec());
+        assert_eq!(again.animation_name(), Some("smile"));
+    }
+
+    #[test]
+    fn a_pick_of_the_default_is_still_stored_as_none() {
+        let mut s = emotion_state();
+        s.select_animation_by_name("smile");
+        s.select_animation_by_name("idle");
+        let mut config = Config::default();
+        s.write_into(&mut config);
+        assert_eq!(config.active_model().unwrap().animation, None);
+    }
+
+    #[test]
+    fn picking_the_same_emotion_again_replays_it_only_after_it_handed_back() {
+        let mut s = emotion_state();
+        s.select_animation(1);
+        assert!(!s.select_animation(1), "still playing: nothing to do");
+        s.note_shown(Some("idle"));
+        assert!(s.select_animation(1), "it has returned, so this asks for it again");
+        assert_eq!(s.shown_name(), Some("smile"));
+    }
+
+    #[test]
+    fn switching_model_forgets_what_was_shown() {
+        let mut s = state();
+        s.select_animation_by_name("walk");
+        s.note_shown(Some("idle"));
+        s.next_model();
+        assert_eq!(s.shown_index(), s.animation_index());
     }
 }

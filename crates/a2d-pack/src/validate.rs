@@ -327,11 +327,6 @@ pub fn validate_cubism(ir: &CubismIr, format_version: u32, textures: &[TextureFi
     for degradation in ir.repeat_degradations() {
         report.warn(degradation);
     }
-
-    // Handovers are carried but nothing plays them yet.
-    for degradation in ir.handover_degradations() {
-        report.warn(degradation);
-    }
 }
 
 #[cfg(test)]

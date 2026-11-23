@@ -328,11 +328,6 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
     for degradation in model.repeat_degradations() {
         report.warn(degradation);
     }
-    // Handovers are stored and nothing plays them yet. Re-derived on every load
-    // and validation, so `record_warnings` keeps it out of the manifest.
-    for degradation in model.handover_degradations() {
-        report.warn(degradation);
-    }
     // Recovered once, while inspecting, so its notes are not reported twice.
     model.physics = physics;
     for degradation in model.unresolved_physics_targets() {
@@ -379,7 +374,6 @@ fn record_warnings(package: &mut Package, report: &LoadReport) {
             let mut all = ir.unresolved_motion_targets();
             all.extend(ir.unresolved_physics_targets());
             all.extend(ir.repeat_degradations());
-            all.extend(ir.handover_degradations());
             all
         }
         _ => Vec::new(),
@@ -886,31 +880,6 @@ mod tests {
         assert_eq!(report.len(), 2);
         record_warnings(&mut package, &report);
         assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
-    }
-
-    #[test]
-    fn the_stored_not_applied_note_is_reported_at_import_and_not_persisted() {
-        use a2d_core::ir::cubism::MotionHandover;
-        let motions = vec![
-            Motion { name: "Idle".into(), duration: 4.0, ..Motion::default() },
-            Motion { name: "Wave".into(), duration: 2.0, ..Motion::default() },
-        ];
-        let mut package = cubism_package(motions);
-        let a2d_pack::PackageModel::Cubism(ir) = &mut package.model else { panic!("cubism package expected") };
-        ir.handovers.push(MotionHandover {
-            from: "Wave".into(),
-            handover: a2d_core::Handover { animation: "Idle".into(), at: 1.75, mix: 0.25 },
-        });
-        let mut report = LoadReport::new();
-        for d in ir.handover_degradations() {
-            report.warn(d);
-        }
-        report.note("kept");
-        assert!(report.to_string().contains("does not apply them yet"), "{report}");
-        record_warnings(&mut package, &report);
-        assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
-        // Package validation reports it too.
-        assert!(package.validate().to_string().contains("does not apply them yet"));
     }
 
     #[test]

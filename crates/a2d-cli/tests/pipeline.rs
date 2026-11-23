@@ -223,7 +223,10 @@ fn validate_prints_the_default_motion_and_the_handovers_of_a_cubism_package() {
     let text = capture(|out| a2d_cli::validate(out, &package_dir).map(|_| ()).map_err(|e| e.to_string()));
     assert!(text.contains("default motion: idle"), "{text}");
     assert!(text.contains("wave -> idle  at 2.750 s, mix 0.250 s"), "{text}");
-    assert!(text.contains("does not apply them yet"), "validate must say handovers are not played: {text}");
+    assert!(
+        !text.contains("does not apply them yet"),
+        "handovers are applied now, so validate must not say otherwise: {text}"
+    );
 }
 
 #[test]

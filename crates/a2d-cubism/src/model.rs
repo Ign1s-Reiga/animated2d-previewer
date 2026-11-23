@@ -671,10 +671,6 @@ impl AnimatedModel for GenericCubismModel {
         for degradation in self.moc.repeat_degradations() {
             report.warn(degradation);
         }
-        // Handovers are carried in the model but nothing plays them yet.
-        for degradation in self.moc.handover_degradations() {
-            report.warn(degradation);
-        }
     }
 }
 
@@ -689,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn handovers_are_reported_as_stored_not_applied() {
+    fn handovers_are_no_longer_reported_because_playback_applies_them() {
         let m = model();
         let mut report = a2d_core::LoadReport::new();
         m.absorb_degradations(&mut report);
@@ -702,7 +698,7 @@ mod tests {
         let m = GenericCubismModel::load(ir, "test");
         let mut report = a2d_core::LoadReport::new();
         m.absorb_degradations(&mut report);
-        assert!(report.to_string().contains("does not apply them yet"), "{report}");
+        assert!(!report.to_string().contains("handover"), "{report}");
     }
 
     #[test]
