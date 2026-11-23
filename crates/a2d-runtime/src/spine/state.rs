@@ -435,6 +435,34 @@ mod tests {
     }
 
     #[test]
+    fn a_once_entry_hands_back_to_a_queued_loop_with_a_crossfade() {
+        let ir = ir_with(vec![rotate_anim("stand", 1.0, 10.0), rotate_anim("fidget", 0.5, 90.0)]);
+        let (stand, fidget) = (index_of(&ir, "stand"), index_of(&ir, "fidget"));
+        let mut state = AnimationState::new();
+        state.set_animation(0, stand, true, 1.0, 0.0, 0.0);
+        state.set_animation(0, fidget, false, 1.0, 0.0, 0.3);
+        state.add_animation(0, stand, true, 1.0, 0.0, 0.3);
+        for _ in 0..6 {
+            state.update(&ir, 0.1);
+        }
+        let track = state.track(0).unwrap();
+        assert_eq!(track.current().unwrap().animation, stand);
+        let from = track.mixing_from.as_ref().expect("the variation is crossfading out");
+        assert_eq!(from.animation, fidget);
+        assert!((from.animation_time(0.5) - 0.5).abs() < 1e-5, "held at its end");
+
+        let mut pose = SkeletonPose::new(ir.clone());
+        state.apply(&mut pose);
+        let rotation = pose.bones[0].local.rotation;
+        assert!(rotation > 0.0 && rotation < 90.0, "blended between the two poses, got {rotation}");
+
+        for _ in 0..3 {
+            state.update(&ir, 0.1);
+        }
+        assert!(state.track(0).unwrap().mixing_from.is_none());
+    }
+
+    #[test]
     fn playback_speed_scales_time() {
         let ir = ir_with(vec![rotate_anim("idle", 10.0, 90.0)]);
         let mut state = AnimationState::new();
