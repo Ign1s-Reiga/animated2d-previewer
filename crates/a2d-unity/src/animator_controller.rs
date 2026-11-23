@@ -604,12 +604,18 @@ impl AnimatorController {
         }
         for (m, sm) in self.state_machines.iter().enumerate() {
             let states = sm.states.len();
+            // A state, or selector `k` of this machine.
+            let resolves = |d: u32| {
+                (d as usize) < states
+                    || (d >= SELECTOR_DESTINATION_BASE
+                        && ((d - SELECTOR_DESTINATION_BASE) as usize) < sm.selectors.len())
+            };
             if !sm.states.is_empty() && sm.default_state as usize >= states {
                 out.push(format!("state machine {m} defaults to state {}", sm.default_state));
             }
             for (s, st) in sm.states.iter().enumerate() {
                 for (t, tr) in st.transitions.iter().enumerate() {
-                    if tr.destination as usize >= states {
+                    if !resolves(tr.destination) {
                         out.push(format!("machine {m} state {s} transition {t} goes to state {}", tr.destination));
                     }
                 }
@@ -639,7 +645,7 @@ impl AnimatorController {
                 }
             }
             for (t, tr) in sm.any_state_transitions.iter().enumerate() {
-                if tr.destination as usize >= states {
+                if !resolves(tr.destination) {
                     out.push(format!("machine {m} any-state transition {t} goes to state {}", tr.destination));
                 }
             }
@@ -987,6 +993,20 @@ mod tests {
         one_problem(set(2), "neither a state nor a selector");
         one_problem(set(SELECTOR_DESTINATION_BASE + 1), "neither a state nor a selector");
         one_problem(set(u32::MAX), "neither a state nor a selector");
+    }
+
+    #[test]
+    fn state_and_any_state_transitions_may_name_a_selector_too() {
+        let mut c = AnimatorController::parse(&good()).unwrap();
+        c.state_machines[0].states[0].transitions[0].destination = SELECTOR_DESTINATION_BASE;
+        c.state_machines[0].any_state_transitions[0].destination = SELECTOR_DESTINATION_BASE;
+        assert!(c.unresolved_references().is_empty(), "{:?}", c.unresolved_references());
+        // The machine has one selector, so selector 1 and a bare 2 do not exist.
+        one_problem(
+            |c| c.state_machines[0].states[0].transitions[0].destination = SELECTOR_DESTINATION_BASE + 1,
+            "transition 0 goes to state",
+        );
+        one_problem(|c| c.state_machines[0].any_state_transitions[0].destination = 2, "any-state transition 0");
     }
 
     #[test]
