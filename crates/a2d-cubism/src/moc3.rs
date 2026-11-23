@@ -521,6 +521,8 @@ impl Moc3 {
                 motions: Vec::new(),
                 // Nor physics, which is a separate file in the editor's export.
                 physics: None,
+                default_motion: None,
+                handovers: Vec::new(),
             },
         })
     }

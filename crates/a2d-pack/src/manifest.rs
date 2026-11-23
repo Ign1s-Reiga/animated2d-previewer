@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 /// * 5 -- Cubism `model.bin` gains its physics rig. Spine is unchanged.
 /// * 6 -- Cubism `model.bin` gains its per-parameter repeat flags. Spine is
 ///   unchanged.
-pub const FORMAT_VERSION: u32 = 6;
+/// * 7 -- Cubism `model.bin` gains its default motion and handovers. Spine is
+///   unchanged.
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Which runtime family loads this package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

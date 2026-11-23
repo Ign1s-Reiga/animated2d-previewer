@@ -85,6 +85,22 @@ pub struct AnimationInfo {
     pub duration: f32,
 }
 
+/// A scripted return from one animation to another.
+///
+/// After the animation this belongs to, play `animation`. The crossfade into it
+/// starts when the outgoing animation's playhead reaches `at` seconds into its
+/// pass, and lasts `mix` seconds. The source decides all three; nothing here
+/// says where it came from, so either runtime can carry one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Handover {
+    /// The animation to play next.
+    pub animation: String,
+    /// Seconds into the outgoing animation's pass at which the crossfade begins.
+    pub at: f32,
+    /// Seconds the crossfade lasts.
+    pub mix: f32,
+}
+
 /// What the viewer needs to list an expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpressionInfo {

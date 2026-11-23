@@ -17,7 +17,7 @@
 //! the space of whatever deforms it. Evaluating that is `a2d-cubism`'s job;
 //! this module is the data it works from.
 
-use crate::BlendMode;
+use crate::{BlendMode, Handover};
 
 /// How many of each element the model declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -395,6 +395,21 @@ pub struct CubismIr {
     /// this was stored is read. Nothing applies it yet: it is recovered and
     /// kept, and playback ignores it.
     pub physics: Option<Physics>,
+    /// The motion the source says to start on and return to, by name. `None`
+    /// when the source names none, or when a package written before this was
+    /// stored is read. When set it names a motion in [`CubismIr::motions`].
+    pub default_motion: Option<String>,
+    /// Scripted returns between motions, at most one per `from`. Empty when the
+    /// source carried none or a package written before this was stored is read.
+    pub handovers: Vec<MotionHandover>,
+}
+
+/// A [`Handover`] and the motion it belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MotionHandover {
+    /// The motion this handover leaves, by name.
+    pub from: String,
+    pub handover: Handover,
 }
 
 /// A model's physics rig: groups of pendulum chains that read some parameters

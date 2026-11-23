@@ -32,6 +32,13 @@
 //!   `u8` per parameter, each 0 or 1). A version 5 model reads with no
 //!   flags, so repeating parameters are inferred from its motions; its package
 //!   validates with a note telling the user to re-import.
+//! * Version 7: appends `default_motion: opt str` then `handovers: seq`, each
+//!   `from: str, to: str, at: f32, mix: f32`, so a version 6 body is a prefix
+//!   of a version 7 one. A version 6 model reads with no default and no
+//!   handovers; a package of that age that has motions validates with a note
+//!   telling the user to re-import. Every name must be a motion in the table,
+//!   no motion has two handovers, `at` and `mix` are finite and not negative,
+//!   and `at` does not pass the end of the motion it leaves.
 //!
 //! A motion is `name: str, duration: f32, fade_in: f32, fade_out: f32,
 //! curves: seq`. A curve is `target: str, fade_in: opt f32, fade_out: opt f32,
@@ -66,7 +73,7 @@
 //! question.
 
 use a2d_core::ir::cubism::*;
-use a2d_core::DecodeError;
+use a2d_core::{DecodeError, Handover};
 
 use crate::bin_io::{Reader, Writer};
 
@@ -82,6 +89,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     validate_draw_order_track(ir)?;
     validate_physics(ir)?;
     validate_repeats(ir)?;
+    validate_handovers(ir)?;
     write_canvas(w, &ir.canvas);
     w.seq(&ir.parameters, write_parameter);
     write_ids(w, &ir.part_ids);
@@ -112,6 +120,14 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     w.opt(ir.physics.as_ref(), write_physics);
     // Added in format version 6.
     w.opt(ir.parameter_repeats.as_ref(), |w, flags| w.seq(flags, |w, f| w.bool(*f)));
+    // Added in format version 7.
+    w.opt_str(ir.default_motion.as_deref());
+    w.seq(&ir.handovers, |w, h| {
+        w.str(&h.from);
+        w.str(&h.handover.animation);
+        w.f32(h.handover.at);
+        w.f32(h.handover.mix);
+    });
     Ok(())
 }
 
@@ -120,7 +136,8 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
 /// `version` is the format version from the `model.bin` header. A version 1
 /// model ends after the draw-order tracks and has no motions; version 2 adds
 /// the motion table, version 3 the glue table, version 4 the warp opacities and
-/// version 5 the physics rig, version 6 the repeat flags. The layout is chosen by the header, never
+/// version 5 the physics rig, version 6 the repeat flags and version 7 the default
+/// motion and handovers. The layout is chosen by the header, never
 /// inferred from how many bytes happen to remain.
 pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     let mut ir = CubismIr {
@@ -147,6 +164,8 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
         drawable_keyform_draw_orders: r.f32_seq()?,
         motions: Vec::new(),
         physics: None,
+        default_motion: None,
+        handovers: Vec::new(),
     };
     if version >= 2 {
         ir.motions = r.seq("motion", 20, read_motion)?;
@@ -170,13 +189,67 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
             })
         })?;
     }
+    if version >= 7 {
+        ir.default_motion = r.opt_str()?;
+        ir.handovers = r.seq("motion handover", 16, |r| {
+            Ok(MotionHandover {
+                from: r.str()?,
+                handover: Handover { animation: r.str()?, at: r.f32()?, mix: r.f32()? },
+            })
+        })?;
+    }
     validate_references(&ir)?;
     validate_glues(&ir)?;
     validate_warp_opacities(&ir)?;
     validate_draw_order_track(&ir)?;
     validate_physics(&ir)?;
     validate_repeats(&ir)?;
+    validate_handovers(&ir)?;
     Ok(ir)
+}
+
+/// The default motion and the handovers must name motions the model has, each
+/// motion leaves by at most one handover, and the timings must be usable: a
+/// handover that starts after its motion has ended could never fire.
+///
+/// Motion names are not required to be unique; a name is looked up by its
+/// first match, as playback does.
+fn validate_handovers(ir: &CubismIr) -> Result<(), DecodeError> {
+    let motion = |name: &str| ir.motions.iter().find(|m| m.name == name);
+    if let Some(name) = &ir.default_motion {
+        if motion(name).is_none() {
+            return Err(DecodeError::corrupt(format!("default motion {name:?} names no motion in the model")));
+        }
+    }
+    for (i, h) in ir.handovers.iter().enumerate() {
+        let Some(from) = motion(&h.from) else {
+            return Err(DecodeError::corrupt(format!("handover from {:?} names no motion in the model", h.from)));
+        };
+        if motion(&h.handover.animation).is_none() {
+            return Err(DecodeError::corrupt(format!(
+                "handover from {:?} goes to {:?}, which names no motion in the model",
+                h.from, h.handover.animation
+            )));
+        }
+        if ir.handovers[..i].iter().any(|earlier| earlier.from == h.from) {
+            return Err(DecodeError::corrupt(format!("motion {:?} has more than one handover", h.from)));
+        }
+        for (what, value) in [("at", h.handover.at), ("mix", h.handover.mix)] {
+            if !is_valid_duration(value) {
+                return Err(DecodeError::corrupt(format!(
+                    "handover from {:?} has {what} {value}, which is not a finite non-negative time",
+                    h.from
+                )));
+            }
+        }
+        if h.handover.at > from.duration {
+            return Err(DecodeError::corrupt(format!(
+                "handover from {:?} starts at {}s, after the motion ends at {}s",
+                h.from, h.handover.at, from.duration
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The repeat flags, when stored, are exactly one per parameter: a short list
@@ -871,6 +944,8 @@ mod tests {
             glue_intensities: vec![],
             warp_keyform_opacities: vec![],
             physics: None,
+            default_motion: None,
+            handovers: vec![],
             drawables: vec![
                 Drawable {
                     id: "ArtMesh1".into(),
@@ -1213,7 +1288,7 @@ mod tests {
         let mut bytes = Package::from_cubism(model(), "test", "x").encode_model().unwrap();
         // The motion count is followed by the two empty glue tables, the empty
         // warp opacity track (a count each) and the physics flag (one byte).
-        let at = bytes.len() - 17;
+        let at = bytes.len() - 17 - V7_TAIL;
         bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("a huge count should be refused");
         assert!(err.to_string().contains("motion count"), "{err}");
@@ -1342,7 +1417,7 @@ mod tests {
             write(&mut w, &good).unwrap();
             let mut bytes = w.into_bytes();
             // Drop the repeat flag and the physics flag, then the empty opacity track before them.
-            bytes.truncate(bytes.len() - 2 - 4);
+            bytes.truncate(bytes.len() - V7_TAIL - 2 - 4);
             let mut tail = Writer::new();
             tail.f32_seq(&ir.warp_keyform_opacities);
             bytes.extend(tail.into_bytes());
@@ -1545,6 +1620,17 @@ mod tests {
         }
     }
 
+    /// Bytes a version 7 model adds after a version 6 one when it has neither a
+    /// default motion nor handovers: the absent marker and an empty count.
+    const V7_TAIL: usize = 1 + 4;
+
+    /// Removes the version 7 tail of a model with neither default nor handovers.
+    fn strip_v7_tail(bytes: &mut Vec<u8>) {
+        let at = bytes.len() - V7_TAIL;
+        assert_eq!(&bytes[at..], &[0u8; V7_TAIL], "the version 7 tail of a model with none");
+        bytes.truncate(at);
+    }
+
     /// `with_glue()` plus a physics rig whose ids all resolve against `model()`'s
     /// parameters, touching every field the layout holds.
     fn with_physics() -> CubismIr {
@@ -1629,7 +1715,8 @@ mod tests {
     #[test]
     fn the_current_writer_without_repeat_flags_is_the_version_5_layout_plus_one_zero_byte() {
         let v5 = include_bytes!("../tests/fixtures/cubism_v5.model.bin");
-        let now = Package::from_cubism(with_physics(), "test", "x").encode_model().unwrap();
+        let mut now = Package::from_cubism(with_physics(), "test", "x").encode_model().unwrap();
+        strip_v7_tail(&mut now);
         assert_eq!(&now[8..now.len() - 1], &v5[8..]);
         assert_eq!(now[now.len() - 1], 0);
     }
@@ -1685,7 +1772,7 @@ mod tests {
             write(&mut w, &good).unwrap();
             let mut bytes = w.into_bytes();
             // Drop the flag sequence (opt byte, count, two flags) and put the bad one back.
-            bytes.truncate(bytes.len() - (1 + 4 + 2));
+            bytes.truncate(bytes.len() - V7_TAIL - (1 + 4 + 2));
             let mut tail = Writer::new();
             tail.opt(ir.parameter_repeats.as_ref(), |w, f| w.seq(f, |w, f| w.bool(*f)));
             bytes.extend(tail.into_bytes());
@@ -1702,7 +1789,7 @@ mod tests {
         write(&mut w, &ir).unwrap();
         let mut bytes = w.into_bytes();
         let n = bytes.len();
-        bytes[n - 2] = 2;
+        bytes[n - V7_TAIL - 2] = 2;
         let err = read(&mut Reader::new(&bytes), 6).expect_err("a flag of 2");
         assert!(err.to_string().contains("repeat flag is 2"), "{err}");
     }
@@ -1765,7 +1852,7 @@ mod tests {
             write(&mut w, &good).unwrap();
             let mut bytes = w.into_bytes();
             // The physics flag and the repeat flag after it.
-            bytes.truncate(bytes.len() - 2);
+            bytes.truncate(bytes.len() - V7_TAIL - 2);
             let mut tail = Writer::new();
             tail.opt(ir.physics.as_ref(), write_physics);
             bytes.extend(tail.into_bytes());
@@ -1855,6 +1942,7 @@ mod tests {
             return;
         }
         let mut bytes = Package::from_cubism(with_physics(), "test", "x").encode_model().unwrap();
+        strip_v7_tail(&mut bytes);
         assert_eq!(bytes.pop(), Some(0), "the repeat-flag marker of a model with none");
         bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
         let PackageModel::Cubism(ir) = Package::decode_model(&bytes).expect("the v5 bytes must decode") else {
@@ -1875,9 +1963,254 @@ mod tests {
         }
         let mut bytes = Package::from_cubism(with_glue(), "test", "x").encode_model().unwrap();
         // The current writer ends [physics 0][repeat flags 0]; a version 4 body ends before both.
+        strip_v7_tail(&mut bytes);
         assert_eq!(bytes.pop(), Some(0), "the repeat-flag marker of a model with none");
         assert_eq!(bytes.pop(), Some(0), "the physics flag of a model with none");
         bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
         std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cubism_v4.model.bin"), bytes).unwrap();
+    }
+
+    // ---- Version 7: default motion and handovers ----
+
+    fn handover(from: &str, to: &str, at: f32, mix: f32) -> MotionHandover {
+        MotionHandover { from: from.into(), handover: Handover { animation: to.into(), at, mix } }
+    }
+
+    /// `with_motions()` plus a default and one handover back to it.
+    fn with_handovers() -> CubismIr {
+        let mut ir = with_motions();
+        ir.default_motion = Some("Idle".into());
+        ir.handovers = vec![handover("Walk", "Idle", 2.25, 0.5)];
+        ir
+    }
+
+    fn encode(ir: &CubismIr) -> Vec<u8> {
+        Package::from_cubism(ir.clone(), "test", "x").encode_model().unwrap()
+    }
+
+    /// The model's bytes with the version 7 tail replaced by `default` and `handovers`
+    /// written as raw fields, bypassing the writer's checks.
+    fn with_raw_tail(default: Option<&str>, handovers: &[(&str, &str, f32, f32)]) -> Vec<u8> {
+        let mut w = Writer::new();
+        write(&mut w, &with_motions()).unwrap();
+        let mut bytes = w.into_bytes();
+        strip_v7_tail(&mut bytes);
+        let mut tail = Writer::new();
+        tail.opt_str(default);
+        tail.seq(handovers, |w, (from, to, at, mix)| {
+            w.str(from);
+            w.str(to);
+            w.f32(*at);
+            w.f32(*mix);
+        });
+        bytes.extend(tail.into_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_version_6_model_reads_with_no_default_motion_and_no_handovers() {
+        // Generated by the version 6 writer from `with_physics()`.
+        let bytes = include_bytes!("../tests/fixtures/cubism_v6.model.bin");
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 6);
+        let PackageModel::Cubism(ir) = Package::decode_model(bytes).expect("v6 must still load") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert_eq!(ir.default_motion, None);
+        assert!(ir.handovers.is_empty());
+        assert_eq!(ir, with_physics());
+    }
+
+    #[test]
+    fn the_current_writer_without_a_default_or_handovers_is_the_version_6_layout_plus_five_zero_bytes() {
+        let v6 = include_bytes!("../tests/fixtures/cubism_v6.model.bin");
+        let now = encode(&with_physics());
+        assert_eq!(&now[8..now.len() - V7_TAIL], &v6[8..]);
+        assert_eq!(&now[now.len() - V7_TAIL..], &[0u8; V7_TAIL]);
+    }
+
+    #[test]
+    fn a_version_7_header_over_version_6_bytes_is_refused() {
+        let mut bytes = include_bytes!("../tests/fixtures/cubism_v6.model.bin").to_vec();
+        bytes[4..8].copy_from_slice(&7u32.to_le_bytes());
+        assert!(Package::decode_model(&bytes).is_err());
+    }
+
+    #[test]
+    fn a_version_8_header_is_refused_rather_than_misread() {
+        let mut bytes = encode(&with_handovers());
+        bytes[4..8].copy_from_slice(&8u32.to_le_bytes());
+        let err = Package::decode_model(&bytes).expect_err("too new");
+        assert!(err.to_string().contains("newer"), "{err}");
+    }
+
+    #[test]
+    fn a_default_motion_and_handovers_round_trip_and_re_encode_to_identical_bytes() {
+        let mut two = with_handovers();
+        two.handovers.push(handover("Idle", "Walk", 0.0, 0.0));
+        let mut only_default = with_motions();
+        only_default.default_motion = Some("Walk".into());
+        let mut only_handover = with_motions();
+        only_handover.handovers = vec![handover("Idle", "Walk", 4.0, 0.125)];
+        for ir in [with_motions(), with_handovers(), two, only_default, only_handover] {
+            let first = encode(&ir);
+            let PackageModel::Cubism(back) = Package::decode_model(&first).expect("should decode") else {
+                panic!("a Cubism package must decode as one")
+            };
+            assert_eq!(back, ir);
+            assert_eq!(encode(&back), first);
+        }
+    }
+
+    #[test]
+    fn the_version_7_layout_is_the_default_then_each_handover_as_from_to_at_mix() {
+        let bytes = encode(&with_handovers());
+        let mut tail = Writer::new();
+        tail.opt_str(Some("Idle"));
+        tail.u32(1);
+        tail.str("Walk");
+        tail.str("Idle");
+        tail.f32(2.25);
+        tail.f32(0.5);
+        let tail = tail.into_bytes();
+        assert_eq!(&bytes[bytes.len() - tail.len()..], &tail[..]);
+    }
+
+    #[test]
+    fn bad_default_or_handovers_are_refused_by_the_writer_and_the_reader_alike() {
+        type Edit = fn(&mut CubismIr);
+        type Raw = (Option<&'static str>, Vec<(&'static str, &'static str, f32, f32)>);
+        let cases: Vec<(&str, Edit, Raw)> = vec![
+            (
+                "default motion \"Run\" names no motion",
+                |ir| ir.default_motion = Some("Run".into()),
+                (Some("Run"), vec![]),
+            ),
+            (
+                "handover from \"Run\" names no motion",
+                |ir| ir.handovers = vec![handover("Run", "Idle", 0.0, 0.0)],
+                (None, vec![("Run", "Idle", 0.0, 0.0)]),
+            ),
+            (
+                "goes to \"Run\", which names no motion",
+                |ir| ir.handovers = vec![handover("Walk", "Run", 0.0, 0.0)],
+                (None, vec![("Walk", "Run", 0.0, 0.0)]),
+            ),
+            (
+                "motion \"Walk\" has more than one handover",
+                |ir| ir.handovers = vec![handover("Walk", "Idle", 0.0, 0.0), handover("Walk", "Idle", 1.0, 0.0)],
+                (None, vec![("Walk", "Idle", 0.0, 0.0), ("Walk", "Idle", 1.0, 0.0)]),
+            ),
+            (
+                "has at NaN",
+                |ir| ir.handovers = vec![handover("Walk", "Idle", f32::NAN, 0.0)],
+                (None, vec![("Walk", "Idle", f32::NAN, 0.0)]),
+            ),
+            (
+                "has at -0.5",
+                |ir| ir.handovers = vec![handover("Walk", "Idle", -0.5, 0.0)],
+                (None, vec![("Walk", "Idle", -0.5, 0.0)]),
+            ),
+            (
+                "has mix inf",
+                |ir| ir.handovers = vec![handover("Walk", "Idle", 0.0, f32::INFINITY)],
+                (None, vec![("Walk", "Idle", 0.0, f32::INFINITY)]),
+            ),
+            (
+                "has mix -1",
+                |ir| ir.handovers = vec![handover("Walk", "Idle", 0.0, -1.0)],
+                (None, vec![("Walk", "Idle", 0.0, -1.0)]),
+            ),
+            (
+                "starts at 2.75s, after the motion ends at 2.5s",
+                |ir| ir.handovers = vec![handover("Walk", "Idle", 2.75, 0.0)],
+                (None, vec![("Walk", "Idle", 2.75, 0.0)]),
+            ),
+        ];
+        for (what, damage, (default, raw)) in cases {
+            let mut ir = with_motions();
+            damage(&mut ir);
+            let err = Package::from_cubism(ir, "test", "x").encode_model().expect_err(what);
+            assert!(matches!(err, DecodeError::Corrupt { .. }), "{what}: {err:?}");
+            assert!(err.to_string().contains(what), "{what}: {err}");
+
+            let bytes = with_raw_tail(default, &raw);
+            let err = read(&mut Reader::new(&bytes), 7).expect_err(what);
+            assert!(matches!(err, DecodeError::Corrupt { .. }), "{what}: {err:?}");
+            assert!(err.to_string().contains(what), "{what}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_handover_at_exactly_the_end_of_its_motion_is_accepted() {
+        let mut ir = with_motions();
+        ir.handovers = vec![handover("Walk", "Idle", 2.5, 0.0)];
+        assert!(Package::decode_model(&encode(&ir)).is_ok());
+    }
+
+    #[test]
+    fn an_implausible_handover_count_is_refused_before_allocating() {
+        let mut bytes = encode(&with_handovers());
+        // The count precedes one handover: two 4-byte-prefixed 4-letter names, then at and mix.
+        let count_at = bytes.len() - (4 + (4 + 4) + (4 + 4) + 4 + 4);
+        bytes[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = Package::decode_model(&bytes).expect_err("a huge count should be refused");
+        assert!(err.to_string().contains("motion handover count"), "{err}");
+    }
+
+    #[test]
+    fn truncating_or_corrupting_handover_bytes_never_panics() {
+        let full = encode(&with_handovers());
+        for cut in 0..full.len() {
+            let _ = Package::decode_model(&full[..cut]);
+        }
+        for at in 8..full.len() {
+            let mut bytes = full.clone();
+            bytes[at] ^= 0xff;
+            let _ = Package::decode_model(&bytes);
+        }
+    }
+
+    #[test]
+    fn the_manifest_default_is_the_sources_default_motion_and_falls_back_to_the_name_guess() {
+        // Without a stated default the name heuristic picks "Idle".
+        let guessed = Package::from_cubism(with_motions(), "test", "x");
+        assert_eq!(guessed.manifest.default_animation.as_deref(), Some("Idle"));
+        // A stated default wins over it, even when it is the less idle-looking one.
+        let mut ir = with_motions();
+        ir.default_motion = Some("Walk".into());
+        let stated = Package::from_cubism(ir, "test", "x");
+        assert_eq!(stated.manifest.default_animation.as_deref(), Some("Walk"));
+    }
+
+    #[test]
+    fn an_older_cubism_package_with_motions_says_to_re_import_and_a_current_one_does_not() {
+        let notes = |package: Package| {
+            package.validate().warnings().iter().map(|w| w.to_string()).collect::<Vec<_>>().join("\n")
+        };
+        let mut old = Package::from_cubism(with_motions(), "test", "x");
+        old.manifest.format_version = 6;
+        assert!(notes(old).contains("predates stored default motion and handovers"));
+        // An older package with no motions has nothing to script.
+        let mut no_motions = Package::from_cubism(model(), "test", "x");
+        no_motions.manifest.format_version = 6;
+        assert!(!notes(no_motions).contains("handovers"));
+        // A current package that carries no controller data is a source that had none: no nag.
+        assert!(!notes(Package::from_cubism(with_motions(), "test", "x")).contains("handovers"));
+        assert!(!notes(Package::from_cubism(with_handovers(), "test", "x")).contains("handovers"));
+    }
+
+    /// Writes the committed version 6 fixture. Run with `--ignored` and
+    /// `UPDATE_GOLDEN=1` to regenerate it; nothing else touches the file.
+    #[test]
+    #[ignore = "regenerates tests/fixtures/cubism_v6.model.bin; needs UPDATE_GOLDEN=1"]
+    fn regenerate_the_version_6_fixture() {
+        if std::env::var_os("UPDATE_GOLDEN").is_none() {
+            return;
+        }
+        let mut bytes = Package::from_cubism(with_physics(), "test", "x").encode_model().unwrap();
+        // A version 6 writer ended after the repeat flags: no default motion, no handovers.
+        strip_v7_tail(&mut bytes);
+        bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cubism_v6.model.bin"), bytes).unwrap();
     }
 }

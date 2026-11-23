@@ -298,6 +298,17 @@ pub fn validate_cubism(ir: &CubismIr, format_version: u32, textures: &[TextureFi
         ));
     }
 
+    // Same for the default motion and handovers: an older package cannot say
+    // whether its source scripted any. Only a package that has motions has
+    // anything to be told about, and a current one with none stored is a
+    // source that carried none.
+    if format_version < 7 && !ir.motions.is_empty() && ir.default_motion.is_none() && ir.handovers.is_empty() {
+        report.warn(Degradation::Note(
+            "this package predates stored default motion and handovers (format 7): the standing motion is guessed from motion names and no motion hands back to it by itself; re-import the source to read them"
+                .into(),
+        ));
+    }
+
     // Physics naming a parameter the model lacks is skipped at playback;
     // validation reports it for the same reason as for motions below.
     for degradation in ir.unresolved_physics_targets() {

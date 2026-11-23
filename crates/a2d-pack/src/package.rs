@@ -34,7 +34,11 @@ pub struct TextureFile {
 }
 
 /// The normalized model a package carries.
+///
+/// A package holds exactly one model, so the size gap between the variants costs
+/// nothing, and boxing the Cubism one would change every pattern that matches it.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum PackageModel {
     Spine(SpineIr),
     Cubism(CubismIr),
@@ -105,7 +109,9 @@ impl Package {
             ir.motions.iter().map(|m| AnimationEntry { name: m.name.clone(), duration: m.duration }).collect();
         let infos: Vec<AnimationInfo> =
             ir.motions.iter().map(|m| AnimationInfo { name: m.name.clone(), duration: m.duration }).collect();
-        manifest.default_animation = preferred_animation(&infos).map(str::to_string);
+        // The source's own default wins; the name heuristic is the fallback.
+        manifest.default_animation =
+            ir.default_motion.clone().or_else(|| preferred_animation(&infos).map(str::to_string));
         Package { manifest, model: PackageModel::Cubism(ir), textures: Vec::new() }
     }
 
@@ -660,8 +666,8 @@ mod tests {
     #[test]
     fn writers_always_write_the_current_version() {
         let bytes = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
-        assert_eq!(FORMAT_VERSION, 6);
-        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 6);
+        assert_eq!(FORMAT_VERSION, 7);
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 7);
     }
 
     #[test]
