@@ -56,7 +56,7 @@ against the official runtime yet (§11 cross-impl).
 
 Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 binary layouts;
 for Cubism, expressions, pose and part opacity (not applied; none of the target bundles carries any, and part-opacity curves in a clip are reported by name), authored motion fades (crossfades use the host's mix duration, except hand-backs between motions that the source's animator controller states: the desktop viewer plays such an emotion once and crossfades to the default at the source's time and duration),
-multiple texture pages, and the model-level curves (opacity, eye blink,
+multiple texture pages, the look-at rig (on every target prefab; a small constant offset at its stored target, named in an import note), and the model-level curves (opacity, eye blink,
 lip sync) that motions may carry.
 Looping (repeat) parameters are read from the per-parameter repeat flag (MOC3 section 54) and
 stored in the package from format 6; those parameters are wrapped instead of clamped. Inference from motions
