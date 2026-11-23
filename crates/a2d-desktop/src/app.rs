@@ -581,6 +581,13 @@ impl App {
             Ok(None) => {}
             Err(e) => self.report.note(format!("update failed: {e}")),
         }
+        // Follow a handover: the selector shows what is playing, while the pick
+        // (what Tab continues from and the config remembers) stays the user's.
+        if self.state.note_shown(active.viewer.shown_animation()) {
+            if let Some(tray) = &mut self.tray {
+                tray.sync(&self.state);
+            }
+        }
 
         let frame = match active.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -701,6 +708,15 @@ impl App {
             let _ = active.viewer.play(&name, Duration::ZERO);
         }
         active.viewer.reset_idle();
+        // The tray's animation items belong to the model it was built for, so
+        // build it again for the new one (the old icon goes first).
+        if self.tray.is_some() {
+            self.tray = None;
+            match Tray::new(&self.state) {
+                Ok(tray) => self.tray = Some(tray),
+                Err(e) => self.report.note(format!("tray could not be rebuilt: {e}")),
+            }
+        }
     }
 
     fn save_config(&mut self, report: &mut LoadReport) {

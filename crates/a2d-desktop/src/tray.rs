@@ -82,6 +82,9 @@ pub struct Tray {
     pause: CheckMenuItem,
     always_on_top: CheckMenuItem,
     click_through: CheckMenuItem,
+    /// One per animation of the model the tray was built for, so the check mark
+    /// can follow what is showing rather than only what was picked.
+    animations: Vec<CheckMenuItem>,
 }
 
 impl std::fmt::Debug for Tray {
@@ -110,17 +113,14 @@ impl Tray {
             menu.append(&models)?;
         }
 
+        let mut animation_items = Vec::new();
         if let Some(model) = state.active_model() {
             if !model.animations.is_empty() {
                 let animations = Submenu::new("Animation", true);
                 for (i, name) in model.animations.iter().enumerate() {
-                    animations.append(&CheckMenuItem::with_id(
-                        animation_id(i),
-                        name,
-                        true,
-                        i == state.animation_index(),
-                        None,
-                    ))?;
+                    let item = CheckMenuItem::with_id(animation_id(i), name, true, i == state.shown_index(), None);
+                    animations.append(&item)?;
+                    animation_items.push(item);
                 }
                 menu.append(&animations)?;
             }
@@ -143,7 +143,7 @@ impl Tray {
             .with_icon(tray_icon::Icon::from_rgba(icon_rgba(32), 32, 32)?)
             .build()?;
 
-        Ok(Tray { _icon: icon, pause, always_on_top, click_through })
+        Ok(Tray { _icon: icon, pause, always_on_top, click_through, animations: animation_items })
     }
 
     /// Takes the next pending menu activation, if any.
@@ -157,6 +157,9 @@ impl Tray {
         self.pause.set_checked(state.is_paused());
         self.always_on_top.set_checked(state.always_on_top());
         self.click_through.set_checked(state.click_through());
+        for (i, item) in self.animations.iter().enumerate() {
+            item.set_checked(i == state.shown_index());
+        }
     }
 }
 

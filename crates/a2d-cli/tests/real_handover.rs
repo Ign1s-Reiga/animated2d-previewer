@@ -48,17 +48,17 @@ fn a_real_bundle_gives_a_default_motion_and_a_handover_back_to_it_for_every_othe
     assert!(missing.is_empty(), "motions with no handover: {missing:?}");
     assert!(ir.handovers.iter().all(|h| h.from != default), "the default must not hand over");
 
-    // The runtime does not play handovers yet, and loading the model says so
-    // (the note is derived on load, never stored in the package).
+    // Playback applies the handovers, so neither loading nor the manifest says
+    // they are stored but unused.
     assert!(!ir.handovers.is_empty(), "the model has other motions, so some handover must exist");
     let model = a2d_cubism::GenericCubismModel::load(ir.clone(), "handover");
     let mut loaded = LoadReport::new();
     model.absorb_degradations(&mut loaded);
     let text = loaded.to_string();
-    assert!(text.contains("does not apply them yet"), "{text}");
+    assert!(!text.contains("does not apply them yet"), "{text}");
     assert!(
         !package.manifest.import_warnings.iter().any(|w| w.contains("does not apply them yet")),
-        "the note must not be frozen into the manifest"
+        "the stale note must not appear in the manifest"
     );
     println!("import notes:\n{report}\nload notes:\n{text}");
 }
