@@ -66,7 +66,15 @@ pub fn paint_sequence_of(count: usize, draw_orders: &[f32], tie_order: &[u32]) -
 /// is defined in `a2d-core` so that a package can store it.
 pub trait CubismEmit {
     /// Appends one mesh per visible drawable, in paint order.
-    fn emit(&self, pose: &Pose, texture: TextureId, out: &mut RenderList);
+    fn emit(&self, pose: &Pose, texture: TextureId, out: &mut RenderList) {
+        self.emit_scaled(pose, texture, Vec2::ONE, out);
+    }
+
+    /// As [`CubismEmit::emit`], with every emitted position (meshes and the
+    /// clip shapes alike) multiplied by `scale` about the model-space origin. A
+    /// negative component mirrors. The renderer does not cull, so the flipped
+    /// winding that a mirror causes needs no handling.
+    fn emit_scaled(&self, pose: &Pose, texture: TextureId, scale: Vec2, out: &mut RenderList);
 
     /// The posed geometry's bounds, or `None` when nothing was posed.
     fn bounds(&self, pose: &Pose) -> Option<(Vec2, Vec2)>;
@@ -82,7 +90,7 @@ impl CubismEmit for CubismIr {
     ///
     /// Coordinates come out in canvas units — the space the canvas size is
     /// expressed in once divided by its pixels per unit — with `y` upwards.
-    fn emit(&self, pose: &Pose, texture: TextureId, out: &mut RenderList) {
+    fn emit_scaled(&self, pose: &Pose, texture: TextureId, scale: Vec2, out: &mut RenderList) {
         // Paint order is decided per frame: each drawable's blended draw order
         // (which motions animate) picks its layer, and the model's draw-order
         // object list breaks ties. Neither is a sequence on its own; the
@@ -126,7 +134,8 @@ impl CubismEmit for CubismIr {
                             if points.len() != mask.uvs.len() {
                                 continue;
                             }
-                            let corners: Vec<Vec2> = points.iter().map(|(x, y)| Vec2::new(*x, *y)).collect();
+                            let corners: Vec<Vec2> =
+                                points.iter().map(|(x, y)| Vec2::new(*x * scale.x, *y * scale.y)).collect();
                             shape.push_mesh(&corners, &mask.indices);
                         }
                         // An empty shape would clip everything away, so a mask
@@ -143,7 +152,7 @@ impl CubismEmit for CubismIr {
             };
 
             let mut mesh = out.take_mesh();
-            mesh.vertices.extend(points.iter().map(|(x, y)| Vec2::new(*x, *y)));
+            mesh.vertices.extend(points.iter().map(|(x, y)| Vec2::new(*x * scale.x, *y * scale.y)));
             mesh.uvs.extend(drawable.uvs.iter().map(|(u, v)| Vec2::new(*u, *v)));
             mesh.indices.extend_from_slice(&drawable.indices);
             mesh.texture = texture;
