@@ -1,8 +1,9 @@
 //! Runtime-driver components of a real Unity bundle are reported, not dropped.
 //!
 //! The prefabs carry one look-at rig and no eye blink, mouth, harmonic motion,
-//! breath, expression or pose-part components. The rig is not applied, so the
-//! import has to say so; the others must not be reported when they are absent.
+//! breath, expression or pose-part components. The rig is recovered into the
+//! package, which is not yet applied at playback, so the import has to say so;
+//! the others must not be reported when they are absent.
 //!
 //! The asset is never committed (spec §11). `A2D_FIXTURE_CUBISM` names one
 //! bundle file (not a directory):
@@ -29,23 +30,45 @@ fn the_look_rig_is_noted_with_its_parameters_and_absent_drivers_are_not() {
     let look: Vec<&String> = notes.iter().filter(|n| n.starts_with("look-at rig")).collect();
     assert_eq!(look.len(), 1, "exactly one look note expected: {notes:?}");
     println!("{}", look[0]);
-    assert!(!look[0].contains("no readable owner"), "{}", look[0]);
-    let count: usize = look[0]
-        .split("not applied: ")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| panic!("no parameter count in {:?}", look[0]));
-    assert!(count > 0, "{}", look[0]);
-    let ids = look[0]
-        .split_once('[')
-        .and_then(|(_, rest)| rest.split_once(']'))
-        .map(|(ids, _)| ids)
-        .unwrap_or_else(|| panic!("no id list in {:?}", look[0]));
+    assert!(look[0].contains("recovered") && look[0].contains("not yet applied"), "{}", look[0]);
+    assert!(!look[0].contains("no readable owner") && !look[0].contains("not recovered"), "{}", look[0]);
     let model = package.model.as_cubism().expect("a Cubism package");
-    for id in ids.split(", ") {
-        assert!(model.parameters.iter().any(|p| p.id == id), "look parameter {id:?} is not a parameter of the model");
+    let rig = model.look.as_ref().expect("the look rig is recovered into the model");
+    println!("rig: {rig:?}");
+    assert!(!rig.parameters.is_empty());
+    assert_eq!(rig.problem(&model.parameters), None);
+    assert!(rig.damping.is_finite() && rig.damping >= 0.0);
+    let (tx, ty, tz) = rig.rest_target;
+    assert!([tx, ty, tz].iter().all(|v| v.is_finite()));
+    // Within the model's own extent: a target far outside it would mean the unit is wrong.
+    assert!(tx.abs() < 10.0 && ty.abs() < 10.0 && tz.abs() < 10.0, "{:?}", rig.rest_target);
+    assert_eq!(rig.center, (0.0, 0.0, 0.0), "a null Center is the controller's own origin");
+    assert!(look[0].contains(&format!("{} look parameter(s)", rig.parameters.len())), "{}", look[0]);
+    for p in &rig.parameters {
+        assert!(p.factor.is_finite() && p.factor != 0.0, "{p:?}");
+        println!("  {} {:?} {}", p.parameter, p.axis, p.factor);
     }
+
+    // Inspecting reports the same outcome as importing.
+    let mut inspected = LoadReport::default();
+    let inventory = a2d_import::inspect_bundle(&bytes, &mut inspected).expect("the bundle should inspect");
+    assert_eq!(inventory.look.as_ref(), Some(rig));
+    let inspected_note = inspected.warnings().iter().map(|w| w.to_string()).find(|n| n.starts_with("look-at rig"));
+    assert_eq!(inspected_note.as_ref(), Some(look[0]));
+
+    // The rig survives the package: write, read back, and `validate` names it.
+    let dir = std::env::temp_dir().join(format!("a2d-real-drivers-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let package_dir = dir.join("look.a2dpack");
+    package.write_to(&package_dir).expect("the package should write");
+    let back = a2d_pack::Package::read_from(&package_dir).expect("the package should read back");
+    assert_eq!(back.model.as_cubism().and_then(|m| m.look.as_ref()), Some(rig));
+    let mut out = Vec::new();
+    a2d_cli::validate(&mut out, &package_dir).expect("validate should run");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    println!("{text}");
+    assert!(text.contains("look-at rig:") && text.contains("recovered: "), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 
     // The absent drivers are matched by this module's own note prefixes.
     for absent in [

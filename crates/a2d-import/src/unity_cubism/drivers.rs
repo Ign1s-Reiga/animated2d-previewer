@@ -1,4 +1,4 @@
-//! Runtime-driver components a bundle carries and the viewer does not apply.
+//! Runtime-driver components a bundle carries and the viewer does not (yet) apply.
 //!
 //! A Cubism Unity prefab can hold components that move parameters while it
 //! runs: a look-at rig, eye blink, mouth, harmonic motion, breath, an
@@ -8,9 +8,11 @@
 //! each one found is named in one note.
 //!
 //! Recognition is by the script's class name (the names are the public Cubism
-//! Unity SDK's) and by presence only. The only fields read are the pointer of
-//! an expression controller, to tell an empty list from a set one, and the
-//! owner name of a look parameter, which is the id of the parameter it drives.
+//! Unity SDK's) and by presence only, with two exceptions. The pointer of an
+//! expression controller is read, to tell an empty list from a set one. The
+//! look-at rig is recovered in full (`look.rs`) and checked against the
+//! model's parameters: it is carried into the package, and its note says it
+//! was recovered, or why it was not. It is still not applied during playback.
 //! Hit areas are reported too: hit testing is not implemented, so a drawable
 //! the source marked as hittable hits nothing here.
 //! Components that only do bookkeeping (the parameter store, the update
@@ -20,11 +22,11 @@
 
 use std::collections::BTreeMap;
 
+use a2d_core::ir::cubism::{LookBlend, LookRig, Parameter};
 use a2d_core::LoadReport;
 use a2d_unity::{behaviour_body, behaviour_owner_name, Inventory, SerializedFile};
 
-const LOOK_CONTROLLER: &str = "CubismLookController";
-const LOOK_PARAMETER: &str = "CubismLookParameter";
+use super::look::{self, LOOK_CONTROLLER, LOOK_PARAMETER};
 const EXPRESSION_CONTROLLER: &str = "CubismExpressionController";
 
 /// A driver kind reported only when present, with the classes that mark it.
@@ -49,17 +51,35 @@ pub(super) struct Scan {
     pub expression_set: bool,
     /// Whether any expression controller's pointer could not be read.
     pub expression_unreadable: bool,
+    /// The look rig recovered from the components, while it is still usable.
+    pub look: Option<LookRig>,
+    /// Why there is no rig although look components are present.
+    pub look_failure: Option<String>,
+}
+
+impl Scan {
+    /// Checks the recovered rig against the model's parameters; a rig the
+    /// model cannot use is dropped and the reason kept for the note.
+    pub fn validate_look(&mut self, parameters: &[Parameter]) {
+        if let Some(problem) = self.look.as_ref().and_then(|rig| rig.problem(parameters)) {
+            self.look = None;
+            self.look_failure = Some(format!("the rig does not fit the model: {problem}"));
+        }
+    }
 }
 
 /// Notes the components found and not applied, one per kind.
-pub(super) fn note_unapplied(file: &SerializedFile, inventory: &Inventory, report: &mut LoadReport) {
-    for note in notes(&scan(file, inventory)) {
+pub(super) fn note_scan(scan: &Scan, report: &mut LoadReport) {
+    for note in notes(scan) {
         report.note(note);
     }
 }
 
-fn scan(file: &SerializedFile, inventory: &Inventory) -> Scan {
+pub(super) fn scan(file: &SerializedFile, inventory: &Inventory) -> Scan {
     let mut out = Scan::default();
+    let look = look::recover(file, inventory);
+    out.look = look.rig;
+    out.look_failure = look.failure;
     for info in &inventory.objects {
         let Some(script) = &info.script else { continue };
         *out.classes.entry(script.class_name.clone()).or_insert(0) += 1;
@@ -95,16 +115,29 @@ pub(super) fn notes(scan: &Scan) -> Vec<String> {
         ids.sort();
         ids.dedup();
         let unnamed = scan.look_ids.iter().filter(|i| i.is_none()).count();
-        let mut line = format!(
-            "look-at rig ({LOOK_CONTROLLER}) is present and not applied: {} look parameter(s) drive [{}]",
-            scan.look_ids.len(),
-            ids.join(", ")
-        );
+        let mut line = match (&scan.look, &scan.look_failure) {
+            (Some(rig), _) => format!(
+                "look-at rig ({LOOK_CONTROLLER}) recovered: {} look parameter(s) drive [{}], {} blend, damping {} s; not yet applied, not driven by default",
+                rig.parameters.len(),
+                ids.join(", "),
+                match rig.blend {
+                    LookBlend::Additive => "additive",
+                    LookBlend::Multiply => "multiply",
+                    LookBlend::Override => "override",
+                },
+                rig.damping
+            ),
+            (None, _) => format!(
+                "look-at rig ({LOOK_CONTROLLER}) is present and not applied: {} look parameter(s) drive [{}]",
+                scan.look_ids.len(),
+                ids.join(", ")
+            ),
+        };
         if unnamed > 0 {
             line.push_str(&format!(", {unnamed} with no readable owner"));
         }
-        if count(LOOK_CONTROLLER) == 0 {
-            line.push_str("; the controller itself is missing");
+        if let (None, Some(failure)) = (&scan.look, &scan.look_failure) {
+            line.push_str(&format!("; not recovered: {failure}"));
         }
         out.push(line);
     }
@@ -132,7 +165,7 @@ pub(super) fn notes(scan: &Scan) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::unity_cubism) mod tests {
     use super::*;
 
     fn scan_of(classes: &[(&str, usize)], look: &[Option<&str>], expr: (bool, bool)) -> Scan {
@@ -141,6 +174,7 @@ mod tests {
             look_ids: look.iter().map(|i| i.map(String::from)).collect(),
             expression_set: expr.0,
             expression_unreadable: expr.1,
+            ..Scan::default()
         }
     }
 
@@ -164,22 +198,65 @@ mod tests {
         assert!(notes(&Scan::default()).is_empty());
     }
 
-    #[test]
-    fn a_look_rig_is_one_note_naming_its_parameters() {
-        let s =
-            scan_of(&[(LOOK_CONTROLLER, 1), (LOOK_PARAMETER, 2)], &[Some("AngleX"), Some("EyeBallX")], (false, false));
-        let n = notes(&s);
-        assert_eq!(n.len(), 1);
-        assert!(n[0].contains("2 look parameter(s) drive [AngleX, EyeBallX]"), "{}", n[0]);
-        assert!(n[0].contains("not applied"));
+    fn rig() -> LookRig {
+        LookRig {
+            blend: LookBlend::Additive,
+            damping: 0.15,
+            rest_target: (0.0, 0.0, 0.0),
+            center: (0.0, 0.0, 0.0),
+            parameters: Vec::new(),
+        }
     }
 
     #[test]
-    fn a_look_rig_with_unreadable_owners_or_no_controller_says_so() {
-        let n = notes(&scan_of(&[(LOOK_PARAMETER, 2)], &[Some("AngleX"), None], (false, false)));
-        assert_eq!(n.len(), 1);
-        assert!(n[0].contains("1 with no readable owner"), "{}", n[0]);
-        assert!(n[0].contains("controller itself is missing"), "{}", n[0]);
+    fn a_recovered_look_rig_is_one_note_naming_its_parameters_and_that_it_is_not_applied() {
+        let mut s =
+            scan_of(&[(LOOK_CONTROLLER, 1), (LOOK_PARAMETER, 2)], &[Some("AngleX"), Some("EyeBallX")], (false, false));
+        let mut r = rig();
+        for id in ["AngleX", "EyeBallX"] {
+            r.parameters.push(a2d_core::ir::cubism::LookParameter {
+                parameter: id.into(),
+                axis: a2d_core::ir::cubism::LookAxis::X,
+                factor: 1.0,
+            });
+        }
+        s.look = Some(r);
+        let n = notes(&s);
+        assert_eq!(
+            n,
+            ["look-at rig (CubismLookController) recovered: 2 look parameter(s) drive [AngleX, EyeBallX], additive blend, damping 0.15 s; not yet applied, not driven by default"]
+        );
+    }
+
+    #[test]
+    fn a_look_rig_that_was_not_recovered_says_why() {
+        let mut s = scan_of(&[(LOOK_PARAMETER, 2)], &[Some("AngleX"), None], (false, false));
+        s.look_failure = Some("the controller is missing".into());
+        let n = notes(&s);
+        assert_eq!(
+            n,
+            ["look-at rig (CubismLookController) is present and not applied: 2 look parameter(s) drive [AngleX], 1 with no readable owner; not recovered: the controller is missing"]
+        );
+    }
+
+    #[test]
+    fn a_rig_the_model_cannot_use_is_dropped_with_the_reason() {
+        let mut s = scan_of(&[(LOOK_CONTROLLER, 1), (LOOK_PARAMETER, 1)], &[Some("AngleX")], (false, false));
+        let mut r = rig();
+        r.parameters.push(a2d_core::ir::cubism::LookParameter {
+            parameter: "AngleX".into(),
+            axis: a2d_core::ir::cubism::LookAxis::X,
+            factor: 1.0,
+        });
+        s.look = Some(r);
+        s.validate_look(&[]);
+        assert!(s.look.is_none());
+        let n = notes(&s);
+        assert!(
+            n[0].contains("not recovered: the rig does not fit the model: parameter \"AngleX\" names no parameter"),
+            "{}",
+            n[0]
+        );
     }
 
     #[test]
@@ -217,30 +294,30 @@ mod tests {
     // is a small copy of the one in `a2d-unity`'s tests, so that crate's public
     // API does not grow a test-support surface. ---
 
-    fn put_i32(o: &mut Vec<u8>, v: i32) {
+    pub(in crate::unity_cubism) fn put_i32(o: &mut Vec<u8>, v: i32) {
         o.extend_from_slice(&v.to_le_bytes());
     }
-    fn put_string(o: &mut Vec<u8>, s: &str) {
+    pub(in crate::unity_cubism) fn put_string(o: &mut Vec<u8>, s: &str) {
         put_i32(o, s.len() as i32);
         o.extend_from_slice(s.as_bytes());
         while o.len() % 4 != 0 {
             o.push(0);
         }
     }
-    fn put_pptr(o: &mut Vec<u8>, file: i32, path: i64) {
+    pub(in crate::unity_cubism) fn put_pptr(o: &mut Vec<u8>, file: i32, path: i64) {
         put_i32(o, file);
         o.extend_from_slice(&path.to_le_bytes());
     }
 
     /// `(path_id, type_index, bytes)` into a version-17 file with no type tree.
-    /// Type 0 is GameObject, 1 MonoScript, 2 MonoBehaviour.
-    fn build(objects: &[(i64, usize, Vec<u8>)]) -> SerializedFile {
+    /// Type 0 is GameObject, 1 MonoScript, 2 MonoBehaviour, 3 Transform.
+    pub(in crate::unity_cubism) fn build(objects: &[(i64, usize, Vec<u8>)]) -> SerializedFile {
         let mut meta = Vec::new();
         meta.extend_from_slice(b"2022.3.0f1 ");
         put_i32(&mut meta, 5);
         meta.push(0);
-        put_i32(&mut meta, 3);
-        for class in [1i32, 115, 114] {
+        put_i32(&mut meta, 4);
+        for class in [1i32, 115, 114, 4] {
             put_i32(&mut meta, class);
             meta.push(0);
             meta.extend_from_slice(&(-1i16).to_le_bytes());
@@ -274,7 +351,7 @@ mod tests {
         SerializedFile::parse(&file).expect("the synthetic file should parse")
     }
 
-    fn game_object(name: &str) -> Vec<u8> {
+    pub(in crate::unity_cubism) fn game_object(name: &str) -> Vec<u8> {
         let mut o = Vec::new();
         put_i32(&mut o, 0);
         put_i32(&mut o, 0);
@@ -282,7 +359,7 @@ mod tests {
         o
     }
 
-    fn mono_script(class: &str) -> Vec<u8> {
+    pub(in crate::unity_cubism) fn mono_script(class: &str) -> Vec<u8> {
         let mut o = Vec::new();
         put_string(&mut o, class);
         put_i32(&mut o, 0);
@@ -293,7 +370,7 @@ mod tests {
         o
     }
 
-    fn behaviour(owner: i64, script: i64, body: &[u8]) -> Vec<u8> {
+    pub(in crate::unity_cubism) fn behaviour(owner: i64, script: i64, body: &[u8]) -> Vec<u8> {
         let mut o = Vec::new();
         put_pptr(&mut o, 0, owner);
         o.extend_from_slice(&[1, 0, 0, 0]);
@@ -326,12 +403,12 @@ mod tests {
         ]);
         let inventory = Inventory::build(&file);
         let mut report = LoadReport::default();
-        note_unapplied(&file, &inventory, &mut report);
+        note_scan(&scan(&file, &inventory), &mut report);
         let got: Vec<String> = report.warnings().iter().map(|w| w.to_string()).collect();
         assert_eq!(
             got,
             [
-                "look-at rig (CubismLookController) is present and not applied: 2 look parameter(s) drive [ParamAngleX], 1 with no readable owner",
+                "look-at rig (CubismLookController) is present and not applied: 2 look parameter(s) drive [ParamAngleX], 1 with no readable owner; not recovered: the controller's owner is unreadable: a component has no local owner",
                 "hit area components are present and not applied: CubismHitDrawable x1",
             ]
         );
