@@ -176,7 +176,7 @@ pub fn run_with(
         stats: PacingStats::default(),
         last_present: None,
         refresh_period: None,
-        cursor: Vec2::ZERO,
+        cursor: None,
         report: std::mem::take(report),
         exit_after: options.exit_after,
         hidden: options.hidden,
@@ -327,6 +327,20 @@ fn commit(composition: &Option<CompositionGuard>, report: &mut LoadReport) {
 #[cfg(not(windows))]
 fn commit(_composition: &Option<CompositionGuard>, _report: &mut LoadReport) {}
 
+/// The pointer in physical screen pixels. Windows asks the system, since a
+/// click-through window gets no pointer events.
+#[cfg(windows)]
+fn global_cursor() -> Option<(i32, i32)> {
+    crate::composition::cursor_position()
+}
+
+/// Elsewhere there is no global query: the caller falls back to the last
+/// position the window itself saw.
+#[cfg(not(windows))]
+fn global_cursor() -> Option<(i32, i32)> {
+    None
+}
+
 struct App {
     /// Decoded models, moved into the viewer once a device exists.
     models: Vec<LoadedModel>,
@@ -344,7 +358,7 @@ struct App {
     refresh_period: Option<Duration>,
     /// Cursor position in physical pixels. Tracked because a drag needs it and
     /// button events do not carry it.
-    cursor: Vec2,
+    cursor: Option<Vec2>,
     report: LoadReport,
     /// How long to run for, when a run is time-limited.
     ///
@@ -561,6 +575,25 @@ impl App {
         commit(&active.composition, &mut self.report);
     }
 
+    /// The pointer in physical pixels from the window's client-area origin.
+    /// It may lie outside the window: following the pointer anywhere on the
+    /// desktop is intended. `None` when the option is off, the window is
+    /// minimized (its coordinates are not a real position), or no position is
+    /// known.
+    fn pointer_in_window(&self) -> Option<Vec2> {
+        if !self.state.follow_cursor() {
+            return None;
+        }
+        let active = self.active.as_ref()?;
+        if active.window.is_minimized() == Some(true) {
+            return None;
+        }
+        if let (Some(global), Ok(origin)) = (global_cursor(), active.window.inner_position()) {
+            return Some(crate::viewer::client_pointer(global, (origin.x, origin.y)));
+        }
+        self.cursor
+    }
+
     fn redraw(&mut self) {
         let now = Instant::now();
         let measured = now.duration_since(self.last_frame);
@@ -569,7 +602,16 @@ impl App {
 
         let paused = self.state.is_paused();
         let selected = self.state.animation_name().map(str::to_string);
+        let viewport = self.viewport();
+        let (scale, offset, flip) = (self.state.scale(), self.state.offset(), self.state.flip_x());
+        let pointer = self.pointer_in_window();
+        let follow = self.state.follow_cursor();
         let Some(active) = &mut self.active else { return };
+
+        // The viewer applies these in `update` through `viewer::step_model`
+        // (scale, look target, update), then `render` emits.
+        let camera = active.viewer.camera(viewport, scale, offset);
+        active.viewer.set_frame_inputs(crate::viewer::FrameInputs { pointer, follow, flip_x: flip, camera, viewport });
 
         match active.viewer.update(dt, paused) {
             Ok(Some(variation)) => {
@@ -609,10 +651,7 @@ impl App {
         };
 
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let viewport = self.viewport();
-        let (scale, offset, flip) = (self.state.scale(), self.state.offset(), self.state.flip_x());
         let Some(active) = &mut self.active else { return };
-        let camera = active.viewer.camera(viewport, scale, offset);
         if let Err(e) = active.viewer.render(&view, active.format, viewport, camera, flip) {
             self.report.note(format!("render failed: {e}"));
             return;
@@ -667,6 +706,9 @@ impl App {
             TrayCommand::ToggleClickThrough => {
                 self.state.toggle_click_through();
                 self.sync_window();
+            }
+            TrayCommand::ToggleFollowCursor => {
+                self.state.toggle_follow_cursor();
             }
             TrayCommand::NextAnimation => self.change_animation(|s| s.next_animation()),
             TrayCommand::SelectAnimation(index) => self.change_animation(move |s| s.select_animation(index)),
@@ -783,12 +825,16 @@ impl ApplicationHandler for App {
             WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Moved(_) => self.update_refresh(),
 
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = Vec2::new(position.x as f32, position.y as f32);
-                let action = self.state.drag_to(self.cursor);
+                let at = Vec2::new(position.x as f32, position.y as f32);
+                self.cursor = Some(at);
+                let action = self.state.drag_to(at);
                 self.apply(action);
             }
+            // Off Windows the last position is the only pointer source, so a
+            // position from before the pointer left must not be used forever.
+            WindowEvent::CursorLeft { .. } => self.cursor = None,
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                self.state.begin_drag(self.cursor);
+                self.state.begin_drag(self.cursor.unwrap_or(Vec2::ZERO));
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 self.state.end_drag();
@@ -813,6 +859,7 @@ impl ApplicationHandler for App {
                     Key::Character("m") => Some(TrayCommand::NextModel),
                     Key::Character("t") => Some(TrayCommand::ToggleAlwaysOnTop),
                     Key::Character("c") => Some(TrayCommand::ToggleClickThrough),
+                    Key::Character("l") => Some(TrayCommand::ToggleFollowCursor),
                     Key::Character("r") => Some(TrayCommand::ResetPlacement),
                     Key::Character("f") => {
                         self.state.toggle_flip();

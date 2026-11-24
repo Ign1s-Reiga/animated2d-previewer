@@ -34,11 +34,21 @@ pub struct WindowConfig {
     pub always_on_top: bool,
     /// When true, clicks pass through to whatever is behind the character.
     pub click_through: bool,
+    /// When true, the character looks toward the mouse pointer. Off by default,
+    /// and absent from configs written before the option existed.
+    #[serde(default)]
+    pub follow_cursor: bool,
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
-        WindowConfig { position: None, size: (480, 640), always_on_top: true, click_through: false }
+        WindowConfig {
+            position: None,
+            size: (480, 640),
+            always_on_top: true,
+            click_through: false,
+            follow_cursor: false,
+        }
     }
 }
 
@@ -434,6 +444,7 @@ mod tests {
                 size: (480, 640),
                 always_on_top: true,
                 click_through: false,
+                follow_cursor: true,
             },
             models: vec![
                 ModelConfig {
@@ -816,7 +827,17 @@ mod tests {
         assert!(config.models.is_empty());
         assert_eq!(config.active, 0);
         assert!(config.window.click_through);
+        assert!(!config.window.follow_cursor, "a config from before the option existed loads as off");
         assert_eq!(config.window.position, None);
+        assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn follow_cursor_defaults_off_and_survives_a_json_round_trip() {
+        assert!(!Config::default().window.follow_cursor);
+        let json = serde_json::to_string(&sample()).unwrap();
+        let (back, report) = Config::from_json(&json).unwrap();
+        assert!(back.window.follow_cursor);
         assert!(report.is_empty(), "{report}");
     }
 

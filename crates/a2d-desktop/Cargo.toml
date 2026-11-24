@@ -32,4 +32,4 @@ pollster = "1"
 # the viewer presents through a DirectComposition visual. Same version wgpu-hal
 # already resolves, so no second copy is built.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_DirectComposition"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_DirectComposition", "Win32_UI_WindowsAndMessaging"] }

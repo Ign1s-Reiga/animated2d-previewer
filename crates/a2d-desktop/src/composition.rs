@@ -1,4 +1,5 @@
-//! Windows-only: a DirectComposition visual for the swapchain to present into.
+//! Windows-only FFI for the crate: a DirectComposition visual for the swapchain
+//! to present into, and the global cursor query.
 //!
 //! # Why this exists
 //!
@@ -20,8 +21,10 @@
 //! # Scope of the unsafe code
 //!
 //! This is the only module in the crate allowed to use `unsafe`. Everything
-//! unsafe here is a COM call or the hand-off of a raw visual pointer to wgpu.
-//! No Win32 type escapes: callers see [`Composition`] as an opaque guard.
+//! unsafe here is a COM call, the hand-off of a raw visual pointer to wgpu, or
+//! the one `GetCursorPos` call in [`cursor_position`] (winit has no global
+//! pointer query). No Win32 type escapes: callers see [`Composition`] as an
+//! opaque guard and the cursor as a plain pair of integers.
 
 #![allow(unsafe_code)]
 
@@ -55,6 +58,19 @@ impl Composition {
         // `Commit` takes no pointers.
         unsafe { self.device.Commit() }.map_err(|e| format!("DirectComposition commit failed: {e}"))
     }
+}
+
+/// The pointer's position on the virtual screen in physical pixels, or `None`
+/// when Windows will not say (for example on a locked desktop).
+///
+/// A click-through window receives no `CursorMoved`, so this is how a window
+/// that ignores the mouse can still know where it is.
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let mut point = windows::Win32::Foundation::POINT::default();
+    // SAFETY: `point` is a live, writable POINT for the duration of the call,
+    // and `GetCursorPos` takes no other pointers.
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point) }.ok()?;
+    Some((point.x, point.y))
 }
 
 /// Makes a wgpu surface that presents through a DirectComposition visual
