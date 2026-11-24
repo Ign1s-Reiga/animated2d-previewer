@@ -161,6 +161,12 @@ pub struct GenericCubismModel {
     physics: Option<PhysicsState>,
     /// The look-at rig and its smoothing, when the model has a usable one.
     look: Option<LookState>,
+    /// The presentation scale from [`AnimatedModel::set_scale`]; a negative
+    /// component mirrors. Applied to the emitted geometry and the bounds only.
+    scale: a2d_core::Vec2,
+    /// The look target as the host gave it (post-scale model space), kept so a
+    /// later scale change can re-derive the un-scaled target the rig follows.
+    look_target: Option<a2d_core::Vec2>,
 }
 
 impl GenericCubismModel {
@@ -215,6 +221,8 @@ impl GenericCubismModel {
             texture: TextureId(0),
             physics,
             look,
+            scale: a2d_core::Vec2::ONE,
+            look_target: None,
         };
         // Open on the same kind of animation the Spine side does, rather than a
         // second rule for what a standing pose is called.
@@ -387,6 +395,17 @@ impl GenericCubismModel {
         }
     }
 
+    /// Hands the rig the stored look target, un-scaled into model space.
+    fn forward_look_target(&mut self) {
+        let Some(look) = &mut self.look else { return };
+        let (sx, sy) = (self.scale.x, self.scale.y);
+        let own = match self.look_target {
+            Some(t) if sx != 0.0 && sy != 0.0 => Some(a2d_core::Vec2::new(t.x / sx, t.y / sy)),
+            _ => None,
+        };
+        look.set_target(own);
+    }
+
     fn repose(&mut self) {
         self.pose = self.moc.pose(&self.values);
     }
@@ -501,7 +520,28 @@ impl AnimatedModel for GenericCubismModel {
     }
 
     fn emit(&self, out: &mut RenderList) {
-        self.moc.emit(&self.pose, self.texture, out);
+        self.moc.emit_scaled(&self.pose, self.texture, self.scale, out);
+    }
+
+    /// Scales the emitted geometry about the model-space origin, the way the
+    /// Spine runtime scales its skeleton: a negative component mirrors, and the
+    /// magnitude scales. Unlike Spine, which stores whatever it is given, a
+    /// non-finite scale is ignored here and the previous one stays. The scale
+    /// takes effect at the next emit (and bounds query), not retroactively on a
+    /// list already filled.
+    ///
+    /// This is a presentation transform applied at emit, not to the
+    /// parameters, so physics, motions and the look rig's own state are
+    /// untouched: a mirrored model's physics sees gravity and wind exactly as an
+    /// unmirrored one does, which is also what the official runtime does for a
+    /// mirror applied to the drawn model. Only the look target is adjusted, so
+    /// that the model looks at the point the host meant in the space it sees.
+    fn set_scale(&mut self, scale: a2d_core::Vec2) {
+        if !(scale.x.is_finite() && scale.y.is_finite()) {
+            return;
+        }
+        self.scale = scale;
+        self.forward_look_target();
     }
 
     /// Only `looping`, `speed`, `mix_duration` and `queued` are honoured: there
@@ -641,14 +681,15 @@ impl AnimatedModel for GenericCubismModel {
     /// Drives the look-at rig toward `target` (model space); see the module
     /// documentation. Without a rig this does nothing.
     ///
-    /// There is no mirror handling: this model does not mirror its geometry
-    /// (see [`AnimatedModel::set_scale`], which it ignores), so the target is
-    /// used as given. When it does mirror, the target's x must be un-mirrored
-    /// here, in the same change.
+    /// The target is in the space the host sees, after
+    /// [`AnimatedModel::set_scale`]: it is divided by the scale to get back to
+    /// the model's own space (a mirror negates x), so a point to the viewer's
+    /// right is looked at on the right whether or not the model is flipped.
+    /// The rest target is the model's own and is not mirrored. A zero scale
+    /// component has no inverse, so the target is released.
     fn set_look_target(&mut self, target: Option<a2d_core::Vec2>) {
-        if let Some(look) = &mut self.look {
-            look.set_target(target);
-        }
+        self.look_target = target;
+        self.forward_look_target();
     }
 
     fn set_expression(&mut self, name: &str) -> Result<(), RuntimeError> {
@@ -667,16 +708,21 @@ impl AnimatedModel for GenericCubismModel {
         let mut out = Aabb::EMPTY;
         // The canvas, not the geometry: a model may reach past its frame, and a
         // viewer that fits the geometry would then jitter as the pose moves.
+        // It is scaled like the geometry, so a mirrored model's frame is what
+        // is drawn (a corner pair either way round extends to the same box).
         let canvas = self.moc.canvas;
         if canvas.pixels_per_unit > 0.0 {
             let (w, h) = (canvas.size.0 / canvas.pixels_per_unit, canvas.size.1 / canvas.pixels_per_unit);
-            out.extend(a2d_core::Vec2::new(-w * 0.5, -h * 0.5));
-            out.extend(a2d_core::Vec2::new(w * 0.5, h * 0.5));
+            let s = self.scale;
+            out.extend(a2d_core::Vec2::new(-w * 0.5 * s.x, -h * 0.5 * s.y));
+            out.extend(a2d_core::Vec2::new(w * 0.5 * s.x, h * 0.5 * s.y));
         }
         out
     }
 
     fn hit_test(&self, _x: f32, _y: f32) -> Option<HitAreaId> {
+        // Once hit areas exist, a point must be divided by `self.scale` into the
+        // model's own space before it is tested.
         // Cubism hit areas are named drawables listed in the model settings,
         // which live outside the MOC3 and are not read yet.
         None
@@ -2464,5 +2510,128 @@ mod tests {
         m.set_look_target(Some(a2d_core::Vec2::new(3.0, 3.0)));
         tick(&mut m);
         assert_eq!(value(&m, "ParamAngleX"), 5.0);
+    }
+
+    fn emitted(m: &GenericCubismModel) -> RenderList {
+        let mut list = RenderList::new();
+        m.emit(&mut list);
+        list
+    }
+
+    #[test]
+    fn a_mirror_flips_every_emitted_vertex_about_the_origin() {
+        let bytes = crate::moc3::tests::Builder::new().masked().build();
+        let mut m = GenericCubismModel::load(Moc3::parse(&bytes).expect("should parse"), "masked");
+        let plain = emitted(&m);
+        m.set_scale(a2d_core::Vec2::new(-1.0, 1.0));
+        let flipped = emitted(&m);
+        assert_eq!(plain.meshes().len(), flipped.meshes().len());
+        let mut checked = 0;
+        for (a, b) in plain.meshes().iter().zip(flipped.meshes()) {
+            assert_eq!(a.indices, b.indices);
+            assert_eq!(a.uvs, b.uvs, "the texture follows the geometry");
+            for (p, q) in a.vertices.iter().zip(&b.vertices) {
+                assert_eq!((q.x, q.y), (-p.x, p.y));
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+        assert!(!plain.masks().is_empty(), "the fixture must carry a mask or this half proves nothing");
+        assert_eq!(plain.masks().len(), flipped.masks().len());
+        for (a, b) in plain.masks().iter().zip(flipped.masks()) {
+            for (p, q) in a.vertices.iter().zip(&b.vertices) {
+                assert_eq!((q.x, q.y), (-p.x, p.y), "clip shapes mirror with the meshes");
+            }
+        }
+    }
+
+    #[test]
+    fn the_magnitude_scales_and_unit_scale_restores() {
+        let mut m = model();
+        let plain = emitted(&m);
+        m.set_scale(a2d_core::Vec2::new(-2.0, 0.5));
+        let scaled = emitted(&m);
+        for (a, b) in plain.meshes().iter().zip(scaled.meshes()) {
+            for (p, q) in a.vertices.iter().zip(&b.vertices) {
+                assert_eq!((q.x, q.y), (-2.0 * p.x, 0.5 * p.y));
+            }
+        }
+        m.set_scale(a2d_core::Vec2::new(f32::NAN, 1.0));
+        assert_eq!(emitted(&m).meshes()[0].vertices, scaled.meshes()[0].vertices, "a non-finite scale is ignored");
+        m.set_scale(a2d_core::Vec2::ONE);
+        for (a, b) in plain.meshes().iter().zip(emitted(&m).meshes()) {
+            assert_eq!(a.vertices, b.vertices);
+        }
+    }
+
+    #[test]
+    fn bounds_follow_the_scale_and_stay_ordered() {
+        let mut m = model();
+        let b = m.bounds();
+        m.set_scale(a2d_core::Vec2::new(-1.0, 1.0));
+        let mirrored = m.bounds();
+        assert_eq!((mirrored.min.x, mirrored.max.x), (-b.max.x, -b.min.x));
+        assert_eq!((mirrored.min.y, mirrored.max.y), (b.min.y, b.max.y));
+        m.set_scale(a2d_core::Vec2::new(-2.0, 3.0));
+        let big = m.bounds();
+        assert_eq!((big.min.x, big.max.x), (-2.0 * b.max.x, -2.0 * b.min.x));
+        assert_eq!((big.min.y, big.max.y), (3.0 * b.min.y, 3.0 * b.max.y));
+        assert!(big.min.x <= big.max.x && big.min.y <= big.max.y);
+    }
+
+    #[test]
+    fn a_target_on_the_right_of_a_mirrored_model_is_the_mirrored_point() {
+        let rig = || angle_rig(LookBlend::Additive, (0.2, 0.0, 0.0));
+        let settle = |scale: f32, x: f32| {
+            let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], rig());
+            m.set_scale(a2d_core::Vec2::new(scale, 1.0));
+            m.set_look_target(Some(a2d_core::Vec2::new(x, 0.0)));
+            frames(&mut m, 400);
+            value(&m, "ParamAngleX")
+        };
+        // Unmirrored, a point at x = 1 gives 10.
+        assert!((settle(1.0, 1.0) - 10.0).abs() < 1e-3);
+        // Mirrored, the viewer's right is the model's left: the same point on
+        // screen is x = -1 in the model's own space, giving -10.
+        assert!((settle(-1.0, 1.0) - -10.0).abs() < 1e-3);
+        // And the mirrored model reaches the unmirrored value at the mirrored point.
+        assert!((settle(-1.0, -1.0) - 10.0).abs() < 1e-3);
+        // The rest target is the model's own: mirroring does not move it.
+        let rest = |scale: f32| {
+            let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], rig());
+            m.set_scale(a2d_core::Vec2::new(scale, 1.0));
+            tick(&mut m);
+            value(&m, "ParamAngleX")
+        };
+        assert!((rest(-1.0) - rest(1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_scale_set_after_the_target_still_unmirrors_it() {
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], angle_rig(LookBlend::Additive, (0.0, 0.0, 0.0)));
+        m.set_look_target(Some(a2d_core::Vec2::new(1.0, 0.0)));
+        m.set_scale(a2d_core::Vec2::new(-1.0, 1.0));
+        frames(&mut m, 400);
+        assert!((value(&m, "ParamAngleX") - -10.0).abs() < 1e-3);
+        m.set_scale(a2d_core::Vec2::new(0.0, 1.0));
+        frames(&mut m, 600);
+        assert!(value(&m, "ParamAngleX").abs() < 1e-3, "a zero scale has no inverse: the target is released");
+    }
+
+    #[test]
+    fn mirroring_does_not_touch_the_physics() {
+        let run = |mirror: bool| {
+            let mut m = with_physics(vec![hold_both("Idle", 0.9)], rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+            if mirror {
+                m.set_scale(a2d_core::Vec2::new(-1.0, 1.0));
+            }
+            let mut seen = Vec::new();
+            for _ in 0..120 {
+                m.update(Duration::from_millis(16)).expect("update");
+                seen.push(value(&m, "ParamEyeLOpen"));
+            }
+            seen
+        };
+        assert_eq!(run(false), run(true));
     }
 }

@@ -346,3 +346,31 @@ fn a_tie_in_draw_order_is_settled_by_the_object_list_when_rendered() {
     let image = harness.frame(0.0);
     assert_eq!(harness.pixel_at(&image, OVERLAP.0, OVERLAP.1), BLUE);
 }
+
+#[test]
+fn a_mirrored_model_renders_as_the_horizontally_flipped_image() {
+    let Some(gpu) = gpu() else { return };
+    let mut plain = Harness::build(gpu.clone(), "mirror-plain");
+    let mut mirrored = Harness::build(gpu, "mirror-flipped");
+    // The frame is symmetric about the origin, so the same camera serves both.
+    assert_eq!(plain.camera.center.x, 0.0);
+    mirrored.model.set_scale(a2d_core::Vec2::new(-1.0, 1.0));
+    for time in TIMESTAMPS {
+        let a = plain.frame(time);
+        let b = mirrored.frame(time);
+        let (w, h) = (a.width as usize, a.height as usize);
+        let mut flipped = a.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let from = (y * w + (w - 1 - x)) * 4;
+                let to = (y * w + x) * 4;
+                flipped.pixels[to..to + 4].copy_from_slice(&a.pixels[from..from + 4]);
+            }
+        }
+        let diff = flipped.diff(&b).expect("same size");
+        // Rasterisation rounds the two sides differently along edges, so a few
+        // edge pixels may differ; the bulk must agree.
+        assert!(diff.differing_pixels * 100 < diff.total_pixels, "t={time}: {diff}");
+        assert!(coverage(&b) > 0.02, "t={time}: the mirrored model drew nothing");
+    }
+}
