@@ -402,6 +402,10 @@ pub struct CubismIr {
     /// Scripted returns between motions, at most one per `from`. Empty when the
     /// source carried none or a package written before this was stored is read.
     pub handovers: Vec<MotionHandover>,
+    /// A rig that points the model at a look position (a cursor, a touch).
+    /// `None` when the source carried none or a package written before this was
+    /// stored is read. Nothing applies it yet: it is recovered and kept.
+    pub look: Option<LookRig>,
 }
 
 /// A [`Handover`] and the motion it belongs to.
@@ -410,6 +414,104 @@ pub struct MotionHandover {
     /// The motion this handover leaves, by name.
     pub from: String,
     pub handover: Handover,
+}
+
+/// How a look contribution combines with the value a parameter already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookBlend {
+    /// `value += position[axis] * factor`.
+    Additive,
+    /// `value *= position[axis] * factor`.
+    Multiply,
+    /// `value = position[axis] * factor`.
+    Override,
+}
+
+/// One axis of the look position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookAxis {
+    X,
+    Y,
+    Z,
+}
+
+/// One parameter a look rig drives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookParameter {
+    /// A parameter of the model, by id.
+    pub parameter: String,
+    /// Which component of the look position feeds it.
+    pub axis: LookAxis,
+    /// Multiplier on that component. Finite.
+    pub factor: f32,
+}
+
+/// A look-at rig: a smoothed position that nudges some parameters, so the model
+/// can follow a target.
+///
+/// # Space and unit
+///
+/// Every point and length here is in **model-space units**: the space the
+/// drawables are in after `Moc3::pose`, that is `(pixel - Canvas::origin) /
+/// Canvas::pixels_per_unit`, X to the right and Y up. Model-space `(0, 0)` is
+/// `Canvas::origin`, the point `GenericCubismModel::bounds()` centres on. A
+/// source whose units are model-space units (as an engine unit is when the
+/// model is imported at its own pixels-per-unit) copies its numbers across
+/// with no conversion, and factors need no rescaling.
+///
+/// Z is the depth axis: **+Z points away from the viewer, into the screen**, so
+/// a left-handed Y-up source copies its z unchanged. A pointer that only
+/// supplies x and y leaves z at `rest_target.2`.
+///
+/// # What the blend sees
+///
+/// The target is a *point* in model space (the rest target, or a driven one).
+/// The position fed to the blend is `point - center`, per component, and
+/// `position[axis]` in the formulas on [`LookBlend`] is that. At rest the
+/// position is `rest_target - center`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookRig {
+    pub blend: LookBlend,
+    /// Smoothing time in seconds for a critically damped follow: roughly the
+    /// time the position takes to close the gap to its goal. Finite, not
+    /// negative; `0` follows instantly.
+    pub damping: f32,
+    /// The point the rig looks at when nothing drives it, in model space.
+    /// Finite.
+    pub rest_target: (f32, f32, f32),
+    /// The point positions are measured from, in model space. Finite.
+    pub center: (f32, f32, f32),
+    /// The driven parameters, in application order. A parameter appears once.
+    pub parameters: Vec<LookParameter>,
+}
+
+impl LookRig {
+    /// The first reason this rig cannot be used with a model that has
+    /// `parameters`, or `None` when it can: a parameter the model lacks or one
+    /// listed twice, a factor or target that is not finite, a damping that is
+    /// not finite or is negative.
+    pub fn problem(&self, parameters: &[Parameter]) -> Option<String> {
+        if !self.damping.is_finite() || self.damping < 0.0 {
+            return Some(format!("damping {} is not a finite non-negative time", self.damping));
+        }
+        for (what, (x, y, z)) in [("rest target", self.rest_target), ("center", self.center)] {
+            if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+                return Some(format!("{what} ({x}, {y}, {z}) is not finite"));
+            }
+        }
+        for (i, p) in self.parameters.iter().enumerate() {
+            if !p.factor.is_finite() {
+                return Some(format!("parameter {:?} has factor {}, which is not finite", p.parameter, p.factor));
+            }
+            if !parameters.iter().any(|m| m.id == p.parameter) {
+                return Some(format!("parameter {:?} names no parameter of the model", p.parameter));
+            }
+            if self.parameters[..i].iter().any(|e| e.parameter == p.parameter) {
+                return Some(format!("parameter {:?} is driven more than once", p.parameter));
+            }
+        }
+        None
+    }
 }
 
 /// A model's physics rig: groups of pendulum chains that read some parameters

@@ -297,6 +297,7 @@ pub fn cubism_package(with_motion: bool) -> a2d_pack::Package {
         physics: None,
         default_motion: None,
         handovers: vec![],
+        look: None,
         drawable_keyform_draw_orders: vec![500.0, 500.0],
         ..CubismIr::default()
     };
@@ -386,6 +387,7 @@ pub fn cubism_draw_order_package(tie_order: Vec<u32>) -> a2d_pack::Package {
         physics: None,
         default_motion: None,
         handovers: vec![],
+        look: None,
         drawable_keyform_draw_orders: vec![400.0, 600.0, 500.0, 500.0],
         ..CubismIr::default()
     };
@@ -547,6 +549,7 @@ pub fn cubism_deformation_package() -> a2d_pack::Package {
         physics: None,
         default_motion: None,
         handovers: vec![],
+        look: None,
         drawable_keyform_draw_orders: vec![500.0; 4],
         ..CubismIr::default()
     };
