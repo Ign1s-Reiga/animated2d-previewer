@@ -57,6 +57,7 @@ use a2d_core::{
 
 use crate::emit::CubismEmit;
 use crate::eval::{CubismEval, Pose};
+use crate::look::LookState;
 use crate::moc3::CubismIr;
 use crate::motion::{wrap_time, MotionPlayer};
 use crate::physics::PhysicsState;
@@ -158,6 +159,8 @@ pub struct GenericCubismModel {
     texture: TextureId,
     /// The physics simulation, if the model has a rig with anything to simulate.
     physics: Option<PhysicsState>,
+    /// The look-at rig and its smoothing, when the model has a usable one.
+    look: Option<LookState>,
 }
 
 impl GenericCubismModel {
@@ -194,6 +197,8 @@ impl GenericCubismModel {
             }
         }
         let physics = moc.physics.as_ref().and_then(|p| PhysicsState::new(p, &moc.parameters));
+        let look =
+            moc.look.as_ref().and_then(|rig| LookState::new(rig, &moc.parameters)).filter(|state| !state.is_empty());
         let mut model = GenericCubismModel {
             moc,
             name: display_name.into(),
@@ -209,12 +214,18 @@ impl GenericCubismModel {
             expressions: Vec::new(),
             texture: TextureId(0),
             physics,
+            look,
         };
         // Open on the same kind of animation the Spine side does, rather than a
         // second rule for what a standing pose is called.
         if let Some(index) = model.default_name().and_then(|name| model.animations.iter().position(|a| a.name == name))
         {
             model.start_motion(index, true, 1.0, 0.0);
+        } else if model.look.is_some() {
+            // Show the rig's rest offset from the first frame, as the first
+            // update would, rather than the bare defaults until then.
+            model.step_physics(0.0);
+            model.repose();
         }
         model
     }
@@ -355,9 +366,22 @@ impl GenericCubismModel {
         &self.pose.unstable
     }
 
-    /// Advances the physics by `dt` seconds over the values the motion or idle
-    /// just wrote. Does nothing for a model without a rig.
+    /// Writes the look rig's parameters over the values the motion or idle just
+    /// wrote. Does nothing for a model without a usable rig.
+    fn apply_look(&mut self) {
+        if let Some(look) = &self.look {
+            look.apply(&mut self.values, &self.moc.parameters, &self.repeating);
+        }
+    }
+
+    /// Applies the look rig, then advances the physics by `dt` seconds over the
+    /// values the motion or idle just wrote. The look goes first so physics reads
+    /// the head angle the viewer will see. Every caller has just rebuilt the
+    /// values from their defaults, which is what stops the look offset building
+    /// up from one frame to the next. The physics does nothing for a model
+    /// without a rig.
     fn step_physics(&mut self, dt: f32) {
+        self.apply_look();
         if let Some(physics) = &mut self.physics {
             physics.step(dt, &mut self.values);
         }
@@ -374,6 +398,9 @@ impl AnimatedModel for GenericCubismModel {
         // would jump the idle rather than advance it.
         let step = dt.as_secs_f32().min(0.1);
         self.elapsed += step;
+        if let Some(look) = &mut self.look {
+            look.advance(step);
+        }
         let mut leftover = None;
         // A queued entry with a handover time takes over when the playhead
         // crosses it, part-way through this step; the crossing leaves the
@@ -443,7 +470,7 @@ impl AnimatedModel for GenericCubismModel {
             return Ok(());
         }
 
-        if self.motion.is_none() && self.idle.is_empty() && self.physics.is_none() {
+        if self.motion.is_none() && self.idle.is_empty() && self.physics.is_none() && self.look.is_none() {
             // Nothing drives anything: only repose if something was left off rest.
             if self.values.iter().zip(&self.moc.parameters).any(|(v, p)| *v != p.default) {
                 self.reset_values();
@@ -523,7 +550,8 @@ impl AnimatedModel for GenericCubismModel {
     /// asking for the end shows the final frame. Afterwards the motion is the
     /// current one, looping, with its playhead at `time`; anything queued is
     /// dropped, as is any crossfade: the pose is the motion alone at full weight.
-    /// The synthetic idle is not applied.
+    /// The synthetic idle is not applied. A look rig is posed at its rest target;
+    /// the host's driven target and the rig's smoothing are left as they were.
     fn pose_at(&mut self, animation: &str, time: f32) -> Result<(), RuntimeError> {
         let index = self
             .animations
@@ -532,6 +560,13 @@ impl AnimatedModel for GenericCubismModel {
             .ok_or_else(|| RuntimeError::UnknownAnimation(animation.to_string()))?;
         self.pending = None;
         self.fading = None;
+        // The look rig sits at its rest target for the pose, so it is a function
+        // of the timestamp alone; the host's driven target and the smoothing in
+        // flight are put back afterwards.
+        let saved_look = self.look.clone();
+        if let Some(look) = &mut self.look {
+            look.rest();
+        }
         self.motion = MotionPlayer::new(&self.moc, index, true, 1.0);
         let duration = self.moc.motions.get(index).map_or(0.0, |m| m.duration);
         let target = wrap_time(time, duration, false);
@@ -565,7 +600,9 @@ impl AnimatedModel for GenericCubismModel {
             if let Some(player) = &self.motion {
                 player.apply(&self.moc, &mut self.values);
             }
+            self.apply_look();
         }
+        self.look = saved_look;
         self.repose();
         Ok(())
     }
@@ -598,6 +635,19 @@ impl AnimatedModel for GenericCubismModel {
             self.write_motion_values();
             self.step_physics(0.0);
             self.repose();
+        }
+    }
+
+    /// Drives the look-at rig toward `target` (model space); see the module
+    /// documentation. Without a rig this does nothing.
+    ///
+    /// There is no mirror handling: this model does not mirror its geometry
+    /// (see [`AnimatedModel::set_scale`], which it ignores), so the target is
+    /// used as given. When it does mirror, the target's x must be un-mirrored
+    /// here, in the same change.
+    fn set_look_target(&mut self, target: Option<a2d_core::Vec2>) {
+        if let Some(look) = &mut self.look {
+            look.set_target(target);
         }
     }
 
@@ -640,6 +690,7 @@ impl AnimatedModel for GenericCubismModel {
         self.fading = None;
         self.pending = None;
         self.physics = None;
+        self.look = None;
     }
 
     fn display_name(&self) -> &str {
@@ -664,6 +715,10 @@ impl AnimatedModel for GenericCubismModel {
         // The same for a physics input or output: the rig runs without it.
         for degradation in self.moc.unresolved_physics_targets() {
             report.warn(degradation);
+        }
+        // A look rig the model cannot use is left off; say why.
+        if let Some(problem) = self.moc.look.as_ref().and_then(|rig| rig.problem(&self.moc.parameters)) {
+            report.warn(a2d_core::Degradation::Note(format!("look-at rig not applied: {problem}")));
         }
         // Where the motions suggest a parameter repeats but the source says it
         // does not (or, with no stored flags, where one is inferred), name it so
@@ -2197,5 +2252,217 @@ mod tests {
         assert!(m.fading.is_none() && m.motion.is_some());
         step(&mut m, 0.1);
         assert_eq!(value(&m, "ParamExtra"), 8.0);
+    }
+
+    // ---- look-at rig ----
+
+    use a2d_core::ir::cubism::{LookAxis, LookBlend, LookParameter, LookRig};
+
+    fn look_rig(
+        blend: LookBlend,
+        rest: (f32, f32, f32),
+        center: (f32, f32, f32),
+        drives: &[(&str, LookAxis, f32)],
+    ) -> LookRig {
+        LookRig {
+            blend,
+            damping: 0.15,
+            rest_target: rest,
+            center,
+            parameters: drives
+                .iter()
+                .map(|(p, axis, factor)| LookParameter { parameter: (*p).into(), axis: *axis, factor: *factor })
+                .collect(),
+        }
+    }
+
+    fn with_look(motions: Vec<Motion>, rig: LookRig) -> GenericCubismModel {
+        let bytes = crate::moc3::tests::Builder::new().build();
+        let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+        ir.parameter_repeats = None;
+        ir.motions = motions;
+        ir.look = Some(rig);
+        GenericCubismModel::load(ir, "test")
+    }
+
+    fn angle_rig(blend: LookBlend, rest: (f32, f32, f32)) -> LookRig {
+        look_rig(blend, rest, (0.0, 0.0, 0.0), &[("ParamAngleX", LookAxis::X, 10.0)])
+    }
+
+    fn tick(m: &mut GenericCubismModel) {
+        m.update(Duration::from_millis(16)).expect("update");
+    }
+
+    #[test]
+    fn the_rest_offset_applies_by_default_in_each_blend() {
+        // Position x 0.4 * factor 10 = 4 against a keyed 5.
+        for (blend, want) in [(LookBlend::Additive, 9.0), (LookBlend::Multiply, 20.0), (LookBlend::Override, 4.0)] {
+            let mut m = with_look(vec![hold("Idle", "ParamAngleX", 5.0)], angle_rig(blend, (0.4, 0.0, 0.0)));
+            tick(&mut m);
+            assert!((value(&m, "ParamAngleX") - want).abs() < 1e-4, "{blend:?}: {}", value(&m, "ParamAngleX"));
+        }
+    }
+
+    #[test]
+    fn the_result_is_clamped_to_the_parameters_range() {
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 5.0)], angle_rig(LookBlend::Additive, (10.0, 0.0, 0.0)));
+        tick(&mut m);
+        assert_eq!(value(&m, "ParamAngleX"), 30.0);
+    }
+
+    #[test]
+    fn the_centre_is_subtracted_from_the_point() {
+        let rig =
+            look_rig(LookBlend::Additive, (0.5, 0.0, 0.0), (0.1, 0.0, 0.0), &[("ParamAngleX", LookAxis::X, 10.0)]);
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], rig);
+        tick(&mut m);
+        assert!((value(&m, "ParamAngleX") - 4.0).abs() < 1e-4, "{}", value(&m, "ParamAngleX"));
+    }
+
+    #[test]
+    fn a_2d_target_leaves_z_at_the_rest_targets() {
+        let rig =
+            look_rig(LookBlend::Additive, (0.0, 0.0, 0.3), (0.0, 0.0, 0.0), &[("ParamAngleX", LookAxis::Z, 10.0)]);
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], rig);
+        m.set_look_target(Some(a2d_core::Vec2::new(0.9, 0.9)));
+        frames(&mut m, 300);
+        assert!((value(&m, "ParamAngleX") - 3.0).abs() < 1e-4, "{}", value(&m, "ParamAngleX"));
+    }
+
+    #[test]
+    fn a_driven_target_is_followed_and_released_back_to_rest() {
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], angle_rig(LookBlend::Additive, (0.2, 0.0, 0.0)));
+        tick(&mut m);
+        assert!((value(&m, "ParamAngleX") - 2.0).abs() < 1e-4);
+        m.set_look_target(Some(a2d_core::Vec2::new(1.0, 0.0)));
+        tick(&mut m);
+        let first = value(&m, "ParamAngleX");
+        assert!(first > 2.0 && first < 10.0, "it eases, not jumps: {first}");
+        frames(&mut m, 300);
+        assert!((value(&m, "ParamAngleX") - 10.0).abs() < 1e-3);
+        m.set_look_target(None);
+        tick(&mut m);
+        let back = value(&m, "ParamAngleX");
+        assert!(back < 10.0 && back > 2.0, "it eases back, not jumps: {back}");
+        frames(&mut m, 600);
+        assert!((value(&m, "ParamAngleX") - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_offset_does_not_accumulate_on_a_parameter_nothing_keys() {
+        // The eye parameter defaults to 1 on 0..1.2; the rig adds 0.5 * 0.1.
+        let rig =
+            look_rig(LookBlend::Additive, (0.0, 0.0, 0.5), (0.0, 0.0, 0.0), &[("ParamEyeLOpen", LookAxis::Z, 0.1)]);
+        for motions in [vec![hold("Idle", "ParamAngleX", 0.0)], Vec::new()] {
+            let mut m = with_look(motions, rig.clone());
+            frames(&mut m, 500);
+            assert!((value(&m, "ParamEyeLOpen") - 1.05).abs() < 1e-5, "{}", value(&m, "ParamEyeLOpen"));
+        }
+    }
+
+    #[test]
+    fn the_offset_is_in_place_before_physics_reads_its_inputs() {
+        // The motion holds ParamAngleX at 0; the rig pushes it to its maximum.
+        // A chain fed by ParamAngleX settles at the angle of a maximal input only
+        // if physics sees the pushed value.
+        let build = |look: Option<LookRig>| {
+            let bytes = crate::moc3::tests::Builder::new().build();
+            let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+            ir.parameter_repeats = None;
+            ir.motions = vec![hold("Idle", "ParamAngleX", 0.0)];
+            ir.physics = Some(rig("ParamAngleX", "ParamEyeLOpen", 100.0));
+            ir.look = look;
+            GenericCubismModel::load(ir, "test")
+        };
+        let mut with = build(Some(angle_rig(LookBlend::Additive, (100.0, 0.0, 0.0))));
+        frames(&mut with, 600);
+        assert!((value(&with, "ParamEyeLOpen") - SETTLED).abs() < 2e-3, "{}", value(&with, "ParamEyeLOpen"));
+        let mut without = build(None);
+        frames(&mut without, 600);
+        assert!(value(&without, "ParamEyeLOpen").abs() < 2e-3, "{}", value(&without, "ParamEyeLOpen"));
+    }
+
+    #[test]
+    fn pose_at_applies_the_rest_offset_and_ignores_a_driven_target() {
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], angle_rig(LookBlend::Additive, (0.2, 0.0, 0.0)));
+        m.set_look_target(Some(a2d_core::Vec2::new(1.0, 0.0)));
+        frames(&mut m, 300);
+        m.pose_at("Idle", 0.5).expect("pose");
+        assert!((value(&m, "ParamAngleX") - 2.0).abs() < 1e-4, "{}", value(&m, "ParamAngleX"));
+        // The driven target and the smoothing survive it: the next update shows
+        // the followed position (10), not the rest offset.
+        tick(&mut m);
+        assert!((value(&m, "ParamAngleX") - 10.0).abs() < 1e-3, "{}", value(&m, "ParamAngleX"));
+    }
+
+    #[test]
+    fn a_model_with_a_rig_and_no_motion_shows_the_offset_at_load() {
+        let rig = look_rig(
+            LookBlend::Override,
+            (0.0, 0.0, 0.5),
+            (0.0, 0.0, 0.0),
+            &[("ParamEyeLOpen", LookAxis::Z, 1.0), ("ParamAngleX", LookAxis::Z, 10.0)],
+        );
+        let mut m = with_look(Vec::new(), rig);
+        let at_load = m.values.clone();
+        let pose_at_load = m.pose().clone();
+        assert!((value(&m, "ParamEyeLOpen") - 0.5).abs() < 1e-6);
+        m.update(Duration::ZERO).expect("update");
+        assert_eq!(m.values, at_load);
+        assert_eq!(*m.pose(), pose_at_load);
+    }
+
+    #[test]
+    fn the_look_is_applied_once_across_a_handover_crossing() {
+        // A ramps ParamExtra by 10 per second, B holds 4, the handover is at 0.5 s
+        // over a one second fade (see the handover tests above). A look of
+        // +0.5 on ParamExtra (position x 1 * factor 0.5) is added after the blend,
+        // once, so every expected value is the handover test's plus 0.5.
+        let mut m = queued_ramp(Some(0.5), 1.0);
+        let rig = look_rig(LookBlend::Additive, (1.0, 0.0, 0.0), (0.0, 0.0, 0.0), &[("ParamExtra", LookAxis::X, 0.5)]);
+        m.look = LookState::new(&rig, &m.moc.parameters);
+        steps(&mut m, 6, STEP);
+        assert_eq!(m.current_animation(), Some("A"));
+        assert!((value(&m, "ParamExtra") - 4.25).abs() < 1e-5, "{}", value(&m, "ParamExtra"));
+        steps(&mut m, 2, STEP);
+        assert_eq!(m.current_animation(), Some("B"));
+        assert!((value(&m, "ParamExtra") - 5.5).abs() < 1e-5, "{}", value(&m, "ParamExtra"));
+        steps(&mut m, 2, STEP);
+        assert!((value(&m, "ParamExtra") - 6.664_364_5).abs() < 1e-4, "{}", value(&m, "ParamExtra"));
+        // Once the fade is over, B alone: 4 + 0.5.
+        steps(&mut m, 20, STEP);
+        assert!((value(&m, "ParamExtra") - 4.5).abs() < 1e-5, "{}", value(&m, "ParamExtra"));
+    }
+
+    #[test]
+    fn a_motionless_model_with_a_rig_still_applies_it() {
+        // No motion and no idle: the early "nothing drives anything" return must
+        // not skip the look.
+        let rig =
+            look_rig(LookBlend::Override, (0.0, 0.0, 0.5), (0.0, 0.0, 0.0), &[("ParamEyeLOpen", LookAxis::Z, 1.0)]);
+        let mut m = with_look(Vec::new(), rig);
+        m.idle.clear();
+        tick(&mut m);
+        assert!((value(&m, "ParamEyeLOpen") - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_rig_naming_a_missing_parameter_is_left_off_and_reported() {
+        let rig = look_rig(LookBlend::Additive, (1.0, 0.0, 0.0), (0.0, 0.0, 0.0), &[("NoSuch", LookAxis::X, 1.0)]);
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 5.0)], rig);
+        tick(&mut m);
+        assert_eq!(value(&m, "ParamAngleX"), 5.0);
+        let mut report = a2d_core::LoadReport::new();
+        m.absorb_degradations(&mut report);
+        let text: Vec<String> = report.warnings().iter().map(|w| w.to_string()).collect();
+        assert!(text.iter().any(|t| t.contains("look-at rig not applied") && t.contains("NoSuch")), "{text:?}");
+    }
+
+    #[test]
+    fn a_model_without_a_rig_ignores_a_look_target() {
+        let mut m = with_motions(vec![hold("Idle", "ParamAngleX", 5.0)]);
+        m.set_look_target(Some(a2d_core::Vec2::new(3.0, 3.0)));
+        tick(&mut m);
+        assert_eq!(value(&m, "ParamAngleX"), 5.0);
     }
 }

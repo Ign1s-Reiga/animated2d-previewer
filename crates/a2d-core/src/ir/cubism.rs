@@ -404,7 +404,8 @@ pub struct CubismIr {
     pub handovers: Vec<MotionHandover>,
     /// A rig that points the model at a look position (a cursor, a touch).
     /// `None` when the source carried none or a package written before this was
-    /// stored is read. Nothing applies it yet: it is recovered and kept.
+    /// stored is read. `GenericCubismModel` applies it: at its rest target by
+    /// default, following a point when the host drives it.
     pub look: Option<LookRig>,
 }
 

@@ -12,7 +12,7 @@
 //! expression controller is read, to tell an empty list from a set one. The
 //! look-at rig is recovered in full (`look.rs`) and checked against the
 //! model's parameters: it is carried into the package, and its note says it
-//! was recovered, or why it was not. It is still not applied during playback.
+//! was recovered, or why it was not. Playback applies it at its rest target and follows a pointer when the host drives it.
 //! Hit areas are reported too: hit testing is not implemented, so a drawable
 //! the source marked as hittable hits nothing here.
 //! Components that only do bookkeeping (the parameter store, the update
@@ -117,7 +117,7 @@ pub(super) fn notes(scan: &Scan) -> Vec<String> {
         let unnamed = scan.look_ids.iter().filter(|i| i.is_none()).count();
         let mut line = match (&scan.look, &scan.look_failure) {
             (Some(rig), _) => format!(
-                "look-at rig ({LOOK_CONTROLLER}) recovered: {} look parameter(s) drive [{}], {} blend, damping {} s; not yet applied, not driven by default",
+                "look-at rig ({LOOK_CONTROLLER}) recovered: {} look parameter(s) drive [{}], {} blend, damping {} s; applied at its rest target, follows a pointer when the host drives it",
                 rig.parameters.len(),
                 ids.join(", "),
                 match rig.blend {
@@ -224,7 +224,7 @@ pub(in crate::unity_cubism) mod tests {
         let n = notes(&s);
         assert_eq!(
             n,
-            ["look-at rig (CubismLookController) recovered: 2 look parameter(s) drive [AngleX, EyeBallX], additive blend, damping 0.15 s; not yet applied, not driven by default"]
+            ["look-at rig (CubismLookController) recovered: 2 look parameter(s) drive [AngleX, EyeBallX], additive blend, damping 0.15 s; applied at its rest target, follows a pointer when the host drives it"]
         );
     }
 
@@ -313,7 +313,7 @@ pub(in crate::unity_cubism) mod tests {
     /// Type 0 is GameObject, 1 MonoScript, 2 MonoBehaviour, 3 Transform.
     pub(in crate::unity_cubism) fn build(objects: &[(i64, usize, Vec<u8>)]) -> SerializedFile {
         let mut meta = Vec::new();
-        meta.extend_from_slice(b"2022.3.0f1 ");
+        meta.extend_from_slice(b"2022.3.0f1\0");
         put_i32(&mut meta, 5);
         meta.push(0);
         put_i32(&mut meta, 4);
