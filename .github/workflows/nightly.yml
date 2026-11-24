@@ -67,12 +67,12 @@ jobs:
             libxrandr-dev libxi-dev libgl1-mesa-dev pkg-config
 
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # A2D_REQUIRE_GPU is deliberately unset: a runner has no adapter, and the
       # GPU and window tests skip themselves rather than fail. That does mean a
       # nightly is not proof the renderer works, only that everything else does.
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
 
   build:
     name: ${{ matrix.label }}

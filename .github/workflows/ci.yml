@@ -1,0 +1,79 @@
+name: CI
+
+# Checks every pull request and every push to `main`, so a red tree is seen
+# before it merges rather than by the next nightly. It runs the same format,
+# lint and test steps as the nightly's `check` job, on the newest stable Rust:
+# a new rustfmt or clippy release that disagrees with the tree shows up here on
+# the next change.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Nothing here writes to the repository; build scripts of dependencies run
+# during the tests, so they get a read-only token and no stored credential.
+permissions:
+  contents: read
+
+# A newer push to a pull request makes an older run of it pointless. Runs on
+# `main` are never cancelled, so every merge commit gets its own result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+
+jobs:
+  linux:
+    name: Format, lints and tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          # libxdo is what tray-icon links against. clippy only checks and
+          # never links, so a missing one passes every earlier step and fails
+          # at the first binary that gets built.
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev pkg-config
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # A2D_REQUIRE_GPU is deliberately unset: a runner has no adapter, and the
+      # GPU and window tests skip themselves rather than fail.
+      - run: cargo test --workspace --locked
+
+  windows:
+    # The DirectComposition surface and the global cursor query are compiled
+    # only on Windows, so a Linux run never type-checks them.
+    name: Lints (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings

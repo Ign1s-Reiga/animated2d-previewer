@@ -9,5 +9,4 @@ description = "Spine version detection, decoders and normalization into the Gene
 
 [dependencies]
 a2d-core.workspace = true
-serde.workspace = true
 serde_json.workspace = true
