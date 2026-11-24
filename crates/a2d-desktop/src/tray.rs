@@ -32,6 +32,7 @@ pub enum TrayCommand {
     TogglePause,
     ToggleAlwaysOnTop,
     ToggleClickThrough,
+    ToggleFollowCursor,
     NextAnimation,
     SelectAnimation(usize),
     NextModel,
@@ -44,6 +45,7 @@ const ID_QUIT: &str = "quit";
 const ID_PAUSE: &str = "pause";
 const ID_TOP: &str = "always-on-top";
 const ID_CLICK: &str = "click-through";
+const ID_FOLLOW: &str = "follow-cursor";
 const ID_RESET: &str = "reset-placement";
 
 /// Maps a menu id back to the command it stands for.
@@ -56,6 +58,7 @@ pub fn command_for(id: &str) -> Option<TrayCommand> {
         ID_PAUSE => return Some(TrayCommand::TogglePause),
         ID_TOP => return Some(TrayCommand::ToggleAlwaysOnTop),
         ID_CLICK => return Some(TrayCommand::ToggleClickThrough),
+        ID_FOLLOW => return Some(TrayCommand::ToggleFollowCursor),
         ID_RESET => return Some(TrayCommand::ResetPlacement),
         _ => {}
     }
@@ -82,6 +85,7 @@ pub struct Tray {
     pause: CheckMenuItem,
     always_on_top: CheckMenuItem,
     click_through: CheckMenuItem,
+    follow_cursor: CheckMenuItem,
     /// One per animation of the model the tray was built for, so the check mark
     /// can follow what is showing rather than only what was picked.
     animations: Vec<CheckMenuItem>,
@@ -133,6 +137,8 @@ impl Tray {
         menu.append(&pause)?;
         menu.append(&always_on_top)?;
         menu.append(&click_through)?;
+        let follow_cursor = CheckMenuItem::with_id(ID_FOLLOW, "Follow cursor", true, state.follow_cursor(), None);
+        menu.append(&follow_cursor)?;
         menu.append(&MenuItem::with_id(ID_RESET, "Reset size and position", true, None))?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&MenuItem::with_id(ID_QUIT, "Quit", true, None))?;
@@ -143,7 +149,7 @@ impl Tray {
             .with_icon(tray_icon::Icon::from_rgba(icon_rgba(32), 32, 32)?)
             .build()?;
 
-        Ok(Tray { _icon: icon, pause, always_on_top, click_through, animations: animation_items })
+        Ok(Tray { _icon: icon, pause, always_on_top, click_through, follow_cursor, animations: animation_items })
     }
 
     /// Takes the next pending menu activation, if any.
@@ -157,6 +163,7 @@ impl Tray {
         self.pause.set_checked(state.is_paused());
         self.always_on_top.set_checked(state.always_on_top());
         self.click_through.set_checked(state.click_through());
+        self.follow_cursor.set_checked(state.follow_cursor());
         for (i, item) in self.animations.iter().enumerate() {
             item.set_checked(i == state.shown_index());
         }
@@ -200,6 +207,7 @@ mod tests {
         assert_eq!(command_for(ID_PAUSE), Some(TrayCommand::TogglePause));
         assert_eq!(command_for(ID_TOP), Some(TrayCommand::ToggleAlwaysOnTop));
         assert_eq!(command_for(ID_CLICK), Some(TrayCommand::ToggleClickThrough));
+        assert_eq!(command_for(ID_FOLLOW), Some(TrayCommand::ToggleFollowCursor));
         assert_eq!(command_for(ID_RESET), Some(TrayCommand::ResetPlacement));
     }
 

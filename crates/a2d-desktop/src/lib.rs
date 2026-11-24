@@ -39,8 +39,9 @@
 //! handle path and says why in its report; the window then has an opaque
 //! background. Other platforms use the ordinary surface path unchanged.
 //!
-//! That setup is the one place this crate uses `unsafe` (the `composition`
-//! module, Windows only). Everything else is `deny(unsafe_code)`.
+//! The `composition` module (Windows only) holds the crate's Win32 FFI, the one
+//! place it uses `unsafe`: the DirectComposition setup and the global cursor
+//! query. Everything else is `deny(unsafe_code)`.
 
 #![deny(unsafe_code)]
 

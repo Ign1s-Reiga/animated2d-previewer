@@ -42,6 +42,8 @@ pub struct LoadedModel {
     /// deliberately cannot name a concrete model type: knowing which family it
     /// is showing is exactly what it must not need.
     pub model: Box<dyn AnimatedModel>,
+    /// Host inputs for the next update; see [`FrameInputs`].
+    inputs: Option<FrameInputs>,
     /// The box the camera frames, worked out once when the model is loaded.
     ///
     /// Fitting the live pose every frame would rescale the character whenever
@@ -170,6 +172,7 @@ impl LoadedModel {
         Ok(LoadedModel {
             package_path: absolute_path(path),
             model,
+            inputs: None,
             framing,
             pages,
             idle,
@@ -199,6 +202,7 @@ impl LoadedModel {
         LoadedModel {
             package_path: absolute_path(path),
             model,
+            inputs: None,
             framing,
             pages,
             idle,
@@ -273,11 +277,11 @@ impl LoadedModel {
         if paused {
             // Still evaluate once at dt = 0 so the pose stays valid after a
             // model switch or a resize while paused.
-            self.model.update(Duration::ZERO)?;
+            step_model(self.model.as_mut(), self.inputs.as_ref(), Duration::ZERO)?;
             self.follow.observe(self.model.as_mut());
             return Ok(None);
         }
-        self.model.update(dt)?;
+        step_model(self.model.as_mut(), self.inputs.as_ref(), dt)?;
         self.follow.observe(self.model.as_mut());
         // No variation while a picked animation is still playing its pass or
         // one is under way; the timer starts over when the character is back.
@@ -485,6 +489,13 @@ impl Viewer {
         camera
     }
 
+    /// Stores this frame's host inputs for the active model. The next
+    /// [`update`](Viewer::update) applies them through [`step_model`], before
+    /// evaluating, so the pose agrees with what is drawn.
+    pub(crate) fn set_frame_inputs(&mut self, inputs: FrameInputs) {
+        self.models[self.active].inputs = Some(inputs);
+    }
+
     /// Draws the active model into `view`.
     pub fn render(
         &mut self,
@@ -495,6 +506,8 @@ impl Viewer {
         flip_x: bool,
     ) -> Result<FrameStats, RenderError> {
         let model = &mut self.models[self.active].model;
+        // Idempotent with `set_frame_inputs`; kept so callers that never call it
+        // (the CLI) still get the mirroring.
         model.set_scale(Vec2::new(if flip_x { -1.0 } else { 1.0 }, 1.0));
 
         let mut list = RenderList::new();
@@ -504,6 +517,64 @@ impl Viewer {
         let settings = FrameSettings::new(viewport, camera).with_clear_color(Rgba::TRANSPARENT);
         self.renderer.render(view, format, settings, &list)
     }
+}
+
+/// A pointer position from a screen position and the client area's origin on
+/// that screen, all in physical pixels. The result may be negative or beyond
+/// the window: the pointer anywhere on the desktop counts.
+pub(crate) fn client_pointer(global: (i32, i32), client_origin: (i32, i32)) -> Vec2 {
+    Vec2::new((global.0 - client_origin.0) as f32, (global.1 - client_origin.1) as f32)
+}
+
+/// Converts a pointer position (physical pixels from the client area's
+/// top-left) to model space through `camera`.
+///
+/// A pointer outside the window is deliberately NOT rejected: this is a desktop
+/// mascot and should look toward the pointer wherever it is on the desktop. The
+/// model clamps its own parameters, so a far-away point just means "look fully
+/// that way". `None` only when there is no position, it is not finite, or the
+/// camera cannot be inverted. The point is raw: mirroring is the model's
+/// business, so it is not applied here.
+pub(crate) fn cursor_to_model(camera: &Camera, viewport: Viewport, cursor: Option<Vec2>) -> Option<Vec2> {
+    let cursor = cursor.filter(|c| c.is_finite())?;
+    camera.screen_to_model(cursor.x, cursor.y, viewport).filter(|p| p.is_finite())
+}
+
+/// What to send the model as its look target: the converted pointer (inside the
+/// window or not, see [`cursor_to_model`]) when the option is on, `None` (which
+/// releases a model that was following) when off or when there is no position.
+pub(crate) fn look_target(follow: bool, camera: &Camera, viewport: Viewport, cursor: Option<Vec2>) -> Option<Vec2> {
+    if follow {
+        cursor_to_model(camera, viewport, cursor)
+    } else {
+        None
+    }
+}
+
+/// The host's inputs for one frame.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameInputs {
+    /// Client-relative physical pixels; `None` when the position is unknown.
+    pub pointer: Option<Vec2>,
+    pub follow: bool,
+    pub flip_x: bool,
+    pub camera: Camera,
+    pub viewport: Viewport,
+}
+
+/// The per-frame pipeline: `set_scale`, then `set_look_target`, then `update`.
+/// Re-sent every frame because a model switch or `pose_at` does not keep them.
+/// With no inputs the model is just advanced.
+pub(crate) fn step_model(
+    model: &mut dyn AnimatedModel,
+    inputs: Option<&FrameInputs>,
+    dt: Duration,
+) -> Result<(), a2d_core::RuntimeError> {
+    if let Some(i) = inputs {
+        model.set_scale(Vec2::new(if i.flip_x { -1.0 } else { 1.0 }, 1.0));
+        model.set_look_target(look_target(i.follow, &i.camera, i.viewport, i.pointer));
+    }
+    model.update(dt)
 }
 
 /// A duration from seconds, or `None` for a value a `Duration` cannot hold
@@ -690,6 +761,133 @@ mod tests {
         fn display_name(&self) -> &str {
             "recorder"
         }
+    }
+
+    /// Records the host inputs it is handed, in call order.
+    #[derive(Default)]
+    struct InputLog {
+        calls: Vec<String>,
+    }
+    struct Probe(Rc<RefCell<InputLog>>);
+    impl AnimatedModel for Probe {
+        fn update(&mut self, _dt: Duration) -> Result<(), a2d_core::RuntimeError> {
+            self.0.borrow_mut().calls.push("update".into());
+            Ok(())
+        }
+        fn emit(&self, _out: &mut RenderList) {}
+        fn play_animation(&mut self, _n: &str, _o: PlayOptions) -> Result<(), a2d_core::RuntimeError> {
+            Ok(())
+        }
+        fn stop_animation(&mut self, _n: &str) {}
+        fn set_expression(&mut self, _n: &str) -> Result<(), a2d_core::RuntimeError> {
+            Ok(())
+        }
+        fn animations(&self) -> &[a2d_core::AnimationInfo] {
+            &[]
+        }
+        fn expressions(&self) -> &[a2d_core::ExpressionInfo] {
+            &[]
+        }
+        fn bounds(&self) -> Aabb {
+            Aabb::EMPTY
+        }
+        fn hit_test(&self, _x: f32, _y: f32) -> Option<a2d_core::HitAreaId> {
+            None
+        }
+        fn dispose(&mut self) {}
+        fn display_name(&self) -> &str {
+            "probe"
+        }
+        fn set_scale(&mut self, scale: Vec2) {
+            self.0.borrow_mut().calls.push(format!("scale {} {}", scale.x, scale.y));
+        }
+        fn set_look_target(&mut self, target: Option<Vec2>) {
+            let text = match target {
+                Some(t) => format!("look {:.3} {:.3}", t.x, t.y),
+                None => "look None".to_owned(),
+            };
+            self.0.borrow_mut().calls.push(text);
+        }
+    }
+
+    fn unit_camera() -> (Camera, Viewport) {
+        let viewport = Viewport { width: 200, height: 100, scale_factor: 1.0 };
+        let camera = Camera { center: Vec2::ZERO, pixels_per_unit: 10.0 };
+        (camera, viewport)
+    }
+
+    #[test]
+    fn the_cursor_converts_to_model_space_in_physical_pixels() {
+        let (camera, viewport) = unit_camera();
+        // The middle of the viewport is the camera centre.
+        let middle = cursor_to_model(&camera, viewport, Some(Vec2::new(100.0, 50.0))).unwrap();
+        assert!(middle.x.abs() < 1e-3 && middle.y.abs() < 1e-3, "{middle:?}");
+        // 50 px right and 20 px up is 5 and 2 units; screen Y points down.
+        let p = cursor_to_model(&camera, viewport, Some(Vec2::new(150.0, 30.0))).unwrap();
+        assert!((p.x - 5.0).abs() < 1e-3 && (p.y - 2.0).abs() < 1e-3, "{p:?}");
+    }
+
+    #[test]
+    fn no_cursor_or_a_degenerate_view_gives_no_target() {
+        let (camera, viewport) = unit_camera();
+        assert_eq!(cursor_to_model(&camera, viewport, None), None);
+        assert_eq!(cursor_to_model(&camera, viewport, Some(Vec2::new(f32::NAN, 1.0))), None);
+        let flat = Viewport { width: 0, height: 0, scale_factor: 1.0 };
+        assert_eq!(cursor_to_model(&camera, flat, Some(Vec2::new(1.0, 1.0))), None);
+    }
+
+    #[test]
+    fn the_toggle_decides_whether_a_target_is_sent() {
+        let (camera, viewport) = unit_camera();
+        let cursor = Some(Vec2::new(150.0, 30.0));
+        assert_eq!(look_target(false, &camera, viewport, cursor), None);
+        assert!(look_target(true, &camera, viewport, cursor).is_some());
+        assert_eq!(look_target(true, &camera, viewport, None), None);
+    }
+
+    fn inputs(pointer: Option<Vec2>, follow: bool, flip_x: bool) -> FrameInputs {
+        let (camera, viewport) = unit_camera();
+        FrameInputs { pointer, follow, flip_x, camera, viewport }
+    }
+
+    fn run_step(i: FrameInputs) -> Vec<String> {
+        let log = Rc::new(RefCell::new(InputLog::default()));
+        let mut model = Probe(Rc::clone(&log));
+        step_model(&mut model, Some(&i), Duration::from_millis(16)).unwrap();
+        let calls = log.borrow().calls.clone();
+        calls
+    }
+
+    #[test]
+    fn the_target_is_set_before_update_and_is_not_mirrored() {
+        // 150,30 is (5, 2) model units in the unit camera; flip must not touch it.
+        let calls = run_step(inputs(Some(Vec2::new(150.0, 30.0)), true, true));
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls[0], "scale -1 1");
+        assert_eq!(calls[1], "look 5.000 2.000");
+        assert_eq!(calls[2], "update");
+    }
+
+    #[test]
+    fn follow_off_or_no_pointer_sends_none_every_frame() {
+        let off = run_step(inputs(Some(Vec2::new(150.0, 30.0)), false, false));
+        assert_eq!(off, ["scale 1 1", "look None", "update"]);
+        let none = run_step(inputs(None, true, false));
+        assert_eq!(none, ["scale 1 1", "look None", "update"]);
+    }
+
+    #[test]
+    fn a_pointer_outside_the_window_still_gives_a_target() {
+        let (camera, viewport) = unit_camera();
+        assert!(look_target(true, &camera, viewport, Some(Vec2::new(-5000.0, 9000.0))).is_some());
+    }
+
+    #[test]
+    fn the_client_pointer_subtracts_the_origin_per_axis() {
+        let p = client_pointer((1000, 400), (300, 50));
+        assert_eq!((p.x, p.y), (700.0, 350.0));
+        let q = client_pointer((10, 20), (30, 5));
+        assert_eq!((q.x, q.y), (-20.0, 15.0), "outside is allowed, and x/y are not swapped");
     }
 
     #[test]

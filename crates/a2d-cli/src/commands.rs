@@ -384,7 +384,10 @@ fn open_spine_bundle(
 Opening {} in the desktop viewer.",
         path.display()
     )?;
-    writeln!(out, "  drag to move, scroll to scale, Space pauses, Tab cycles animations, Esc quits.")?;
+    writeln!(
+        out,
+        "  drag to move, scroll to scale, Space pauses, Tab cycles animations, L follows the cursor, Esc quits."
+    )?;
     if let Some(after) = flags.exit_after {
         writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;
     }
@@ -541,7 +544,10 @@ fn preview_cubism(
 Opening {} in the desktop viewer.",
         path.display()
     )?;
-    writeln!(out, "  drag to move, scroll to scale, Space pauses, Tab cycles animations, Esc quits.")?;
+    writeln!(
+        out,
+        "  drag to move, scroll to scale, Space pauses, Tab cycles animations, L follows the cursor, Esc quits."
+    )?;
     if let Some(after) = flags.exit_after {
         writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;
     }
@@ -711,7 +717,10 @@ pub fn preview(
 
 fn open_viewer(out: &mut dyn std::io::Write, package_dir: &Path, flags: ViewerFlags) -> Result<(), CliError> {
     writeln!(out, "Opening {} in the desktop viewer.", package_dir.display())?;
-    writeln!(out, "  drag to move, scroll to scale, Space pauses, Tab cycles animations, Esc quits.")?;
+    writeln!(
+        out,
+        "  drag to move, scroll to scale, Space pauses, Tab cycles animations, L follows the cursor, Esc quits."
+    )?;
     writeln!(out, "  everything is also in the tray menu.")?;
     if let Some(after) = flags.exit_after {
         writeln!(out, "  quitting automatically after {:.1}s.", after.as_secs_f32())?;

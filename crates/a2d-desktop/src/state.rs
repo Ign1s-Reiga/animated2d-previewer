@@ -64,6 +64,7 @@ pub struct ViewerState {
     flip_x: bool,
     always_on_top: bool,
     click_through: bool,
+    follow_cursor: bool,
     drag: Option<Drag>,
     /// Set whenever something changed that the config should remember.
     dirty: bool,
@@ -82,6 +83,7 @@ impl Default for ViewerState {
             flip_x: false,
             always_on_top: true,
             click_through: false,
+            follow_cursor: false,
             drag: None,
             dirty: false,
         }
@@ -110,6 +112,7 @@ impl ViewerState {
         let mut state = ViewerState {
             always_on_top: config.window.always_on_top,
             click_through: config.window.click_through,
+            follow_cursor: config.window.follow_cursor,
             models,
             ..ViewerState::default()
         };
@@ -155,6 +158,7 @@ impl ViewerState {
     pub fn write_into(&self, config: &mut Config) {
         config.window.always_on_top = self.always_on_top;
         config.window.click_through = self.click_through;
+        config.window.follow_cursor = self.follow_cursor;
         let Some(model) = self.active_model() else { return };
         if !model.reopenable {
             return;
@@ -247,6 +251,11 @@ impl ViewerState {
 
     pub fn click_through(&self) -> bool {
         self.click_through
+    }
+
+    /// Whether the character should look toward the mouse pointer.
+    pub fn follow_cursor(&self) -> bool {
+        self.follow_cursor
     }
 
     pub fn is_dragging(&self) -> bool {
@@ -366,6 +375,12 @@ impl ViewerState {
         self.flip_x = !self.flip_x;
         self.dirty = true;
         self.flip_x
+    }
+
+    pub fn toggle_follow_cursor(&mut self) -> bool {
+        self.follow_cursor = !self.follow_cursor;
+        self.dirty = true;
+        self.follow_cursor
     }
 
     pub fn toggle_always_on_top(&mut self) -> bool {
@@ -705,6 +720,18 @@ mod tests {
         assert!(!s.begin_drag(Vec2::new(f32::NAN, 0.0)));
         s.begin_drag(Vec2::new(10.0, 10.0));
         assert_eq!(s.drag_to(Vec2::new(f32::NAN, 10.0)), Action::None);
+    }
+
+    #[test]
+    fn follow_cursor_is_off_by_default_and_round_trips() {
+        let mut s = ViewerState::default();
+        assert!(!s.follow_cursor());
+        assert!(s.toggle_follow_cursor());
+        let mut config = Config::default();
+        s.write_into(&mut config);
+        assert!(config.window.follow_cursor);
+        let back = ViewerState::from_config(&config, Vec::new());
+        assert!(back.follow_cursor());
     }
 
     #[test]
