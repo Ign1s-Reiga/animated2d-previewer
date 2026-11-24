@@ -913,7 +913,27 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
   geometry weights (assumed, as the manual says draw-order keyforms behave like
   shape keyforms); and nested groups and part objects (type 1, a self index,
   section 58, section 83), which no model seen uses and which are reported
-  rather than ordered. Two of the six models could not be checked at rest.
+  rather than ordered. Checked at rest against the render orders stored in the
+  prefabs: four of the six models agree exactly; two (the small rigs) could not
+  be checked. What established each claim:
+  - *Verified (bundle type trees):* the stored integer is the `CubismRenderer`
+    field `_renderOrder`, in field order `_localSortingOrder, _color,
+    _mainTexture, MeshDirty, _sortingMode, _sortingOrder, _renderOrder,
+    _depthOffset, _opacity`. Unity's
+    `MeshRenderer.m_SortingOrder` (i16 at byte 130) equals `_renderOrder` on
+    every renderer of the four sound models.
+  - *Verified (bundle data):* on the two failing models the sorting mode is
+    back-to-front, there are no offsets and one group, and
+    `CubismDrawable._unmanagedIndex` matches our MOC3 index on every drawable,
+    so the pairing is sound. Yet 59 of 91 and 43 of 99 stored values are
+    outside `0..n` (all non-negative, up to 282 and 313), with 1 and 8 extra
+    copies of repeated values, and only
+    22 of 91 and 38 of 99 equal the rule's position.
+  - *Inferred:* the stored values are stale, left over from a larger revision of
+    the model, and our reading is right. Not proven; the test refuses to pass
+    those models unless `A2D_ALLOW_STALE_RENDER_ORDER=1`.
+  - *Not done (cross-impl):* the official Core's render orders at default
+    parameters for those two models would settle it.
 - **Multiple texture pages.** Section 41 gives each drawable a texture index and
   is read, but the emitter still puts every mesh on one page, because nothing
   loads a second one yet. It is all zero on every model seen.
