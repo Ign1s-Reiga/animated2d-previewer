@@ -265,7 +265,20 @@ pub fn validate(out: &mut dyn std::io::Write, package_dir: &Path) -> Result<bool
         writeln!(out, "  physics:       {}", physics_summary(ir.physics.as_ref()))?;
         print_handovers(out, ir)?;
     }
+    if let Some(ir) = package.model.as_spine() {
+        // Information, not a warning: an empty animation is legitimate source
+        // data and plays as authored, so it is listed but does not fail the
+        // check.
+        for animation in ir.animations.iter().filter(|a| a.timelines.is_empty()) {
+            writeln!(
+                out,
+                "  empty animation: {:?} (no timelines, duration {:.3} s)",
+                animation.name, animation.duration
+            )?;
+        }
+    }
 
+    // Every report entry is a degradation, notes included, so any entry fails.
     let report = package.validate();
     print_report(out, &report)?;
     Ok(report.is_empty())

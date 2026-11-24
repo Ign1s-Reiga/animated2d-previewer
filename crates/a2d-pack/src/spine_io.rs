@@ -90,6 +90,27 @@ fn validate_references(ir: &SpineIr) -> Result<(), DecodeError> {
             }
         }
     }
+    // The runtime indexes the bone arena directly with a constraint's bones and
+    // target, so a dangling one would panic at playback rather than degrade.
+    let missing_bone = |kind: &str, name: &str, bones: &[BoneId], target: Option<BoneId>| {
+        let dangling = bones.iter().copied().chain(target).find(|b| b.index() >= ir.bones.len());
+        match dangling {
+            Some(b) => fail(format!("{kind} constraint {name:?} names bone {} which does not exist", b.0)),
+            None => Ok(()),
+        }
+    };
+    for c in &ir.ik_constraints {
+        missing_bone("ik", &c.name, &c.bones, Some(c.target))?;
+    }
+    for c in &ir.transform_constraints {
+        missing_bone("transform", &c.name, &c.bones, Some(c.target))?;
+    }
+    for c in &ir.path_constraints {
+        missing_bone("path", &c.name, &c.bones, None)?;
+        if c.target_slot.index() >= ir.slots.len() {
+            return fail(format!("path constraint {:?} targets slot {} which does not exist", c.name, c.target_slot.0));
+        }
+    }
     Ok(())
 }
 
