@@ -10,4 +10,6 @@ pub mod args;
 pub mod commands;
 
 pub use args::{parse, ArgError, Command, HELP};
-pub use commands::{import, inspect, preview, print_report, validate, CliError, ViewerFlags, REGRESSION_TIMESTAMPS};
+pub use commands::{
+    import, inspect, parse_game, preview, print_report, validate, CliError, ViewerFlags, REGRESSION_TIMESTAMPS,
+};

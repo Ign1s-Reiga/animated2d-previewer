@@ -10,3 +10,7 @@ description = "Unity serialized file and AssetBundle object graph reading."
 [dependencies]
 a2d-core.workspace = true
 lz4_flex.workspace = true
+
+[features]
+# A writer for tiny synthetic bundles, so other crates tests need no real asset.
+testing = []

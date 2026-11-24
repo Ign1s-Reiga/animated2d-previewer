@@ -16,7 +16,7 @@ pub enum Command {
     Inspect { input: PathBuf, game: Option<String> },
     Import { input: PathBuf, output: PathBuf, game: Option<String> },
     Validate { package: PathBuf },
-    Preview { package: PathBuf, out: Option<PathBuf>, exit_after: Option<f32>, hidden: bool },
+    Preview { package: PathBuf, out: Option<PathBuf>, exit_after: Option<f32>, hidden: bool, game: Option<String> },
     Help,
     Version,
 }
@@ -80,15 +80,13 @@ where
         }
         "preview" => {
             let split = split_flags(rest)?;
-            if split.game.is_some() {
-                return Err(err("this command does not take --game"));
-            }
             // `-o` names a directory to write the rendered frames into.
             Ok(Command::Preview {
                 package: one_path(split.positional, "preview <package>")?,
                 out: split.output,
                 exit_after: split.exit_after,
                 hidden: split.hidden,
+                game: split.game,
             })
         }
         other if other.starts_with('-') => Err(err(format!("unknown option `{other}`; try `animated2d help`"))),
@@ -212,6 +210,7 @@ COMMANDS:
     import   <input> -o <out.a2dpack>       reconstruct a normalized package
     validate <package.a2dpack>              check a package for missing or unsupported data
     preview  <package.a2dpack> [-o <dir>]   open the viewer, or render frames to <dir>
+                                            (--game applies to a Unity bundle)
     help                                    show this text
     version                                 show the version
 
@@ -307,10 +306,14 @@ mod tests {
         assert_eq!(parse_ok(&["validate", "p.a2dpack"]), Command::Validate { package: "p.a2dpack".into() });
         assert_eq!(
             parse_ok(&["preview", "p.a2dpack"]),
-            Command::Preview { package: "p.a2dpack".into(), out: None, exit_after: None, hidden: false }
+            Command::Preview { package: "p.a2dpack".into(), out: None, exit_after: None, hidden: false, game: None }
         );
         assert!(parse(["validate", "p", "--game", "unity_spine"]).is_err());
-        assert!(parse(["preview", "p", "--game", "unity_spine"]).is_err());
+        // `preview` takes --game for a bundle, where detection can be overridden.
+        assert!(matches!(
+            parse_ok(&["preview", "p", "--game", "unity_cubism"]),
+            Command::Preview { game: Some(ref g), .. } if g == "unity_cubism"
+        ));
     }
 
     #[test]
@@ -321,21 +324,24 @@ mod tests {
                 package: "p.a2dpack".into(),
                 out: Some("frames".into()),
                 exit_after: None,
-                hidden: false
+                hidden: false,
+                game: None
             }
         );
     }
 
     #[test]
     fn preview_takes_a_scripted_exit_deadline() {
-        let expected = Command::Preview { package: "p".into(), out: None, exit_after: Some(2.5), hidden: false };
+        let expected =
+            Command::Preview { package: "p".into(), out: None, exit_after: Some(2.5), hidden: false, game: None };
         assert_eq!(parse_ok(&["preview", "p", "--exit-after", "2.5"]), expected);
         assert_eq!(parse_ok(&["preview", "p", "--exit-after=2.5"]), expected);
     }
 
     #[test]
     fn preview_takes_a_hidden_flag() {
-        let expected = Command::Preview { package: "p".into(), out: None, exit_after: Some(1.0), hidden: true };
+        let expected =
+            Command::Preview { package: "p".into(), out: None, exit_after: Some(1.0), hidden: true, game: None };
         assert_eq!(parse_ok(&["preview", "p", "--exit-after", "1", "--hidden"]), expected);
         assert_eq!(parse_ok(&["preview", "--hidden", "p", "--exit-after=1"]), expected);
     }

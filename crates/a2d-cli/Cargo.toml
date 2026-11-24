@@ -25,3 +25,6 @@ a2d-pack.workspace = true
 a2d-runtime.workspace = true
 a2d-render.workspace = true
 a2d-desktop.workspace = true
+
+[dev-dependencies]
+a2d-unity = { workspace = true, features = ["testing"] }

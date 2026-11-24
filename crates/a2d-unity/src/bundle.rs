@@ -215,8 +215,15 @@ fn parse_blocks_info(info: &[u8]) -> Result<(Vec<Block>, Vec<Node>), DecodeError
 }
 
 fn read_blocks(bytes: &[u8], mut at: usize, blocks: &[Block]) -> Result<Vec<u8>, DecodeError> {
-    let total: usize = blocks.iter().map(|b| b.uncompressed_size as usize).sum();
-    let mut out = Vec::with_capacity(total.min(64 << 20));
+    let total: u64 = blocks.iter().map(|b| u64::from(b.uncompressed_size)).sum();
+    // Each block is capped on its own, and so is what they add up to: many
+    // blocks under the per-block cap must not together drive a huge allocation.
+    if total > MAX_DECLARED_SIZE as u64 {
+        return Err(DecodeError::corrupt(format!(
+            "the blocks declare {total} decompressed bytes in all, past the {MAX_DECLARED_SIZE} accepted"
+        )));
+    }
+    let mut out = Vec::with_capacity(total.min(64 << 20) as usize);
     for (i, block) in blocks.iter().enumerate() {
         let end = at.checked_add(block.compressed_size as usize).filter(|e| *e <= bytes.len()).ok_or_else(|| {
             DecodeError::corrupt(format!(
@@ -233,7 +240,17 @@ fn read_blocks(bytes: &[u8], mut at: usize, blocks: &[Block]) -> Result<Vec<u8>,
     Ok(out)
 }
 
+/// The largest decompressed size a single block or table may declare.
+const MAX_DECLARED_SIZE: usize = 1 << 30;
+
 fn decompress(input: &[u8], expected: usize, method: Compression, what: &str) -> Result<Vec<u8>, DecodeError> {
+    // A declared size is input, not a promise: refuse one no real block has
+    // before it can drive an allocation.
+    if expected > MAX_DECLARED_SIZE {
+        return Err(DecodeError::corrupt(format!(
+            "{what} declares {expected} decompressed bytes, past the {MAX_DECLARED_SIZE} accepted"
+        )));
+    }
     match method {
         Compression::None => {
             if input.len() != expected {
@@ -358,6 +375,75 @@ mod tests {
         let full = fixture(b"hello unity", "CAB-abc", 0);
         for cut in 0..full.len() {
             let _ = Bundle::parse(&full[..cut]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hostile_input_tests {
+    use super::*;
+
+    /// A well-formed, uncompressed bundle header whose block table declares
+    /// the given uncompressed sizes (nothing behind them: the declaration is
+    /// what is under test).
+    fn bundle_declaring(sizes: &[u32]) -> Vec<u8> {
+        let mut info = Vec::new();
+        info.extend_from_slice(&[0u8; 16]);
+        info.extend_from_slice(&(sizes.len() as i32).to_be_bytes());
+        for size in sizes {
+            info.extend_from_slice(&size.to_be_bytes());
+            info.extend_from_slice(&0u32.to_be_bytes()); // compressed size
+            info.extend_from_slice(&0u16.to_be_bytes()); // stored
+        }
+        info.extend_from_slice(&0i32.to_be_bytes()); // no nodes
+        let mut out = b"UnityFS\0".to_vec();
+        out.extend_from_slice(&6u32.to_be_bytes());
+        out.extend_from_slice(b"5.x.x\0");
+        out.extend_from_slice(b"2022.3.20f1\0");
+        out.extend_from_slice(&0i64.to_be_bytes());
+        out.extend_from_slice(&(info.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(info.len() as u32).to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&info);
+        out
+    }
+
+    #[test]
+    fn a_block_table_declaring_more_than_the_cap_is_refused_before_allocating() {
+        let one_huge = bundle_declaring(&[u32::MAX]);
+        let err = Bundle::parse(&one_huge).unwrap_err().to_string();
+        assert!(err.contains("past the") && err.contains("accepted"), "{err}");
+
+        // Each under the per-block cap, together over it.
+        let half = (MAX_DECLARED_SIZE / 2 + 1) as u32;
+        let many = bundle_declaring(&[half, half]);
+        let err = Bundle::parse(&many).unwrap_err().to_string();
+        assert!(err.contains("in all") && err.contains("past the") && err.contains("accepted"), "{err}");
+
+        // And a sane declaration gets past the cap, failing later for its own reason.
+        let err = Bundle::parse(&bundle_declaring(&[16])).unwrap_err().to_string();
+        assert!(!err.contains("accepted"), "{err}");
+    }
+    #[test]
+    fn arbitrary_bytes_end_in_an_error_and_never_hang_or_panic() {
+        // A PNG header, text, zeros, and every prefix of a real-looking bundle
+        // header with its counts turned up to the maximum.
+        let mut inputs: Vec<Vec<u8>> = vec![
+            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+            b"{\"skeleton\":{}}".to_vec(),
+            vec![0; 4096],
+            vec![0xff; 4096],
+            Vec::new(),
+        ];
+        let mut header = b"UnityFS\0".to_vec();
+        header.extend_from_slice(&6u32.to_be_bytes());
+        header.extend_from_slice(b"5.x.x\0 2022.3.20f1\0");
+        header.extend_from_slice(&[0xff; 64]);
+        for cut in 0..header.len() {
+            inputs.push(header[..cut].to_vec());
+        }
+        for input in inputs {
+            assert!(Bundle::parse(&input).is_err());
         }
     }
 }

@@ -52,8 +52,19 @@ pub struct SpineSourceSet {
 
 /// Finds every Spine character reachable from `path`.
 ///
-/// `path` may be a directory or a single file; a file is treated as "this
-/// character, in this directory".
+/// `path` may be a directory or a single file.
+///
+/// A directory is scanned whole: every file is classified by content, atlases
+/// are paired to skeletons by stem, and a lone atlas is used for a skeleton that
+/// has none of its name.
+///
+/// A named file means "this character, in this directory", and pairing then
+/// works from file names alone. Only the files sharing the named file's
+/// normalised stem are read (once each, and classified by content, so the named
+/// file must still be a skeleton, or have one of its stem beside it). Nothing
+/// else in the folder is opened, so there is no lone-atlas fallback: with no
+/// atlas of the skeleton's stem, the atlas is reported missing. Point at the
+/// directory for the fallback.
 pub fn discover(path: &Path) -> Result<Vec<SpineSourceSet>, DecodeError> {
     let (dir, only_stem) = if path.is_dir() {
         (path.to_path_buf(), None)
@@ -67,10 +78,19 @@ pub fn discover(path: &Path) -> Result<Vec<SpineSourceSet>, DecodeError> {
     };
 
     let files = scan_dir(&dir)?;
+    // A named file pairs by stem alone, from file names: only the files whose
+    // normalised stem is the named file's are read, once each, so a lone image
+    // in a folder of tens of thousands of assets is answered at once and a
+    // neighbour of another name is never opened.
+    let candidates: Vec<&(PathBuf, String)> = match &only_stem {
+        Some(stem) => files.iter().filter(|(_, name)| normalize_asset_stem(name) == *stem).collect(),
+        None => files.iter().collect(),
+    };
+
     let mut skeletons: Vec<(String, PathBuf, String)> = Vec::new();
     let mut atlases: BTreeMap<String, PathBuf> = BTreeMap::new();
 
-    for (file_path, name) in &files {
+    for (file_path, name) in candidates {
         let Ok(bytes) = std::fs::read(file_path) else { continue };
         match classify(&bytes) {
             AssetKind::SpineSkeleton { version, .. } => {
@@ -114,7 +134,7 @@ pub fn discover(path: &Path) -> Result<Vec<SpineSourceSet>, DecodeError> {
 /// An exact stem match wins. Failing that, a directory holding exactly one
 /// atlas is unambiguous enough to use. Two or more candidates is an error, not
 /// a coin flip (spec §15).
-fn pair_atlas(stem: &str, atlases: &BTreeMap<String, PathBuf>) -> Result<Option<PathBuf>, DecodeError> {
+pub(crate) fn pair_atlas<T: Clone>(stem: &str, atlases: &BTreeMap<String, T>) -> Result<Option<T>, DecodeError> {
     if let Some(exact) = atlases.get(stem) {
         return Ok(Some(exact.clone()));
     }
@@ -159,7 +179,9 @@ fn scan_dir(dir: &Path) -> Result<Vec<(PathBuf, String)>, DecodeError> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        // The directory entry already knows its type; a stat per file made a folder
+        // of tens of thousands of assets take seconds to list.
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
@@ -342,5 +364,66 @@ mod tests {
         // The missing atlas is reported during decode, so a skeleton-only
         // directory can still be inspected.
         assert_eq!(pair_atlas("hero", &atlases(&[])).unwrap(), None);
+    }
+
+    mod named_file {
+        use super::*;
+        use crate::test_fixtures::{atlas_text, SKELETON_JSON};
+
+        fn dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("a2d-named-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("dir");
+            dir
+        }
+
+        #[test]
+        fn a_named_non_skeleton_is_a_missing_skeleton() {
+            let dir = dir("image");
+            std::fs::write(dir.join("hero.png"), b"\x89PNG\r\n\x1a\nxxxx").expect("png");
+            std::fs::write(dir.join("other.json"), SKELETON_JSON).expect("other skeleton");
+            let err = discover(&dir.join("hero.png")).unwrap_err();
+            assert!(matches!(err, DecodeError::MissingSkeleton(_)), "{err}");
+            assert!(err.to_string().contains("no skeleton named"), "{err}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_named_skeleton_pairs_with_its_atlas_and_never_reads_the_rest() {
+            let dir = dir("pair");
+            std::fs::write(dir.join("hero.json"), SKELETON_JSON).expect("skeleton");
+            std::fs::write(dir.join("hero.atlas"), atlas_text("hero.png")).expect("atlas");
+            // Neighbours of another name, one of them not even text.
+            std::fs::write(dir.join("zzz.json"), b"{ this is not valid").expect("garbage");
+            std::fs::write(dir.join("zzz.atlas"), SKELETON_JSON).expect("misnamed");
+            let sets = discover(&dir.join("hero.json")).expect("discover");
+            assert_eq!(sets.len(), 1);
+            assert_eq!(sets[0].name, "hero");
+            assert!(sets[0].atlas.as_ref().is_some_and(|a| a.ends_with("hero.atlas")));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_named_skeleton_has_no_lone_atlas_fallback_but_its_directory_does() {
+            let dir = dir("lone");
+            std::fs::write(dir.join("hero.json"), SKELETON_JSON).expect("skeleton");
+            std::fs::write(dir.join("sheet.atlas"), atlas_text("sheet.png")).expect("atlas");
+            let named = discover(&dir.join("hero.json")).expect("named");
+            assert!(named[0].atlas.is_none(), "reported missing rather than found by scanning the folder");
+            let whole = discover(&dir).expect("directory");
+            assert!(whole[0].atlas.as_ref().is_some_and(|a| a.ends_with("sheet.atlas")));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_named_atlas_finds_its_skeleton() {
+            let dir = dir("atlas");
+            std::fs::write(dir.join("hero.json"), SKELETON_JSON).expect("skeleton");
+            std::fs::write(dir.join("hero.atlas"), atlas_text("hero.png")).expect("atlas");
+            let sets = discover(&dir.join("hero.atlas")).expect("discover");
+            assert_eq!(sets[0].name, "hero");
+            assert!(sets[0].skeleton.ends_with("hero.json"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

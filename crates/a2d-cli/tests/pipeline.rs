@@ -408,10 +408,12 @@ fn doubled_suffixes_are_handled() {
 }
 
 #[test]
-fn the_unimplemented_importers_explain_themselves() {
+fn bundle_importers_pointed_at_a_loose_directory_explain_themselves() {
     let dir = temp_dir("stubs");
     Fixture::spine_json().write_to(dir.path());
-    for (game, expected) in [("unity_spine", "--game generic"), ("unity_cubism", "not implemented")] {
+    for (game, expected) in
+        [("unity_spine", "holds objects, not loose files"), ("unity_cubism", "holds objects, not loose files")]
+    {
         let mut out = Vec::new();
         let err = a2d_cli::inspect(&mut out, dir.path(), Some(game)).unwrap_err();
         assert!(err.to_string().contains(expected), "for {game}: {err}");
