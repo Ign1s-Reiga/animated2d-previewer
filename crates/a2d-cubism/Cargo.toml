@@ -9,5 +9,3 @@ description = "Live2D Cubism decoding and normalization into the Generic Cubism 
 
 [dependencies]
 a2d-core.workspace = true
-serde.workspace = true
-serde_json.workspace = true

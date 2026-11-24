@@ -29,8 +29,6 @@ name = "a2d-cubism"
 version = "0.1.0"
 dependencies = [
  "a2d-core",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -97,7 +95,6 @@ name = "a2d-spine"
 version = "0.1.0"
 dependencies = [
  "a2d-core",
- "serde",
  "serde_json",
 ]
 

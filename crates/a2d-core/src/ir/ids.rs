@@ -30,47 +30,47 @@ macro_rules! define_id {
     };
 }
 
-define_id!(
+define_id! {
     /// Index into [`SpineIr::bones`](crate::ir::spine::SpineIr::bones).
     BoneId, u16
-);
-define_id!(
+}
+define_id! {
     /// Index into [`SpineIr::slots`](crate::ir::spine::SpineIr::slots), which is
     /// also the setup-pose draw order.
     SlotId, u16
-);
-define_id!(
+}
+define_id! {
     /// Index into [`SpineIr::skins`](crate::ir::spine::SpineIr::skins).
     SkinId, u16
-);
-define_id!(
+}
+define_id! {
     /// Index into the flat attachment arena.
     AttachmentId, u32
-);
-define_id!(
+}
+define_id! {
     /// Index into [`SpineIr::events`](crate::ir::spine::SpineIr::events).
     EventId, u16
-);
-define_id!(
+}
+define_id! {
     /// Index into [`SpineIr::ik_constraints`](crate::ir::spine::SpineIr::ik_constraints).
     IkConstraintId, u16
-);
-define_id!(
+}
+define_id! {
     /// Index into [`SpineIr::transform_constraints`](crate::ir::spine::SpineIr::transform_constraints).
     TransformConstraintId, u16
-);
-define_id!(
+}
+define_id! {
     /// Index into [`SpineIr::path_constraints`](crate::ir::spine::SpineIr::path_constraints).
     PathConstraintId, u16
-);
-define_id!(
+}
+define_id! {
     /// Index into [`Atlas::pages`](crate::ir::atlas::Atlas::pages).
     AtlasPageId, u16
-);
-define_id!(
+}
+define_id! {
     /// Index into [`Atlas::regions`](crate::ir::atlas::Atlas::regions).
     AtlasRegionId, u32
-);
+}
 
 #[cfg(test)]
 mod tests {

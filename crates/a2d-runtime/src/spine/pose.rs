@@ -2145,8 +2145,8 @@ mod tests {
         pc.vertices = straight_path(100.0).into_iter().map(|v| Vec2::new(v.y, v.x)).collect();
         let pose = pc.pose();
         // The path now runs straight up, so the bones should too.
-        for i in 1..=2 {
-            assert_close(pose.bones[i].world.rotation_x_rad().to_degrees(), 90.0, "points up");
+        for bone in &pose.bones[1..=2] {
+            assert_close(bone.world.rotation_x_rad().to_degrees(), 90.0, "points up");
         }
     }
 
