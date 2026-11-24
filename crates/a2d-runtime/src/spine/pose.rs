@@ -93,6 +93,72 @@ pub struct SkeletonPose {
     /// Set once when an unsupported constraint mode is first encountered, so
     /// the report is not spammed once per frame.
     reported_unsupported: Vec<String>,
+    /// Bone local transforms as animation left them this evaluation.
+    animated: Vec<BoneLocal>,
+    /// Which bones each constraint re-updates, derived once from the hierarchy.
+    plans: Arc<UpdatePlans>,
+}
+
+/// One bone to recompute after a constraint has run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UpdateStep {
+    bone: u32,
+    /// Put the bone's local transform back to its animated value first. False
+    /// for the constrained bones themselves.
+    reset: bool,
+}
+
+/// Post-constraint update lists, indexed like the IR's constraint vectors.
+#[derive(Debug, Default)]
+struct UpdatePlans {
+    ik: Vec<Box<[UpdateStep]>>,
+    transform: Vec<Box<[UpdateStep]>>,
+    path: Vec<Box<[UpdateStep]>>,
+}
+
+/// Bones to recompute after a constraint on `roots`, parents before children:
+/// every strict descendant of a root, plus the roots too when `include_roots`
+/// (local-mode constraints change the constrained bones' local transform, so
+/// their world has to be recomposed; the other kinds write world directly or
+/// recompose the bones themselves). Relies on parents preceding children.
+fn build_plan(ir: &SpineIr, roots: &[BoneId], include_roots: bool) -> Box<[UpdateStep]> {
+    let n = ir.bones.len();
+    let mut below = vec![false; n];
+    let mut is_root = vec![false; n];
+    let mut lowest = n;
+    for r in roots {
+        let i = r.index();
+        if i < n {
+            below[i] = true;
+            is_root[i] = true;
+            lowest = lowest.min(i);
+        }
+    }
+    let mut steps = Vec::new();
+    for i in lowest..n {
+        let descendant = ir.bones[i].parent.is_some_and(|p| below.get(p.index()).copied().unwrap_or(false));
+        if descendant {
+            below[i] = true;
+        }
+        if is_root[i] {
+            if include_roots {
+                steps.push(UpdateStep { bone: i as u32, reset: false });
+            }
+        } else if descendant {
+            steps.push(UpdateStep { bone: i as u32, reset: true });
+        }
+    }
+    steps.into_boxed_slice()
+}
+
+impl UpdatePlans {
+    fn new(ir: &SpineIr) -> Self {
+        Self {
+            ik: ir.ik_constraints.iter().map(|c| build_plan(ir, &c.bones, false)).collect(),
+            transform: ir.transform_constraints.iter().map(|c| build_plan(ir, &c.bones, c.local)).collect(),
+            path: ir.path_constraints.iter().map(|c| build_plan(ir, &c.bones, false)).collect(),
+        }
+    }
 }
 
 impl SkeletonPose {
@@ -139,6 +205,7 @@ impl SkeletonPose {
             })
             .collect();
 
+        let plans = Arc::new(UpdatePlans::new(&ir));
         let mut pose = SkeletonPose {
             ir,
             bones,
@@ -151,6 +218,8 @@ impl SkeletonPose {
             transform,
             path,
             reported_unsupported: Vec::new(),
+            animated: Vec::new(),
+            plans,
         };
         pose.reset_to_setup();
         pose.update_world_transforms();
@@ -272,6 +341,10 @@ impl SkeletonPose {
 
     /// Recomputes every bone's world transform, then applies constraints.
     pub fn update_world_transforms(&mut self) {
+        // What the timelines left, before any constraint touches a local
+        // transform; descendants are put back to it when they are re-updated.
+        self.animated.clear();
+        self.animated.extend(self.bones.iter().map(|b| b.local));
         for i in 0..self.bones.len() {
             self.update_bone_world(i);
         }
@@ -386,23 +459,76 @@ impl SkeletonPose {
         self.bones[index].world = Affine2 { a: a * sx, b: b * sx, c: c * sy, d: d * sy, tx, ty };
     }
 
-    /// Recomputes world transforms for every bone at or after `from`.
+    /// Applies the constraints in declared order, IK -> Transform -> Path as
+    /// the skeleton authored them.
     ///
-    /// Bones are stored parent-before-child, so this is enough to propagate a
-    /// change made to bone `from - 1` down its whole subtree.
-    fn update_world_from(&mut self, from: usize) {
-        for i in from..self.bones.len() {
-            self.update_bone_world(i);
+    /// This follows the reference runtime's update cache. After a constraint
+    /// runs, the *descendants* of the bones it constrains are updated again
+    /// from their own pose (their parents just moved) and nothing else is. A
+    /// bone that an earlier constraint placed, and that is not below the bones
+    /// of a later one, keeps what the earlier constraint gave it. Updating every
+    /// bone with a higher index instead would silently undo that.
+    ///
+    /// Known differences from the reference runtime, none of which a rig in
+    /// the target set is known to hit:
+    /// - A bone X whose locals an earlier constraint changed (IK, local mode),
+    ///   when a later constraint moves an ancestor of X and a still later one
+    ///   is a local-mode transform on X or a 2-bone IK with X as its child:
+    ///   the reference keeps the first result on X (its cache only unmarks X
+    ///   and the last constraint does not re-sort it); here X is reset to its
+    ///   animated local when the ancestor's constraint re-updates it.
+    /// - A 2-bone IK at mix 0: the reference's `child.updateWorldTransform()`
+    ///   drops an earlier local-mode result on the child; the early return
+    ///   here keeps it.
+    /// - `skin_required` constraints are always applied (pre-existing).
+    /// - World-mode transform and path constraints write only the world
+    ///   matrix, so a later IK or local-mode constraint reads a stale `local`
+    ///   where the reference recomputes the applied values
+    ///   (`updateAppliedTransform`). Pre-existing gap, tracked as a follow-up.
+    ///
+    /// Two details carry over from the reference on purpose:
+    /// - the descendant update runs whether or not the constraint did anything
+    ///   (mix 0, no path attached), because the reference's cache is static;
+    /// - a descendant is recomputed from its *animated* local transform, so a
+    ///   result an earlier IK or local-mode constraint left on it is lost, as
+    ///   it is in the reference when a later constraint moves one of its
+    ///   ancestors. Constrained bones themselves are never reset by their own
+    ///   constraint.
+    fn apply_constraints(&mut self) {
+        let ir = Arc::clone(&self.ir);
+        let plans = Arc::clone(&self.plans);
+        for entry in &ir.constraint_order {
+            let i = entry.index as usize;
+            let steps = match entry.kind {
+                ConstraintKind::Ik => {
+                    self.apply_ik(i);
+                    plans.ik.get(i)
+                }
+                ConstraintKind::Transform => {
+                    self.apply_transform_constraint(i);
+                    plans.transform.get(i)
+                }
+                ConstraintKind::Path => {
+                    self.apply_path_constraint(i);
+                    plans.path.get(i)
+                }
+            };
+            if let Some(steps) = steps {
+                self.update_steps(steps);
+            }
         }
     }
 
-    fn apply_constraints(&mut self) {
-        for entry in self.ir.constraint_order.clone() {
-            match entry.kind {
-                ConstraintKind::Ik => self.apply_ik(entry.index as usize),
-                ConstraintKind::Transform => self.apply_transform_constraint(entry.index as usize),
-                ConstraintKind::Path => self.apply_path_constraint(entry.index as usize),
+    /// Recomputes the bones of one constraint's update plan, in index order.
+    fn update_steps(&mut self, steps: &[UpdateStep]) {
+        for step in steps {
+            let i = step.bone as usize;
+            if step.reset {
+                if let Some(animated) = self.animated.get(i) {
+                    self.bones[i].local = *animated;
+                }
             }
+            self.update_bone_world(i);
         }
     }
 
@@ -438,19 +564,16 @@ impl SkeletonPose {
         let target = self.bones[constraint.target.index()].world.translation();
         let bend_dir = if pose.bend_positive { 1.0f32 } else { -1.0 };
 
-        let lowest = match constraint.bones.len() {
+        match constraint.bones.len() {
             1 => {
                 let b = constraint.bones[0];
                 self.apply_ik_one(b, target, pose.compress, pose.stretch, constraint.uniform, pose.mix);
-                b.index()
             }
             _ => {
                 let (parent, child) = (constraint.bones[0], constraint.bones[1]);
                 self.apply_ik_two(parent, child, target, bend_dir, pose.stretch, pose.softness, pose.mix);
-                parent.index().min(child.index())
             }
-        };
-        self.update_world_from(lowest + 1);
+        }
     }
 
     /// Single-bone IK: rotate the bone so its `+X` axis points at the target.
@@ -531,6 +654,8 @@ impl SkeletonPose {
             // Without a grandparent the solver has no space to work in; fall
             // back to the single-bone case rather than producing garbage.
             self.apply_ik_one(parent, target, false, stretch, false, alpha);
+            // The child is a constrained bone, so no plan recomputes it.
+            self.update_bone_world(ci);
             return;
         };
 
@@ -677,7 +802,6 @@ impl SkeletonPose {
         let offset_shear_y = constraint.offset_shear_y.to_radians() * reflect;
         let offset_world = t.transform_point(Vec2::new(constraint.offset_x, constraint.offset_y));
 
-        let mut lowest = usize::MAX;
         for bone_id in &constraint.bones {
             let i = bone_id.index();
             let Some(pose) = self.bones.get_mut(i) else { continue };
@@ -728,11 +852,8 @@ impl SkeletonPose {
 
             if modified {
                 pose.world = w;
-                lowest = lowest.min(i);
             }
         }
-
-        self.rebuild_below(&constraint.bones, lowest);
     }
 
     /// Adds the world transform of the target on top, rather than replacing.
@@ -742,7 +863,6 @@ impl SkeletonPose {
         let offset_rotation = constraint.offset_rotation.to_radians() * reflect;
         let offset_shear_y = constraint.offset_shear_y.to_radians() * reflect;
 
-        let mut lowest = usize::MAX;
         for bone_id in &constraint.bones {
             let i = bone_id.index();
             let Some(pose) = self.bones.get_mut(i) else { continue };
@@ -794,11 +914,8 @@ impl SkeletonPose {
 
             if modified {
                 pose.world = w;
-                lowest = lowest.min(i);
             }
         }
-
-        self.rebuild_below(&constraint.bones, lowest);
     }
 
     /// Replaces the *local* transform of each bone with that of the target.
@@ -809,7 +926,6 @@ impl SkeletonPose {
     fn apply_transform_absolute_local(&mut self, constraint: &TransformConstraint, mix: TransformPose) {
         let t = self.bones[constraint.target.index()].local;
 
-        let mut lowest = usize::MAX;
         for bone_id in &constraint.bones {
             let i = bone_id.index();
             let Some(pose) = self.bones.get_mut(i) else { continue };
@@ -833,11 +949,6 @@ impl SkeletonPose {
             }
 
             pose.local = l;
-            lowest = lowest.min(i);
-        }
-
-        if lowest != usize::MAX {
-            self.update_world_from(lowest);
         }
     }
 
@@ -845,7 +956,6 @@ impl SkeletonPose {
     fn apply_transform_relative_local(&mut self, constraint: &TransformConstraint, mix: TransformPose) {
         let t = self.bones[constraint.target.index()].local;
 
-        let mut lowest = usize::MAX;
         for bone_id in &constraint.bones {
             let i = bone_id.index();
             let Some(pose) = self.bones.get_mut(i) else { continue };
@@ -861,11 +971,6 @@ impl SkeletonPose {
             l.shear.y += (t.shear.y + constraint.offset_shear_y) * mix.mix_shear_y;
 
             pose.local = l;
-            lowest = lowest.min(i);
-        }
-
-        if lowest != usize::MAX {
-            self.update_world_from(lowest);
         }
     }
 
@@ -945,7 +1050,6 @@ impl SkeletonPose {
         let tip = constraint.offset_rotation == 0.0 && constraint.rotate_mode == PathRotateMode::Chain;
 
         let mut here = samples[0].point;
-        let mut lowest = usize::MAX;
         for i in 0..bone_count {
             let bone_index = constraint.bones[i].index();
             let Some(bone) = self.bones.get_mut(bone_index) else { continue };
@@ -1003,11 +1107,8 @@ impl SkeletonPose {
             }
 
             bone.world = w;
-            lowest = lowest.min(bone_index);
             here = next;
         }
-
-        self.rebuild_below(&constraint.bones, lowest);
     }
 
     /// Resolves the path a constraint follows and measures it in world space.
@@ -1020,16 +1121,6 @@ impl SkeletonPose {
         let world = self.world_vertices(&path.vertices, &slot_pose.deform, slot_bone);
         let geometry = PathGeometry::measure(&world, path.closed, path.constant_speed, &path.lengths);
         Some((geometry, slot_bone))
-    }
-
-    /// Rebuilds everything below a set of bones whose world matrices were
-    /// written directly, leaving those bones as the constraint left them.
-    fn rebuild_below(&mut self, bones: &[BoneId], lowest: usize) {
-        if lowest == usize::MAX {
-            return;
-        }
-        let highest = bones.iter().map(|b| b.index()).max().unwrap_or(lowest);
-        self.update_world_from(highest + 1);
     }
 
     /// World-space bounds of the current pose's bone origins.
@@ -1937,6 +2028,14 @@ mod tests {
 
         /// Bone 0 carries the path slot; the constrained bones follow it.
         fn pose(self) -> SkeletonPose {
+            let mut ir = self.ir();
+            ir.rebuild_derived();
+            SkeletonPose::new(Arc::new(ir))
+        }
+
+        /// The same skeleton before the derived tables are built, for tests that
+        /// add constraints of their own.
+        fn ir(self) -> SpineIr {
             let mut bones = vec![bone("root", None, BoneLocal::default(), 0.0)];
             for i in 0..self.bones {
                 bones.push(bone(&format!("b{i}"), Some(0), BoneLocal::default(), self.bone_length));
@@ -1980,8 +2079,7 @@ mod tests {
                 mix_x: self.mix,
                 mix_y: self.mix,
             });
-            ir.rebuild_derived();
-            SkeletonPose::new(Arc::new(ir))
+            ir
         }
     }
 
@@ -2183,5 +2281,254 @@ mod tests {
         pc.position = 100.0;
         let pose = pc.pose();
         assert_close(pose.bones[1].world.translation().x, 50.0, "half the curve, not half the geometry");
+    }
+
+    // ---------------------------------------------------- constraint update order
+    //
+    // After a constraint only the descendants of the bones it constrains are
+    // recomputed. Bones an earlier constraint placed, and that lie elsewhere in
+    // the hierarchy, must keep their result however high their index is.
+
+    fn world_tc(order: u32, bones: &[u16], target: u16, local: bool) -> TransformConstraint {
+        TransformConstraint {
+            name: format!("tc{order}"),
+            order,
+            skin_required: false,
+            bones: bones.iter().copied().map(BoneId).collect(),
+            target: BoneId(target),
+            offset_rotation: 0.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            offset_scale_x: 0.0,
+            offset_scale_y: 0.0,
+            offset_shear_y: 0.0,
+            mix_rotate: 1.0,
+            mix_x: 1.0,
+            mix_y: 1.0,
+            mix_scale_x: 0.0,
+            mix_scale_y: 0.0,
+            mix_shear_y: 0.0,
+            relative: false,
+            local,
+        }
+    }
+
+    fn ik_for(order: u32, bone: u16, target: u16) -> IkConstraint {
+        IkConstraint {
+            name: format!("ik{order}"),
+            order,
+            skin_required: false,
+            bones: vec![BoneId(bone)],
+            target: BoneId(target),
+            mix: 1.0,
+            softness: 0.0,
+            bend_positive: true,
+            compress: false,
+            stretch: false,
+            uniform: false,
+        }
+    }
+
+    fn built(mut ir: SpineIr) -> SkeletonPose {
+        ir.rebuild_derived();
+        SkeletonPose::new(Arc::new(ir))
+    }
+
+    fn world_at(pose: &SkeletonPose, bone: usize) -> Vec2 {
+        pose.bones[bone].world.translation()
+    }
+
+    #[test]
+    fn an_earlier_world_transform_constraint_survives_a_later_one_on_a_lower_bone() {
+        // 0 root, 1 target of the second constraint, 2 its constrained bone
+        // (low index), 3 target of the first, 4 its constrained bone (high
+        // index), 5 child of 4. The second constraint runs last and touches
+        // nothing below bone 2, so bones 4 and 5 stay where the first put them.
+        let mut ir = SpineIr {
+            bones: vec![
+                bone("root", None, BoneLocal::default(), 0.0),
+                bone("t2", Some(0), at(7.0, 7.0), 0.0),
+                bone("low", Some(0), at(0.0, 10.0), 0.0),
+                bone("t1", Some(0), at(50.0, 20.0), 0.0),
+                bone("hi", Some(0), at(0.0, 0.0), 0.0),
+                bone("hi_child", Some(4), at(10.0, 0.0), 0.0),
+            ],
+            ..Default::default()
+        };
+        ir.transform_constraints.push(world_tc(0, &[4], 3, false));
+        ir.transform_constraints.push(world_tc(1, &[2], 1, false));
+        let pose = built(ir);
+        assert_close(world_at(&pose, 2).x, 7.0, "low x");
+        assert_close(world_at(&pose, 2).y, 7.0, "low y");
+        assert_close(world_at(&pose, 4).x, 50.0, "hi x");
+        assert_close(world_at(&pose, 4).y, 20.0, "hi y");
+        // The first constraint's own descendant update carried the child.
+        assert_close(world_at(&pose, 5).x, 60.0, "child x");
+        assert_close(world_at(&pose, 5).y, 20.0, "child y");
+    }
+
+    #[test]
+    fn an_earlier_path_constraint_survives_a_later_transform_constraint_on_a_lower_bone() {
+        // Bones 2 and 3 ride the path (at x = 0 and 10); bone 1 sits below them
+        // in index order and is pulled to the root by a later constraint.
+        let mut ir = Pc::new(3).ir();
+        ir.bones[1].setup = at(0.0, 30.0);
+        ir.path_constraints[0].bones = vec![BoneId(2), BoneId(3)];
+        ir.transform_constraints.push(world_tc(1, &[1], 0, false));
+        let pose = built(ir);
+        assert_close(world_at(&pose, 1).y, 0.0, "constrained bone pulled to the root");
+        assert_close(world_at(&pose, 2).x, 0.0, "first path bone");
+        assert_close(world_at(&pose, 3).x, 10.0, "second path bone");
+        assert_close(world_at(&pose, 3).y, 0.0, "second path bone y");
+    }
+
+    #[test]
+    fn the_plan_covers_every_descendant_of_a_later_constraints_bone() {
+        // Guards the plan's coverage (this also held before the fix; it is not
+        // the regression test for it).
+        // 0 root, 1 target of the first constraint, 2 target of the second at
+        // (0, 100), 3 the later constraint's bone, 4 its child, constrained by
+        // the first constraint, 5 a child of 4.
+        // The second constraint moves bone 3, so everything below it is
+        // recomposed from its own pose: bone 5 follows, and bone 4 loses the
+        // placement the first constraint gave it, as in the reference runtime
+        // whose update cache re-updates descendants from the animated pose.
+        let mut ir = SpineIr {
+            bones: vec![
+                bone("root", None, BoneLocal::default(), 0.0),
+                bone("t1", Some(0), at(50.0, 20.0), 0.0),
+                bone("t2", Some(0), at(0.0, 100.0), 0.0),
+                bone("anc", Some(0), at(0.0, 0.0), 0.0),
+                bone("mid", Some(3), at(0.0, 0.0), 0.0),
+                bone("leaf", Some(4), at(10.0, 0.0), 0.0),
+            ],
+            ..Default::default()
+        };
+        ir.transform_constraints.push(world_tc(0, &[4], 1, false));
+        ir.transform_constraints.push(world_tc(1, &[3], 2, false));
+        let pose = built(ir);
+        assert_close(world_at(&pose, 3).y, 100.0, "ancestor");
+        assert_close(world_at(&pose, 4).x, 0.0, "mid is below the ancestor again");
+        assert_close(world_at(&pose, 4).y, 100.0, "mid y");
+        assert_close(world_at(&pose, 5).x, 10.0, "leaf follows");
+        assert_close(world_at(&pose, 5).y, 100.0, "leaf y");
+    }
+
+    #[test]
+    fn the_plan_of_a_local_mode_constraint_includes_its_own_bone_and_children() {
+        // Guards the plan's coverage (this also held before the fix; it is not
+        // the regression test for it).
+        // The local constraint (order 0) sets bone 3's local rotation to 30
+        // and its position to the target's (the origin). A later constraint on
+        // the lower bone 2 must neither undo that nor skip the child.
+        let mut ir = SpineIr {
+            bones: vec![
+                bone("root", None, BoneLocal::default(), 0.0),
+                bone("t", Some(0), BoneLocal { rotation: 30.0, ..BoneLocal::default() }, 0.0),
+                bone("low", Some(0), at(0.0, 10.0), 0.0),
+                bone("local", Some(0), at(5.0, 5.0), 0.0),
+                bone("child", Some(3), at(10.0, 0.0), 0.0),
+            ],
+            ..Default::default()
+        };
+        ir.transform_constraints.push(world_tc(0, &[3], 1, true));
+        ir.transform_constraints.push(world_tc(1, &[2], 0, false));
+        let pose = built(ir);
+        assert_close(pose.bones[3].world.rotation_x_rad().to_degrees(), 30.0, "rotation");
+        assert_close(world_at(&pose, 3).x, 0.0, "x");
+        assert_close(world_at(&pose, 4).x, 10.0 * 30f32.to_radians().cos(), "child x");
+        assert_close(world_at(&pose, 4).y, 10.0 * 30f32.to_radians().sin(), "child y");
+    }
+
+    #[test]
+    fn the_plan_leaves_an_ik_result_alone_when_a_later_constraint_is_unrelated() {
+        // Guards the plan's coverage (this also held before the fix: IK writes
+        // local, so the old blanket recompute reproduced it).
+        // 0 root, 1 target of the transform constraint, 2 its bone, 3 the IK
+        // bone (length 100, pointed at (0, 50)), 4 the IK target, 5 child of 3.
+        let mut ir = SpineIr {
+            bones: vec![
+                bone("root", None, BoneLocal::default(), 0.0),
+                bone("t", Some(0), at(5.0, 5.0), 0.0),
+                bone("low", Some(0), at(0.0, 10.0), 0.0),
+                bone("arm", Some(0), BoneLocal::default(), 100.0),
+                bone("aim", Some(0), at(0.0, 50.0), 0.0),
+                bone("hand", Some(3), at(100.0, 0.0), 0.0),
+            ],
+            ..Default::default()
+        };
+        ir.ik_constraints.push(ik_for(0, 3, 4));
+        ir.transform_constraints.push(world_tc(1, &[2], 1, false));
+        let pose = built(ir);
+        assert_close(pose.bones[3].world.rotation_x_rad().to_degrees(), 90.0, "arm still aimed");
+        assert_close(world_at(&pose, 5).x, 0.0, "hand x");
+        assert_close(world_at(&pose, 5).y, 100.0, "hand y");
+        assert_close(world_at(&pose, 2).x, 5.0, "the later constraint did apply");
+    }
+
+    #[test]
+    fn an_ik_result_is_lost_when_a_later_constraint_moves_an_ancestor() {
+        // Matches the reference: the IK bone sits below a bone a later
+        // constraint moves, so it is recomposed from its animated pose.
+        let mut ir = SpineIr {
+            bones: vec![
+                bone("root", None, BoneLocal::default(), 0.0),
+                bone("anc", Some(0), at(0.0, 0.0), 0.0),
+                bone("arm", Some(1), BoneLocal::default(), 100.0),
+                bone("aim", Some(0), at(0.0, 50.0), 0.0),
+                bone("t", Some(0), at(0.0, 100.0), 0.0),
+            ],
+            ..Default::default()
+        };
+        ir.ik_constraints.push(ik_for(0, 2, 3));
+        ir.transform_constraints.push(world_tc(1, &[1], 4, false));
+        let pose = built(ir);
+        assert_close(world_at(&pose, 2).y, 100.0, "arm rides its ancestor");
+        assert_close(pose.bones[2].world.rotation_x_rad().to_degrees(), 0.0, "IK aim dropped");
+    }
+
+    #[test]
+    fn a_two_bone_ik_on_a_root_bone_carries_the_child_with_it() {
+        // The parent has no grandparent, so the solver falls back to aiming the
+        // parent at the target. Bone 0 (root) turns to point at (0, 100), and
+        // its child, 100 along its axis, must follow to (0, 100) rather than
+        // stay at (100, 0).
+        let mut ir = SpineIr {
+            bones: vec![
+                bone("root", None, BoneLocal::default(), 100.0),
+                bone("child", Some(0), at(100.0, 0.0), 50.0),
+                bone("aim", None, at(0.0, 100.0), 0.0),
+            ],
+            ..Default::default()
+        };
+        let mut ik = ik_for(0, 0, 2);
+        ik.bones = vec![BoneId(0), BoneId(1)];
+        ir.ik_constraints.push(ik);
+        let pose = built(ir);
+        assert_close(pose.bones[0].world.rotation_x_rad().to_degrees(), 90.0, "parent aimed");
+        assert_close(world_at(&pose, 1).x, 0.0, "child x");
+        assert_close(world_at(&pose, 1).y, 100.0, "child y");
+    }
+
+    #[test]
+    fn evaluating_twice_gives_the_same_pose() {
+        // The animated snapshot must not leak from one evaluation into the next.
+        let mut ir = SpineIr {
+            bones: vec![
+                bone("root", None, BoneLocal::default(), 0.0),
+                bone("anc", Some(0), at(0.0, 0.0), 0.0),
+                bone("arm", Some(1), BoneLocal::default(), 100.0),
+                bone("aim", Some(0), at(0.0, 50.0), 0.0),
+                bone("t", Some(0), at(0.0, 100.0), 0.0),
+            ],
+            ..Default::default()
+        };
+        ir.ik_constraints.push(ik_for(0, 2, 3));
+        ir.transform_constraints.push(world_tc(1, &[1], 4, false));
+        let mut pose = built(ir);
+        let first = pose.bones.clone();
+        pose.reset_to_setup();
+        pose.update_world_transforms();
+        assert_eq!(first, pose.bones);
     }
 }
