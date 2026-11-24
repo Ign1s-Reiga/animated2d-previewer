@@ -8,12 +8,24 @@
 //!
 //! 1. **At rest, against the engine's own answer.** The Unity renderer
 //!    component of each drawable stores the render order the official runtime
-//!    computed when the prefab was built (the integer written just before the
-//!    `_depthOffset` field, whose value is 1e-5). When those integers are a
-//!    permutation of `0..n` the rule at default parameters must reproduce them
-//!    exactly. When they are not, the prefab carries values from another
-//!    revision of the model; that is printed and the comparison skipped, since
-//!    nothing can be concluded from stale numbers.
+//!    computed when the prefab was built. That integer is the `CubismRenderer`
+//!    field `_renderOrder`: the bundles' type trees list the fields as
+//!    `_localSortingOrder, _color, _mainTexture, MeshDirty, _sortingMode,
+//!    _sortingOrder, _renderOrder, _depthOffset, _opacity`, and `_renderOrder`
+//!    is the integer written just before `_depthOffset` (1e-5), which is how it
+//!    is located here. Unity's `MeshRenderer.m_SortingOrder` equals it on every
+//!    renderer of the models whose values are sound. When the stored integers
+//!    are a permutation of `0..n` the rule at default parameters must
+//!    reproduce them exactly. When they are not, the prefab carries values
+//!    from another revision of the model. Verified from the bundle data: on the
+//!    two such models the sorting mode is back-to-front with no offsets and one
+//!    group, and each `CubismDrawable._unmanagedIndex` matches the MOC3 index,
+//!    so neither the pairing nor our reading of the field is the cause.
+//!    Inferred: the values are stale (not proven; the paint rule itself is not
+//!    checked on those models). The reason is printed (how many values are out
+//!    of range, how many extra copies of a repeated value there are, and how
+//!    many equal the rule's position) and
+//!    the comparison skipped, since nothing can be concluded from stale numbers.
 //! 2. **In motion.** Every motion is played at 60 Hz through the model. Each
 //!    frame's emitted meshes must have unique, ascending `z_order`, name every
 //!    visible drawable at most once, and come out in exactly the order the
@@ -112,13 +124,29 @@ fn at_rest_the_paint_order_matches_the_render_orders_the_engine_stored() {
     }
     assert_eq!(stored.len(), n, "renderer components and drawables should pair one to one");
 
+    // Slot k of the stored data is where drawable i sits; the sequence the
+    // rule produces lists drawables back to front, so invert it.
+    let pose = ir.pose(&[]);
+    let sequence = paint_sequence(&pose.draw_orders, &ir.draw_order);
+    let mut mine = vec![0usize; n];
+    for (position, drawable) in sequence.iter().enumerate() {
+        mine[*drawable] = position;
+    }
+
     let mut seen = vec![false; n];
     let permutation = by_drawable
         .iter()
         .all(|o| usize::try_from(*o).ok().filter(|o| *o < n).is_some_and(|o| !std::mem::replace(&mut seen[o], true)));
     if !permutation {
+        let out_of_range = by_drawable.iter().filter(|o| usize::try_from(**o).map_or(true, |o| o >= n)).count();
+        let mut counts: HashMap<i32, usize> = HashMap::new();
+        for o in &by_drawable {
+            *counts.entry(*o).or_default() += 1;
+        }
+        let duplicated = counts.values().filter(|c| **c > 1).map(|c| c - 1).sum::<usize>();
+        let agreeing = (0..n).filter(|i| mine[*i] as i32 == by_drawable[*i]).count();
         let summary = format!(
-            "stored render orders are stale ({n} drawables, stored range {}..={})",
+            "stored render orders are stale ({n} drawables, stored range {}..={}): {out_of_range} values outside 0..{n}, {duplicated} repeats, {agreeing} equal to the rule's position",
             by_drawable.iter().min().copied().unwrap_or(0),
             by_drawable.iter().max().copied().unwrap_or(0)
         );
@@ -133,14 +161,6 @@ fn at_rest_the_paint_order_matches_the_render_orders_the_engine_stored() {
         return;
     }
 
-    // Slot k of the stored data is where drawable i sits; the sequence the
-    // rule produces lists drawables back to front, so invert it.
-    let pose = ir.pose(&[]);
-    let sequence = paint_sequence(&pose.draw_orders, &ir.draw_order);
-    let mut mine = vec![0usize; n];
-    for (position, drawable) in sequence.iter().enumerate() {
-        mine[*drawable] = position;
-    }
     let differing: Vec<usize> = (0..n).filter(|i| mine[*i] as i32 != by_drawable[*i]).collect();
     println!("{n} drawables; positions differing from the stored render order: {}", differing.len());
     assert!(
