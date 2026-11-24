@@ -33,6 +33,7 @@
 
 pub mod emit;
 pub mod eval;
+pub(crate) mod look;
 pub mod moc3;
 pub mod model;
 pub(crate) mod motion;

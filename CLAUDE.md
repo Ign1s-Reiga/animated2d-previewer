@@ -46,7 +46,7 @@ files, object inventory, MonoBehaviour bodies, `AnimationClip` decoding with CRC
 bindings), `a2d-import`'s `unity_cubism` (bundle → `.a2dpack`, motions recovered from
 `AnimationClip`s and fade motion data, and the physics rig recovered from the bundle), and `a2d-cubism` (MOC3 v2 decode, keyform binding
 and blending, warp and rotation deformers, glue, drawable and deformer opacity, motion
-playback, and physics simulated during playback — checked
+playback, physics simulated during playback, and the look-at rig applied (at its rest target; it follows a pointer only when the host drives it) — checked
 against the SDK's described algorithm and hand-computed steps, **not yet against the official
 runtime**). **A MOC3 holds no resting pose** — coordinates come from blending keyforms by
 parameter value. The layout and the evaluation rules were reverse-engineered and are pinned
@@ -56,7 +56,7 @@ against the official runtime yet (§11 cross-impl).
 
 Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 binary layouts;
 for Cubism, expressions, pose and part opacity (not applied; none of the target bundles carries any, and part-opacity curves in a clip are reported by name), authored motion fades (crossfades use the host's mix duration, except hand-backs between motions that the source's animator controller states: the desktop viewer plays such an emotion once and crossfades to the default at the source's time and duration),
-multiple texture pages, the look-at rig (on every target prefab; a small constant offset at its stored target, named in an import note), and the model-level curves (opacity, eye blink,
+multiple texture pages, and the model-level curves (opacity, eye blink,
 lip sync) that motions may carry.
 Looping (repeat) parameters are read from the per-parameter repeat flag (MOC3 section 54) and
 stored in the package from format 6; those parameters are wrapped instead of clamped. Inference from motions

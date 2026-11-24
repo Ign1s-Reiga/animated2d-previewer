@@ -478,6 +478,19 @@ mod tests {
     }
 
     #[test]
+    fn a_look_target_is_ignored_by_the_default_trait_method() {
+        let mut m = model();
+        m.play_animation("idle", PlayOptions::looping()).unwrap();
+        m.update(Duration::from_millis(100)).unwrap();
+        let before = m.bounds();
+        m.set_look_target(Some(Vec2::new(500.0, -500.0)));
+        m.update(Duration::ZERO).unwrap();
+        assert_close2(m.bounds().center(), before.center());
+        assert_close2(m.bounds().size(), before.size());
+        m.set_look_target(None);
+    }
+
+    #[test]
     fn disposing_twice_is_harmless() {
         let mut m = model();
         m.dispose();

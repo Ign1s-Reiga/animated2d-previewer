@@ -2,7 +2,7 @@
 //!
 //! The prefabs carry one look-at rig and no eye blink, mouth, harmonic motion,
 //! breath, expression or pose-part components. The rig is recovered into the
-//! package, which is not yet applied at playback, so the import has to say so;
+//! package, and playback applies it at its rest target, so the import says so;
 //! the others must not be reported when they are absent.
 //!
 //! The asset is never committed (spec §11). `A2D_FIXTURE_CUBISM` names one
@@ -30,7 +30,7 @@ fn the_look_rig_is_noted_with_its_parameters_and_absent_drivers_are_not() {
     let look: Vec<&String> = notes.iter().filter(|n| n.starts_with("look-at rig")).collect();
     assert_eq!(look.len(), 1, "exactly one look note expected: {notes:?}");
     println!("{}", look[0]);
-    assert!(look[0].contains("recovered") && look[0].contains("not yet applied"), "{}", look[0]);
+    assert!(look[0].contains("recovered") && look[0].contains("applied at its rest target"), "{}", look[0]);
     assert!(!look[0].contains("no readable owner") && !look[0].contains("not recovered"), "{}", look[0]);
     let model = package.model.as_cubism().expect("a Cubism package");
     let rig = model.look.as_ref().expect("the look rig is recovered into the model");

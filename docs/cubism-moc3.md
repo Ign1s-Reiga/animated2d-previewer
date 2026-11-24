@@ -891,7 +891,7 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
 - **Pose files, expressions, hit areas.** All live outside the MOC3 and are not
   read. (Physics is read: the rig is recovered from the bundle's physics
   controller and simulated during playback.)
-- **Look-at rig: present, not applied, reported.** Every model seen carries the
+- **Look-at rig: applied, driven only when the host asks.** Every model seen carries the
   SDK's look-at controller (additive blend, damping 0.15, a target child object)
   and four or five look parameters, each an axis and a factor on a model
   parameter (the angle and eye-ball ones). Established by reading the bundle
@@ -900,8 +900,8 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
   the target position stored in the prefab the rig adds a constant, tiny offset
   (at most about 0.55 degrees of head angle, 1.8 % of eye-ball range, and exactly
   zero on four of the six); nothing in a bundle moves the target, only game code
-  could, which is unverified. Not applied, so playback matches the source at its
-  stored target to within that offset. The import names the rig in a note, with
+  could, which is unverified. Playback applies the rig at that stored target by
+  default, so it matches the source at rest (the constant offset is in). The host may drive it with a model-space point (`AnimatedModel::set_look_target`): the position follows with Unity's `Vector3.SmoothDamp` (a critically damped spring, from the published Game Programming Gems 4 derivation) over the rig's damping, per component, and is applied after the motion and before physics, so physics sees it. No comparison against the official runtime yet. The import names the rig in a note, with
   the parameters it drives. The same note mechanism covers eye blink, mouth,
   harmonic motion, breath, an expression list and pose parts, which none of the
   six models carries (their blinks, breath and mouth are keyed in the clips).

@@ -242,6 +242,18 @@ pub trait AnimatedModel {
     /// Default is to ignore it, for a model that cannot be mirrored meaningfully.
     fn set_scale(&mut self, _scale: crate::Vec2) {}
 
+    /// Points the model at `target`, a point in **model space** (the space of
+    /// [`AnimatedModel::bounds`] and [`AnimatedModel::hit_test`]), for a model
+    /// that can follow a pointer. `None` releases it: it eases back to its own
+    /// rest target with its own smoothing.
+    ///
+    /// A mirrored model (a negative x from [`AnimatedModel::set_scale`])
+    /// interprets the target in its own unmirrored space: each family handles
+    /// that, the host never does.
+    ///
+    /// Default is to ignore it, for a model with nothing that follows.
+    fn set_look_target(&mut self, _target: Option<crate::Vec2>) {}
+
     /// Poses at an absolute time within one animation, without advancing state.
     ///
     /// This is what visual regression tests and frame export need: a frame that
