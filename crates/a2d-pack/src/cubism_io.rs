@@ -39,6 +39,16 @@
 //!   telling the user to re-import. Every name must be a motion in the table,
 //!   no motion has two handovers, `at` and `mix` are finite and not negative,
 //!   and `at` does not pass the end of the motion it leaves.
+//! * Version 8: appends `look: opt`, a rig of `blend: u8, damping: f32,
+//!   rest_target: 3 x f32, center: 3 x f32, parameters: seq`, each `parameter: str, axis: u8,
+//!   factor: f32`, so a version 7 body is a prefix of a version 8 one. Blend is
+//!   0 (additive), 1 (multiply) or 2 (override); axis is 0 (X), 1 (Y) or 2
+//!   (Z). A version 7 model reads with no rig. No re-import note is given for
+//!   an older package: the rig is optional, its absence changes nothing about
+//!   how the model plays by default, and an older package cannot say whether
+//!   its source had one, so a note would nag on every old package. Every
+//!   parameter must be one of the model's and appear once, factors and the
+//!   rest target and center are finite, and damping is finite and not negative.
 //!
 //! A motion is `name: str, duration: f32, fade_in: f32, fade_out: f32,
 //! curves: seq`. A curve is `target: str, fade_in: opt f32, fade_out: opt f32,
@@ -90,6 +100,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     validate_physics(ir)?;
     validate_repeats(ir)?;
     validate_handovers(ir)?;
+    validate_look(ir)?;
     write_canvas(w, &ir.canvas);
     w.seq(&ir.parameters, write_parameter);
     write_ids(w, &ir.part_ids);
@@ -128,6 +139,8 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
         w.f32(h.handover.at);
         w.f32(h.handover.mix);
     });
+    // Added in format version 8.
+    w.opt(ir.look.as_ref(), write_look);
     Ok(())
 }
 
@@ -136,8 +149,8 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
 /// `version` is the format version from the `model.bin` header. A version 1
 /// model ends after the draw-order tracks and has no motions; version 2 adds
 /// the motion table, version 3 the glue table, version 4 the warp opacities and
-/// version 5 the physics rig, version 6 the repeat flags and version 7 the default
-/// motion and handovers. The layout is chosen by the header, never
+/// version 5 the physics rig, version 6 the repeat flags, version 7 the default
+/// motion and handovers and version 8 the look rig. The layout is chosen by the header, never
 /// inferred from how many bytes happen to remain.
 pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     let mut ir = CubismIr {
@@ -166,6 +179,7 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
         physics: None,
         default_motion: None,
         handovers: Vec::new(),
+        look: None,
     };
     if version >= 2 {
         ir.motions = r.seq("motion", 20, read_motion)?;
@@ -198,6 +212,9 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
             })
         })?;
     }
+    if version >= 8 {
+        ir.look = r.opt(read_look)?;
+    }
     validate_references(&ir)?;
     validate_glues(&ir)?;
     validate_warp_opacities(&ir)?;
@@ -205,6 +222,7 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     validate_physics(&ir)?;
     validate_repeats(&ir)?;
     validate_handovers(&ir)?;
+    validate_look(&ir)?;
     Ok(ir)
 }
 
@@ -250,6 +268,66 @@ fn validate_handovers(ir: &CubismIr) -> Result<(), DecodeError> {
         }
     }
     Ok(())
+}
+
+/// The look rig, when stored, must be usable with this model's parameters; the
+/// rules live on [`LookRig::problem`] so writer and reader share them.
+fn validate_look(ir: &CubismIr) -> Result<(), DecodeError> {
+    match ir.look.as_ref().and_then(|l| l.problem(&ir.parameters)) {
+        Some(problem) => Err(DecodeError::corrupt(format!("look rig: {problem}"))),
+        None => Ok(()),
+    }
+}
+
+fn write_look(w: &mut Writer, l: &LookRig) {
+    w.u8(match l.blend {
+        LookBlend::Additive => 0,
+        LookBlend::Multiply => 1,
+        LookBlend::Override => 2,
+    });
+    w.f32(l.damping);
+    w.f32(l.rest_target.0);
+    w.f32(l.rest_target.1);
+    w.f32(l.rest_target.2);
+    w.f32(l.center.0);
+    w.f32(l.center.1);
+    w.f32(l.center.2);
+    w.seq(&l.parameters, |w, p| {
+        w.str(&p.parameter);
+        w.u8(match p.axis {
+            LookAxis::X => 0,
+            LookAxis::Y => 1,
+            LookAxis::Z => 2,
+        });
+        w.f32(p.factor);
+    });
+}
+
+fn read_look(r: &mut Reader<'_>) -> Result<LookRig, DecodeError> {
+    let blend = match r.u8()? {
+        0 => LookBlend::Additive,
+        1 => LookBlend::Multiply,
+        2 => LookBlend::Override,
+        other => return Err(DecodeError::corrupt(format!("a look blend is {other}, not 0, 1 or 2"))),
+    };
+    Ok(LookRig {
+        blend,
+        damping: r.f32()?,
+        rest_target: (r.f32()?, r.f32()?, r.f32()?),
+        center: (r.f32()?, r.f32()?, r.f32()?),
+        parameters: r.seq("look parameter", 9, |r| {
+            Ok(LookParameter {
+                parameter: r.str()?,
+                axis: match r.u8()? {
+                    0 => LookAxis::X,
+                    1 => LookAxis::Y,
+                    2 => LookAxis::Z,
+                    other => return Err(DecodeError::corrupt(format!("a look axis is {other}, not 0, 1 or 2"))),
+                },
+                factor: r.f32()?,
+            })
+        })?,
+    })
 }
 
 /// The repeat flags, when stored, are exactly one per parameter: a short list
@@ -946,6 +1024,7 @@ mod tests {
             physics: None,
             default_motion: None,
             handovers: vec![],
+            look: None,
             drawables: vec![
                 Drawable {
                     id: "ArtMesh1".into(),
@@ -1288,7 +1367,7 @@ mod tests {
         let mut bytes = Package::from_cubism(model(), "test", "x").encode_model().unwrap();
         // The motion count is followed by the two empty glue tables, the empty
         // warp opacity track (a count each) and the physics flag (one byte).
-        let at = bytes.len() - 17 - V7_TAIL;
+        let at = bytes.len() - 17 - POST_V6_TAIL;
         bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("a huge count should be refused");
         assert!(err.to_string().contains("motion count"), "{err}");
@@ -1417,7 +1496,7 @@ mod tests {
             write(&mut w, &good).unwrap();
             let mut bytes = w.into_bytes();
             // Drop the repeat flag and the physics flag, then the empty opacity track before them.
-            bytes.truncate(bytes.len() - V7_TAIL - 2 - 4);
+            bytes.truncate(bytes.len() - POST_V6_TAIL - 2 - 4);
             let mut tail = Writer::new();
             tail.f32_seq(&ir.warp_keyform_opacities);
             bytes.extend(tail.into_bytes());
@@ -1620,14 +1699,15 @@ mod tests {
         }
     }
 
-    /// Bytes a version 7 model adds after a version 6 one when it has neither a
-    /// default motion nor handovers: the absent marker and an empty count.
-    const V7_TAIL: usize = 1 + 4;
+    /// Bytes versions 7 and 8 add after a version 6 model when it has no default
+    /// motion, no handovers and no look rig: the absent marker and an empty
+    /// count, then the absent look marker.
+    const POST_V6_TAIL: usize = 1 + 4 + 1;
 
-    /// Removes the version 7 tail of a model with neither default nor handovers.
+    /// Removes the version 7 and 8 tails of a model with neither default nor handovers.
     fn strip_v7_tail(bytes: &mut Vec<u8>) {
-        let at = bytes.len() - V7_TAIL;
-        assert_eq!(&bytes[at..], &[0u8; V7_TAIL], "the version 7 tail of a model with none");
+        let at = bytes.len() - POST_V6_TAIL;
+        assert_eq!(&bytes[at..], &[0u8; POST_V6_TAIL], "the version 7 tail of a model with none");
         bytes.truncate(at);
     }
 
@@ -1772,7 +1852,7 @@ mod tests {
             write(&mut w, &good).unwrap();
             let mut bytes = w.into_bytes();
             // Drop the flag sequence (opt byte, count, two flags) and put the bad one back.
-            bytes.truncate(bytes.len() - V7_TAIL - (1 + 4 + 2));
+            bytes.truncate(bytes.len() - POST_V6_TAIL - (1 + 4 + 2));
             let mut tail = Writer::new();
             tail.opt(ir.parameter_repeats.as_ref(), |w, f| w.seq(f, |w, f| w.bool(*f)));
             bytes.extend(tail.into_bytes());
@@ -1789,7 +1869,7 @@ mod tests {
         write(&mut w, &ir).unwrap();
         let mut bytes = w.into_bytes();
         let n = bytes.len();
-        bytes[n - V7_TAIL - 2] = 2;
+        bytes[n - POST_V6_TAIL - 2] = 2;
         let err = read(&mut Reader::new(&bytes), 6).expect_err("a flag of 2");
         assert!(err.to_string().contains("repeat flag is 2"), "{err}");
     }
@@ -1852,7 +1932,7 @@ mod tests {
             write(&mut w, &good).unwrap();
             let mut bytes = w.into_bytes();
             // The physics flag and the repeat flag after it.
-            bytes.truncate(bytes.len() - V7_TAIL - 2);
+            bytes.truncate(bytes.len() - POST_V6_TAIL - 2);
             let mut tail = Writer::new();
             tail.opt(ir.physics.as_ref(), write_physics);
             bytes.extend(tail.into_bytes());
@@ -2003,6 +2083,7 @@ mod tests {
             w.f32(*at);
             w.f32(*mix);
         });
+        tail.u8(0);
         bytes.extend(tail.into_bytes());
         bytes
     }
@@ -2021,11 +2102,11 @@ mod tests {
     }
 
     #[test]
-    fn the_current_writer_without_a_default_or_handovers_is_the_version_6_layout_plus_five_zero_bytes() {
+    fn the_current_writer_without_a_default_or_handovers_is_the_version_6_layout_plus_six_zero_bytes() {
         let v6 = include_bytes!("../tests/fixtures/cubism_v6.model.bin");
         let now = encode(&with_physics());
-        assert_eq!(&now[8..now.len() - V7_TAIL], &v6[8..]);
-        assert_eq!(&now[now.len() - V7_TAIL..], &[0u8; V7_TAIL]);
+        assert_eq!(&now[8..now.len() - POST_V6_TAIL], &v6[8..]);
+        assert_eq!(&now[now.len() - POST_V6_TAIL..], &[0u8; POST_V6_TAIL]);
     }
 
     #[test]
@@ -2036,9 +2117,9 @@ mod tests {
     }
 
     #[test]
-    fn a_version_8_header_is_refused_rather_than_misread() {
+    fn a_version_9_header_is_refused_rather_than_misread() {
         let mut bytes = encode(&with_handovers());
-        bytes[4..8].copy_from_slice(&8u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&9u32.to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("too new");
         assert!(err.to_string().contains("newer"), "{err}");
     }
@@ -2072,7 +2153,8 @@ mod tests {
         tail.f32(2.25);
         tail.f32(0.5);
         let tail = tail.into_bytes();
-        assert_eq!(&bytes[bytes.len() - tail.len()..], &tail[..]);
+        let end = bytes.len() - 1; // the absent look marker of version 8
+        assert_eq!(&bytes[end - tail.len()..end], &tail[..]);
     }
 
     #[test]
@@ -2151,7 +2233,7 @@ mod tests {
     fn an_implausible_handover_count_is_refused_before_allocating() {
         let mut bytes = encode(&with_handovers());
         // The count precedes one handover: two 4-byte-prefixed 4-letter names, then at and mix.
-        let count_at = bytes.len() - (4 + (4 + 4) + (4 + 4) + 4 + 4);
+        let count_at = bytes.len() - 1 - (4 + (4 + 4) + (4 + 4) + 4 + 4);
         bytes[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("a huge count should be refused");
         assert!(err.to_string().contains("motion handover count"), "{err}");
@@ -2212,5 +2294,227 @@ mod tests {
         strip_v7_tail(&mut bytes);
         bytes[4..8].copy_from_slice(&6u32.to_le_bytes());
         std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cubism_v6.model.bin"), bytes).unwrap();
+    }
+
+    // ---- Version 8: the look rig ----
+
+    fn look_param(id: &str, axis: LookAxis, factor: f32) -> LookParameter {
+        LookParameter { parameter: id.into(), axis, factor }
+    }
+
+    /// `with_handovers()` plus a look rig over parameters `model()` has.
+    fn with_look() -> CubismIr {
+        let mut ir = with_handovers();
+        let id = |i: usize| ir.parameters[i].id.clone();
+        let (a, b) = (id(0), id(1));
+        ir.look = Some(LookRig {
+            blend: LookBlend::Additive,
+            damping: 0.15,
+            rest_target: (0.25, -0.125, 0.5),
+            center: (0.0625, 0.5, -0.75),
+            parameters: vec![look_param(&a, LookAxis::X, 0.5), look_param(&b, LookAxis::Z, -2.0)],
+        });
+        ir
+    }
+
+    /// The model's bytes with the version 8 tail replaced by `look` written raw,
+    /// bypassing the writer's checks.
+    fn with_raw_look(look: impl FnOnce(&mut Writer)) -> Vec<u8> {
+        let mut w = Writer::new();
+        write(&mut w, &with_handovers()).unwrap();
+        let mut bytes = w.into_bytes();
+        assert_eq!(bytes.pop(), Some(0), "the absent look marker");
+        let mut tail = Writer::new();
+        tail.u8(1);
+        look(&mut tail);
+        bytes.extend(tail.into_bytes());
+        bytes
+    }
+
+    fn raw_look(
+        w: &mut Writer,
+        blend: u8,
+        damping: f32,
+        target: [f32; 3],
+        center: [f32; 3],
+        params: &[(&str, u8, f32)],
+    ) {
+        w.u8(blend);
+        w.f32(damping);
+        for t in target.into_iter().chain(center) {
+            w.f32(t);
+        }
+        w.seq(params, |w, (id, axis, factor)| {
+            w.str(id);
+            w.u8(*axis);
+            w.f32(*factor);
+        });
+    }
+
+    #[test]
+    fn a_version_7_model_reads_with_no_look_rig() {
+        // Generated by the version 7 writer from `with_handovers()`.
+        let bytes = include_bytes!("../tests/fixtures/cubism_v7.model.bin");
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 7);
+        let PackageModel::Cubism(ir) = Package::decode_model(bytes).expect("v7 must still load") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert_eq!(ir.look, None);
+        assert_eq!(ir, with_handovers());
+    }
+
+    #[test]
+    fn the_current_writer_without_a_look_rig_is_the_version_7_layout_plus_one_zero_byte() {
+        let v7 = include_bytes!("../tests/fixtures/cubism_v7.model.bin");
+        let now = encode(&with_handovers());
+        assert_eq!(&now[8..now.len() - 1], &v7[8..]);
+        assert_eq!(now[now.len() - 1], 0);
+    }
+
+    #[test]
+    fn a_look_rig_round_trips_in_every_blend_and_axis_and_re_encodes_to_identical_bytes() {
+        for blend in [LookBlend::Additive, LookBlend::Multiply, LookBlend::Override] {
+            let mut ir = with_look();
+            if let Some(look) = ir.look.as_mut() {
+                look.blend = blend;
+                look.parameters[0].axis = LookAxis::Y;
+            }
+            let first = encode(&ir);
+            let PackageModel::Cubism(back) = Package::decode_model(&first).expect("should decode") else {
+                panic!("a Cubism package must decode as one")
+            };
+            assert_eq!(back, ir);
+            assert_eq!(encode(&back), first);
+        }
+        // A rig that drives nothing is still a rig.
+        let mut empty = with_look();
+        if let Some(look) = empty.look.as_mut() {
+            look.parameters.clear();
+        }
+        assert!(matches!(Package::decode_model(&encode(&empty)), Ok(PackageModel::Cubism(c)) if c == empty));
+    }
+
+    #[test]
+    fn the_version_8_layout_is_blend_damping_target_then_each_parameter_as_id_axis_factor() {
+        let bytes = encode(&with_look());
+        let ir = with_look();
+        let (a, b) = (ir.parameters[0].id.clone(), ir.parameters[1].id.clone());
+        let mut tail = Writer::new();
+        tail.u8(1);
+        raw_look(&mut tail, 0, 0.15, [0.25, -0.125, 0.5], [0.0625, 0.5, -0.75], &[(&a, 0, 0.5), (&b, 2, -2.0)]);
+        let tail = tail.into_bytes();
+        assert_eq!(&bytes[bytes.len() - tail.len()..], &tail[..]);
+    }
+
+    #[test]
+    fn a_look_rig_is_encoded_deterministically() {
+        assert_eq!(encode(&with_look()), encode(&with_look()));
+    }
+
+    #[test]
+    fn a_bad_look_rig_is_refused_by_the_writer_and_the_reader_alike() {
+        let ir = with_look();
+        let (a, b) = (ir.parameters[0].id.clone(), ir.parameters[1].id.clone());
+        type Edit = fn(&mut LookRig);
+        let nan = f32::NAN;
+        type Raw = (f32, [f32; 3], [f32; 3], Vec<(String, u8, f32)>);
+        let cases: Vec<(&str, Edit, Raw)> = vec![
+            (
+                "names no parameter of the model",
+                |l| l.parameters[0].parameter = "Ghost".into(),
+                (0.1, [0.0; 3], [0.0; 3], vec![("Ghost".into(), 0, 1.0)]),
+            ),
+            (
+                "is driven more than once",
+                |l| l.parameters[1].parameter = l.parameters[0].parameter.clone(),
+                (0.1, [0.0; 3], [0.0; 3], vec![(a.clone(), 0, 1.0), (a.clone(), 1, 1.0)]),
+            ),
+            (
+                "has factor NaN",
+                |l| l.parameters[0].factor = f32::NAN,
+                (0.1, [0.0; 3], [0.0; 3], vec![(a.clone(), 0, nan)]),
+            ),
+            (
+                "has factor inf",
+                |l| l.parameters[0].factor = f32::INFINITY,
+                (0.1, [0.0; 3], [0.0; 3], vec![(b.clone(), 0, f32::INFINITY)]),
+            ),
+            ("damping NaN", |l| l.damping = f32::NAN, (nan, [0.0; 3], [0.0; 3], vec![])),
+            ("damping inf", |l| l.damping = f32::INFINITY, (f32::INFINITY, [0.0; 3], [0.0; 3], vec![])),
+            ("damping -0.5", |l| l.damping = -0.5, (-0.5, [0.0; 3], [0.0; 3], vec![])),
+            ("rest target", |l| l.rest_target.1 = f32::NAN, (0.1, [0.0, nan, 0.0], [0.0; 3], vec![])),
+            ("center", |l| l.center.0 = f32::NEG_INFINITY, (0.1, [0.0; 3], [f32::NEG_INFINITY, 0.0, 0.0], vec![])),
+            ("rest target", |l| l.rest_target.2 = f32::INFINITY, (0.1, [0.0, 0.0, f32::INFINITY], [0.0; 3], vec![])),
+        ];
+        for (what, damage, (damping, target, center, params)) in cases {
+            let mut ir = with_look();
+            if let Some(look) = ir.look.as_mut() {
+                damage(look);
+            }
+            let err = Package::from_cubism(ir, "test", "x").encode_model().expect_err(what);
+            assert!(matches!(err, DecodeError::Corrupt { .. }), "{what}: {err:?}");
+            assert!(err.to_string().contains(what), "{what}: {err}");
+
+            let raw: Vec<(&str, u8, f32)> = params.iter().map(|(i, ax, f)| (i.as_str(), *ax, *f)).collect();
+            let bytes = with_raw_look(|w| raw_look(w, 0, damping, target, center, &raw));
+            let err = read(&mut Reader::new(&bytes), 8).expect_err(what);
+            assert!(matches!(err, DecodeError::Corrupt { .. }), "{what}: {err:?}");
+            assert!(err.to_string().contains(what), "{what}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_look_blend_or_axis_is_refused_on_read() {
+        let a = with_look().parameters[0].id.clone();
+        let bytes = with_raw_look(|w| raw_look(w, 3, 0.1, [0.0; 3], [0.0; 3], &[]));
+        let err = read(&mut Reader::new(&bytes), 8).expect_err("blend 3");
+        assert!(err.to_string().contains("look blend"), "{err}");
+        let bytes = with_raw_look(|w| raw_look(w, 0, 0.1, [0.0; 3], [0.0; 3], &[(&a, 3, 1.0)]));
+        let err = read(&mut Reader::new(&bytes), 8).expect_err("axis 3");
+        assert!(err.to_string().contains("look axis"), "{err}");
+    }
+
+    #[test]
+    fn a_version_8_header_over_version_7_bytes_is_refused() {
+        let mut bytes = include_bytes!("../tests/fixtures/cubism_v7.model.bin").to_vec();
+        bytes[4..8].copy_from_slice(&8u32.to_le_bytes());
+        assert!(Package::decode_model(&bytes).is_err());
+    }
+
+    #[test]
+    fn truncating_or_corrupting_look_bytes_never_panics() {
+        let full = encode(&with_look());
+        for cut in 0..full.len() {
+            let _ = Package::decode_model(&full[..cut]);
+        }
+        for at in 8..full.len() {
+            let mut bytes = full.clone();
+            bytes[at] ^= 0xff;
+            let _ = Package::decode_model(&bytes);
+        }
+    }
+
+    #[test]
+    fn an_older_package_gets_no_note_about_a_missing_look_rig() {
+        let mut old = Package::from_cubism(with_handovers(), "test", "x");
+        old.manifest.format_version = 7;
+        let notes: String = old.validate().warnings().iter().map(|w| w.to_string()).collect();
+        assert!(!notes.to_lowercase().contains("look"), "{notes}");
+    }
+
+    /// Writes the committed version 7 fixture. Run with `--ignored` and
+    /// `UPDATE_GOLDEN=1` to regenerate it; nothing else touches the file.
+    #[test]
+    #[ignore = "regenerates tests/fixtures/cubism_v7.model.bin; needs UPDATE_GOLDEN=1"]
+    fn regenerate_the_version_7_fixture() {
+        if std::env::var_os("UPDATE_GOLDEN").is_none() {
+            return;
+        }
+        let mut bytes = encode(&with_handovers());
+        // The current writer's output minus the trailing look marker. That is what a
+        // version 7 writer wrote only while version 8 merely appends to version 7.
+        assert_eq!(bytes.pop(), Some(0));
+        bytes[4..8].copy_from_slice(&7u32.to_le_bytes());
+        std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cubism_v7.model.bin"), bytes).unwrap();
     }
 }

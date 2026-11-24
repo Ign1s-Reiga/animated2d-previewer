@@ -672,8 +672,8 @@ mod tests {
     #[test]
     fn writers_always_write_the_current_version() {
         let bytes = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
-        assert_eq!(FORMAT_VERSION, 7);
-        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 7);
+        assert_eq!(FORMAT_VERSION, 8);
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 8);
     }
 
     #[test]

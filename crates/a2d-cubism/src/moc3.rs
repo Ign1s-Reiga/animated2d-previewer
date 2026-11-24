@@ -523,6 +523,7 @@ impl Moc3 {
                 physics: None,
                 default_motion: None,
                 handovers: Vec::new(),
+                look: None,
             },
         })
     }
