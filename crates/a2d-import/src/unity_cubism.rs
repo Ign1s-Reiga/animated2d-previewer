@@ -32,6 +32,7 @@ mod clip_motion;
 mod drivers;
 mod fade_motion;
 mod handover;
+mod look;
 mod physics;
 
 use std::collections::{HashMap, HashSet};
@@ -99,6 +100,11 @@ pub struct CubismInventory {
     /// `None` when the bundle has none or it could not be recovered; the
     /// report says which.
     pub physics: Option<Physics>,
+    /// The look-at rig recovered from the model's look components, before it
+    /// is checked against the model's parameters (import does that). `None`
+    /// when the bundle has none or it could not be recovered; the report says
+    /// which.
+    pub look: Option<a2d_core::ir::cubism::LookRig>,
 }
 
 impl CubismInventory {
@@ -113,6 +119,15 @@ const MOC3_MAGIC: &[u8; 4] = b"MOC3";
 
 /// Reads a bundle and reports the Cubism assets in it.
 pub fn inspect_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<CubismInventory, DecodeError> {
+    let (inventory, scan) = inspect_scanned(bytes, report)?;
+    drivers::note_scan(&scan, report);
+    Ok(inventory)
+}
+
+/// [`inspect_bundle`] without the runtime-driver notes, which are returned as
+/// the scan they come from so that `import_bundle` can check the look rig
+/// against the model before saying what became of it.
+fn inspect_scanned(bytes: &[u8], report: &mut LoadReport) -> Result<(CubismInventory, drivers::Scan), DecodeError> {
     let bundle = Bundle::parse(bytes)?;
     let node = bundle.nodes.iter().find(|n| n.is_serialized()).ok_or_else(|| DecodeError::Reconstruction {
         game: "unity_cubism".into(),
@@ -154,7 +169,13 @@ pub fn inspect_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<CubismInv
         .collect();
 
     let physics = recover_physics(&file, &inventory, report);
-    drivers::note_unapplied(&file, &inventory, report);
+    let mut scan = drivers::scan(&file, &inventory);
+    // The same check import runs against the model, so that inspecting a bundle
+    // and importing it report one outcome. A payload that does not parse is
+    // import's error to report; the rig is then left as recovered.
+    if let Some(parsed) = moc.as_ref().and_then(|m| a2d_cubism::Moc3::parse(&m.bytes).ok()) {
+        scan.validate_look(&parsed.parameters);
+    }
 
     let out = CubismInventory {
         unity_revision: bundle.unity_revision.clone(),
@@ -169,6 +190,7 @@ pub fn inspect_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<CubismInv
         drawables: inventory.by_script("CubismDrawable").count(),
         fade_sources,
         physics,
+        look: scan.look.clone(),
     };
 
     if out.moc.is_none() {
@@ -177,7 +199,7 @@ pub fn inspect_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<CubismInv
     if out.textures.is_empty() {
         report.warn(Degradation::MissingReference { kind: "texture".into(), name: "any Texture2D".into() });
     }
-    Ok(out)
+    Ok((out, scan))
 }
 
 /// Pulls the `.moc3` bytes out of the `CubismMoc` behaviour.
@@ -290,7 +312,7 @@ fn read_i32(data: &[u8], at: usize) -> Result<i32, DecodeError> {
 /// matching fade data, from the clip itself. A motion that cannot be decoded is
 /// reported through `report` and the model still loads.
 pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, DecodeError> {
-    let inventory = inspect_bundle(bytes, report)?;
+    let (inventory, scan) = inspect_scanned(bytes, report)?;
     let physics = inventory.physics;
     let moc = inventory.moc.ok_or_else(|| DecodeError::Reconstruction {
         game: "unity_cubism".into(),
@@ -308,6 +330,11 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
         report.warn(Degradation::Note(note.clone()));
     }
     let mut model: a2d_core::ir::cubism::CubismIr = parsed.into();
+    // Already checked against this model's parameters while inspecting (a rig
+    // naming one the model lacks would make the package writer refuse the
+    // whole model); what is left is usable.
+    model.look = scan.look.clone();
+    drivers::note_scan(&scan, report);
 
     let bundle = Bundle::parse(bytes)?;
     let node = bundle.nodes.iter().find(|n| n.is_serialized()).ok_or_else(|| DecodeError::Reconstruction {
@@ -1107,6 +1134,7 @@ mod tests {
     #[test]
     fn an_inventory_without_a_moc_is_not_cubism() {
         let empty = CubismInventory {
+            look: None,
             unity_revision: "2022.3".into(),
             object_count: 0,
             moc: None,

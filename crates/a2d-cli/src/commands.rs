@@ -264,6 +264,7 @@ pub fn validate(out: &mut dyn std::io::Write, package_dir: &Path) -> Result<bool
     if let Some(ir) = package.model.as_cubism() {
         writeln!(out, "  physics:       {}", physics_summary(ir.physics.as_ref()))?;
         print_handovers(out, ir)?;
+        print_look(out, ir.look.as_ref())?;
     }
     if let Some(ir) = package.model.as_spine() {
         // Information, not a warning: an empty animation is legitimate source
@@ -1029,6 +1030,7 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<()
     }
 
     writeln!(out, "\n  physics:     {}", physics_summary(inventory.physics.as_ref()))?;
+    print_look(out, inventory.look.as_ref())?;
 
     print_controllers_and_sources(out, &inventory)?;
 
@@ -1052,6 +1054,33 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<()
         out,
         "\nThis reports what the bundle holds. `animated2d import` reconstructs a loadable \npackage from it, and `animated2d preview` opens it directly."
     )?;
+    Ok(())
+}
+
+/// The look-at rig, shared by `inspect` and `validate`.
+fn print_look(out: &mut dyn std::io::Write, look: Option<&a2d_core::ir::cubism::LookRig>) -> std::io::Result<()> {
+    use a2d_core::ir::cubism::{LookAxis, LookBlend};
+    let Some(rig) = look else { return writeln!(out, "  look-at rig: (none recovered)") };
+    let blend = match rig.blend {
+        LookBlend::Additive => "additive",
+        LookBlend::Multiply => "multiply",
+        LookBlend::Override => "override",
+    };
+    let (tx, ty, tz) = rig.rest_target;
+    let (cx, cy, cz) = rig.center;
+    writeln!(out, "  look-at rig: {blend} blend, damping {:.3} s", rig.damping)?;
+    writeln!(
+        out,
+        "    rest target: ({tx:.5}, {ty:.5}, {tz:.5})  center: ({cx:.5}, {cy:.5}, {cz:.5})  (model-space units)"
+    )?;
+    for p in &rig.parameters {
+        let axis = match p.axis {
+            LookAxis::X => "X",
+            LookAxis::Y => "Y",
+            LookAxis::Z => "Z",
+        };
+        writeln!(out, "    {}  axis {axis}  factor {}", p.parameter, p.factor)?;
+    }
     Ok(())
 }
 
@@ -1181,6 +1210,7 @@ mod tests {
             drawables: 0,
             fade_sources: vec![],
             physics: None,
+            look: None,
         };
         let mut out = Vec::new();
         print_controllers_and_sources(&mut out, &inventory).unwrap();
