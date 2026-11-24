@@ -741,6 +741,28 @@ mod tests {
     }
 
     #[test]
+    fn a_constraint_naming_a_missing_bone_or_slot_is_rejected_on_load() {
+        // Each of these would index the bone or slot arena out of range at
+        // playback, so the package is refused on read instead.
+        type Corruption = (&'static str, fn(&mut SpineIr));
+        let corruptions: [Corruption; 6] = [
+            ("ik bone", |ir| ir.ik_constraints[0].bones[0] = BoneId(99)),
+            ("ik target", |ir| ir.ik_constraints[0].target = BoneId(99)),
+            ("transform bone", |ir| ir.transform_constraints[0].bones[0] = BoneId(99)),
+            ("transform target", |ir| ir.transform_constraints[0].target = BoneId(99)),
+            ("path bone", |ir| ir.path_constraints[0].bones[0] = BoneId(99)),
+            ("path target slot", |ir| ir.path_constraints[0].target_slot = SlotId(99)),
+        ];
+        for (what, corrupt) in corruptions {
+            let mut ir = rich_ir();
+            corrupt(&mut ir);
+            let bytes = Package::from_spine(ir, "Hero").encode_model().unwrap();
+            let err = Package::decode_model(&bytes).expect_err(what);
+            assert!(err.to_string().contains("99 which does not exist"), "{what}: {err}");
+        }
+    }
+
+    #[test]
     fn the_manifest_is_derived_from_the_model() {
         let package = Package::from_spine(rich_ir(), "Hero");
         assert_eq!(package.manifest.display_name, "Hero");

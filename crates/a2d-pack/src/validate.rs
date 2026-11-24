@@ -4,7 +4,8 @@
 //! can still be opened and looked at while the gap is diagnosed.
 
 use a2d_core::ir::cubism::CubismIr;
-use a2d_core::ir::spine::{AttachmentKind, ConstraintKind, SpineIr, Timeline};
+use a2d_core::ir::ids::BoneId;
+use a2d_core::ir::spine::{AttachmentKind, PathConstraint, SpineIr, Timeline};
 use a2d_core::{Degradation, LoadReport};
 
 use crate::package::TextureFile;
@@ -154,15 +155,17 @@ fn check_slot_references(ir: &SpineIr, report: &mut LoadReport) {
     }
 }
 
-/// Unsupported constraints.
+/// Unsupported constraints, and constraints that name bones or slots which do
+/// not exist.
+///
+/// The runtime evaluates IK, transform constraints in all four modes (world or
+/// local, absolute or relative) and path constraints in every position,
+/// spacing and rotate mode, so none of those is reported merely for being
+/// present. What it cannot solve is an IK chain longer than two bones: it
+/// solves the first two and leaves the rest alone. The Spine editor never
+/// writes such a chain, so seeing one means the source data is off.
 fn check_constraints(ir: &SpineIr, report: &mut LoadReport) {
-    for entry in &ir.constraint_order {
-        if entry.kind == ConstraintKind::Path {
-            if let Some(c) = ir.path_constraints.get(entry.index as usize) {
-                report.warn(Degradation::UnsupportedConstraint { name: c.name.clone(), kind: "path".into() });
-            }
-        }
-    }
+    let bone_missing = |b: &BoneId| b.index() >= ir.bones.len();
     for c in &ir.ik_constraints {
         if c.bones.len() > 2 {
             report.warn(Degradation::UnsupportedConstraint {
@@ -170,41 +173,178 @@ fn check_constraints(ir: &SpineIr, report: &mut LoadReport) {
                 kind: format!("ik with a {}-bone chain", c.bones.len()),
             });
         }
-        if c.bones.iter().any(|b| b.index() >= ir.bones.len()) || c.target.index() >= ir.bones.len() {
+        if c.bones.iter().any(bone_missing) || bone_missing(&c.target) {
             report.warn(Degradation::MissingReference { kind: "ik constraint bone".into(), name: c.name.clone() });
         }
     }
     for c in &ir.transform_constraints {
-        if c.local || c.relative {
-            report.warn(Degradation::UnsupportedConstraint {
-                name: c.name.clone(),
-                kind: format!("transform constraint in {} mode", if c.local { "local" } else { "relative" }),
-            });
+        if c.bones.iter().any(bone_missing) || bone_missing(&c.target) {
+            report
+                .warn(Degradation::MissingReference { kind: "transform constraint bone".into(), name: c.name.clone() });
         }
+    }
+    for c in &ir.path_constraints {
+        if c.bones.iter().any(bone_missing) {
+            report.warn(Degradation::MissingReference { kind: "path constraint bone".into(), name: c.name.clone() });
+        }
+        if c.target_slot.index() >= ir.slots.len() {
+            report.warn(Degradation::MissingReference {
+                kind: "path constraint target slot".into(),
+                name: c.name.clone(),
+            });
+            continue;
+        }
+        check_path_coverage(ir, c, report);
     }
 }
 
-/// Unsupported timeline types.
+/// Fewest control points a path attachment needs before the runtime can cut a
+/// single curve from it.
+///
+/// Mirrors `path_curves` in the runtime: anchors sit at vertices 1, 4, 7, ...
+/// with two handles between each pair, so an open path needs vertices 1..=4,
+/// five in all. A closed path always gets its wrapping curve from the last two
+/// vertices and the first two, which needs three.
+fn path_min_points(closed: bool) -> usize {
+    if closed {
+        3
+    } else {
+        5
+    }
+}
+
+/// A path constraint does nothing unless its target slot can hold a path the
+/// runtime can follow.
+///
+/// A single skin may leave the path off, which is legitimate. No skin putting
+/// a path there at all means the constraint can never act, which is reported,
+/// as is a path too short to cut a curve from, which the runtime also reports
+/// when it meets one.
+fn check_path_coverage(ir: &SpineIr, c: &PathConstraint, report: &mut LoadReport) {
+    let mut has_path = false;
+    for skin in &ir.skins {
+        for entry in skin.entries.iter().filter(|e| e.slot == c.target_slot) {
+            let Some(attachment) = ir.attachments.get(entry.attachment.index()) else { continue };
+            let AttachmentKind::Path(path) = &attachment.kind else { continue };
+            has_path = true;
+            let points = path.vertices.vertex_count();
+            let needed = path_min_points(path.closed);
+            if points < needed {
+                report.warn(Degradation::UnsupportedConstraint {
+                    name: c.name.clone(),
+                    kind: format!(
+                        "path (attachment {:?} has {points} control points; {} path needs at least {needed})",
+                        entry.name,
+                        if path.closed { "a closed" } else { "an open" }
+                    ),
+                });
+            }
+        }
+    }
+    if !has_path {
+        report.warn(Degradation::MissingReference {
+            kind: "path attachment in any skin for the target slot of path constraint".into(),
+            name: c.name.clone(),
+        });
+    }
+}
+
+/// Whether the runtime applies a timeline of this type.
+///
+/// Every timeline the IR can hold is applied today. The match is exhaustive on
+/// purpose: a timeline type added to the IR does not compile here until someone
+/// decides whether the runtime plays it, so `validate` cannot fall silent about
+/// a type it has never heard of.
+fn runtime_applies(timeline: &Timeline) -> bool {
+    match timeline {
+        Timeline::BoneRotate { .. }
+        | Timeline::BoneTranslate { .. }
+        | Timeline::BoneScale { .. }
+        | Timeline::BoneShear { .. }
+        | Timeline::SlotColor { .. }
+        | Timeline::SlotTwoColor { .. }
+        | Timeline::SlotAlpha { .. }
+        | Timeline::SlotAttachment { .. }
+        | Timeline::Deform { .. }
+        | Timeline::DrawOrder { .. }
+        | Timeline::Event { .. }
+        | Timeline::IkConstraint { .. }
+        | Timeline::TransformConstraint { .. }
+        | Timeline::PathPosition { .. }
+        | Timeline::PathSpacing { .. }
+        | Timeline::PathMix { .. } => true,
+    }
+}
+
+/// Unsupported timeline types, and timelines aimed at something that does
+/// not exist.
+///
+/// An animation with no timelines is not reported: rigs do carry empty
+/// animations (a "stop" that keys nothing), and nothing about one was dropped
+/// or approximated.
 fn check_timelines(ir: &SpineIr, report: &mut LoadReport) {
     for animation in &ir.animations {
         for timeline in &animation.timelines {
-            let unsupported = matches!(
-                timeline,
-                Timeline::PathPosition { .. } | Timeline::PathSpacing { .. } | Timeline::PathMix { .. }
-            );
-            if unsupported {
+            if !runtime_applies(timeline) {
                 report.warn(Degradation::UnsupportedTimeline {
                     animation: animation.name.clone(),
                     kind: timeline.type_name().to_string(),
                 });
             }
+            check_timeline_targets(ir, &animation.name, timeline, report);
         }
-        if animation.timelines.is_empty() {
-            report.warn(Degradation::ClampedValue {
-                context: format!("animation {:?}", animation.name),
-                field: "timelines".into(),
-                detail: "animation has no timelines".into(),
+    }
+}
+
+/// Range-checks what a timeline animates.
+///
+/// Playback skips a timeline whose target is out of range without a word, so
+/// this is the only place the gap is said out loud. A package read from disk
+/// does not range-check timelines, and the binary decoders take timeline
+/// targets as raw indices, so an out-of-range one can reach here.
+fn check_timeline_targets(ir: &SpineIr, animation: &str, timeline: &Timeline, report: &mut LoadReport) {
+    let mut check = |what: &str, index: usize, len: usize| {
+        if index >= len {
+            report.warn(Degradation::MissingReference {
+                kind: format!("{what} for {} timeline", timeline.type_name()),
+                name: format!("{index} (in animation {animation:?})"),
             });
+        }
+    };
+    match timeline {
+        Timeline::BoneRotate { bone, .. }
+        | Timeline::BoneTranslate { bone, .. }
+        | Timeline::BoneScale { bone, .. }
+        | Timeline::BoneShear { bone, .. } => check("bone", bone.index(), ir.bones.len()),
+        Timeline::SlotColor { slot, .. }
+        | Timeline::SlotTwoColor { slot, .. }
+        | Timeline::SlotAlpha { slot, .. }
+        | Timeline::SlotAttachment { slot, .. } => check("slot", slot.index(), ir.slots.len()),
+        Timeline::Deform { slot, skin, attachment, .. } => {
+            check("slot", slot.index(), ir.slots.len());
+            check("skin", skin.index(), ir.skins.len());
+            check("attachment", attachment.index(), ir.attachments.len());
+        }
+        Timeline::DrawOrder { keys } => {
+            for slot in keys.iter().filter_map(|k| k.order.as_ref()).flatten() {
+                check("slot", slot.index(), ir.slots.len());
+            }
+        }
+        Timeline::Event { keys } => {
+            for key in keys {
+                check("event", key.event.index(), ir.events.len());
+            }
+        }
+        Timeline::IkConstraint { constraint, .. } => {
+            check("ik constraint", constraint.index(), ir.ik_constraints.len())
+        }
+        Timeline::TransformConstraint { constraint, .. } => {
+            check("transform constraint", constraint.index(), ir.transform_constraints.len())
+        }
+        Timeline::PathPosition { constraint, .. }
+        | Timeline::PathSpacing { constraint, .. }
+        | Timeline::PathMix { constraint, .. } => {
+            check("path constraint", constraint.index(), ir.path_constraints.len())
         }
     }
 }
@@ -546,15 +686,33 @@ mod tests {
         assert!(text.contains("linked mesh parent"), "{text}");
     }
 
-    #[test]
-    fn path_constraints_and_their_timelines_are_reported_as_unsupported() {
-        let mut ir = healthy();
-        ir.path_constraints.push(PathConstraint {
+    /// Adds slot 1 ("rail") holding a path attachment with `points` control
+    /// points, bound in the default skin.
+    fn with_path_slot(mut ir: SpineIr, points: usize, closed: bool) -> SpineIr {
+        ir.slots.push(Slot { setup_attachment: Some("rail".into()), ..Slot::new("rail", BoneId(0)) });
+        ir.attachments.push(Attachment {
+            name: "rail".into(),
+            kind: AttachmentKind::Path(PathAttachment {
+                closed,
+                constant_speed: true,
+                lengths: vec![],
+                vertices: VertexData::Rigid((0..points).map(|i| Vec2::new(i as f32 * 10.0, 0.0)).collect()),
+                color: Rgba::WHITE,
+            }),
+        });
+        let attachment = AttachmentId(ir.attachments.len() as u32 - 1);
+        ir.skins[0].entries.push(SkinEntry { slot: SlotId(1), name: "rail".into(), attachment });
+        ir.rebuild_derived();
+        ir
+    }
+
+    fn path_constraint(bones: Vec<BoneId>, target_slot: SlotId) -> PathConstraint {
+        PathConstraint {
             name: "pc".into(),
             order: 0,
             skin_required: false,
-            bones: vec![BoneId(1)],
-            target_slot: SlotId(0),
+            bones,
+            target_slot,
             position_mode: PathPositionMode::default(),
             spacing_mode: PathSpacingMode::default(),
             rotate_mode: PathRotateMode::default(),
@@ -564,20 +722,35 @@ mod tests {
             mix_rotate: 1.0,
             mix_x: 1.0,
             mix_y: 1.0,
-        });
-        ir.animations[0]
-            .timelines
-            .push(Timeline::PathMix { constraint: a2d_core::ir::ids::PathConstraintId(0), keys: vec![] });
-        ir.rebuild_derived();
-        let text = run(&ir, &page_file());
-        assert!(text.contains("path constraint"), "{text}");
-        assert!(text.contains("path mix timeline"), "{text}");
+        }
     }
 
-    #[test]
-    fn a_long_ik_chain_is_reported() {
-        let mut ir = healthy();
-        ir.ik_constraints.push(IkConstraint {
+    fn transform_constraint(local: bool, relative: bool) -> TransformConstraint {
+        TransformConstraint {
+            name: format!("tc-local-{local}-relative-{relative}"),
+            order: 0,
+            skin_required: false,
+            bones: vec![BoneId(1)],
+            target: BoneId(0),
+            offset_rotation: 0.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            offset_scale_x: 0.0,
+            offset_scale_y: 0.0,
+            offset_shear_y: 0.0,
+            mix_rotate: 1.0,
+            mix_x: 1.0,
+            mix_y: 1.0,
+            mix_scale_x: 1.0,
+            mix_scale_y: 1.0,
+            mix_shear_y: 1.0,
+            relative,
+            local,
+        }
+    }
+
+    fn long_ik_chain() -> IkConstraint {
+        IkConstraint {
             name: "spine".into(),
             order: 0,
             skin_required: false,
@@ -589,49 +762,184 @@ mod tests {
             compress: false,
             stretch: false,
             uniform: false,
-        });
+        }
+    }
+
+    /// Everything the runtime evaluates and `validate` once called
+    /// unsupported: a path constraint in every position, spacing and rotate
+    /// mode, all three path timelines, transform constraints in all four
+    /// modes, and an empty animation.
+    fn constrained() -> SpineIr {
+        use a2d_core::ir::ids::PathConstraintId;
+        let mut ir = with_path_slot(healthy(), 6, false);
+        for position_mode in [PathPositionMode::Fixed, PathPositionMode::Percent] {
+            for spacing_mode in [
+                PathSpacingMode::Length,
+                PathSpacingMode::Fixed,
+                PathSpacingMode::Percent,
+                PathSpacingMode::Proportional,
+            ] {
+                for rotate_mode in [PathRotateMode::Tangent, PathRotateMode::Chain, PathRotateMode::ChainScale] {
+                    ir.path_constraints.push(PathConstraint {
+                        name: format!("pc-{}", ir.path_constraints.len()),
+                        position_mode,
+                        spacing_mode,
+                        rotate_mode,
+                        ..path_constraint(vec![BoneId(1)], SlotId(1))
+                    });
+                }
+            }
+        }
+        for (local, relative) in [(false, false), (false, true), (true, false), (true, true)] {
+            ir.transform_constraints.push(transform_constraint(local, relative));
+        }
+        let pc = PathConstraintId(0);
+        ir.animations[0].timelines.extend([
+            Timeline::PathPosition { constraint: pc, keys: vec![] },
+            Timeline::PathSpacing { constraint: pc, keys: vec![] },
+            Timeline::PathMix { constraint: pc, keys: vec![] },
+        ]);
+        ir.animations.push(Animation { name: "Stop".into(), duration: 0.0, timelines: vec![] });
+        ir.rebuild_derived();
+        ir
+    }
+
+    #[test]
+    fn what_the_runtime_evaluates_validates_cleanly() {
+        let ir = constrained();
+        let mut report = LoadReport::new();
+        validate_spine(&ir, &page_file(), &mut report);
+        assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn an_empty_animation_is_not_a_degradation() {
+        let mut ir = healthy();
+        ir.animations.push(Animation { name: "Stop".into(), duration: 0.0, timelines: vec![] });
+        let text = run(&ir, &page_file());
+        assert_eq!(text, "Loaded cleanly.", "nothing was clamped or dropped");
+    }
+
+    #[test]
+    fn a_path_constraint_whose_slot_no_skin_gives_a_path_is_reported() {
+        // Slot 0 only ever holds a region, so the constraint can never act.
+        let mut ir = healthy();
+        ir.path_constraints.push(path_constraint(vec![BoneId(1)], SlotId(0)));
+        ir.rebuild_derived();
+        let text = run(&ir, &page_file());
+        assert!(text.contains("path attachment in any skin for the target slot of path constraint: pc"), "{text}");
+    }
+
+    #[test]
+    fn a_path_with_too_few_control_points_for_the_runtime_is_reported() {
+        // The runtime cuts its first open curve from vertices 1..=4 and its
+        // closed wrap from the last two and the first two.
+        for (points, closed, reported) in
+            [(4, false, true), (5, false, false), (2, true, true), (3, true, false), (0, false, true)]
+        {
+            let mut ir = with_path_slot(healthy(), points, closed);
+            ir.path_constraints.push(path_constraint(vec![BoneId(1)], SlotId(1)));
+            ir.rebuild_derived();
+            let text = run(&ir, &page_file());
+            let expected = format!("has {points} control points");
+            assert_eq!(text.contains(&expected), reported, "{points} points, closed {closed}: {text}");
+            if reported {
+                assert!(text.contains("constraint \"pc\" unsupported"), "{text}");
+            } else {
+                assert_eq!(text, "Loaded cleanly.");
+            }
+        }
+    }
+
+    #[test]
+    fn timelines_aimed_at_missing_targets_are_reported() {
+        use a2d_core::ir::ids::{EventId, IkConstraintId, PathConstraintId, SkinId, TransformConstraintId};
+        let far = 77u16;
+        let cases: Vec<(Timeline, &str)> = vec![
+            (Timeline::BoneRotate { bone: BoneId(far), keys: vec![] }, "missing bone for bone rotate timeline"),
+            (Timeline::SlotAlpha { slot: SlotId(far), keys: vec![] }, "missing slot for slot alpha timeline"),
+            (
+                Timeline::Deform { slot: SlotId(0), skin: SkinId(far), attachment: AttachmentId(0), keys: vec![] },
+                "missing skin for deform timeline",
+            ),
+            (
+                Timeline::Deform {
+                    slot: SlotId(0),
+                    skin: SkinId(0),
+                    attachment: AttachmentId(u32::from(far)),
+                    keys: vec![],
+                },
+                "missing attachment for deform timeline",
+            ),
+            (
+                Timeline::DrawOrder { keys: vec![DrawOrderKey { time: 0.0, order: Some(vec![SlotId(far)]) }] },
+                "missing slot for draw order timeline",
+            ),
+            (
+                Timeline::Event {
+                    keys: vec![EventKey {
+                        time: 0.0,
+                        event: EventId(far),
+                        int_value: 0,
+                        float_value: 0.0,
+                        string_value: None,
+                        volume: 1.0,
+                        balance: 0.0,
+                    }],
+                },
+                "missing event for event timeline",
+            ),
+            (
+                Timeline::IkConstraint { constraint: IkConstraintId(far), keys: vec![] },
+                "missing ik constraint for ik constraint timeline",
+            ),
+            (
+                Timeline::TransformConstraint { constraint: TransformConstraintId(far), keys: vec![] },
+                "missing transform constraint for transform constraint timeline",
+            ),
+            (
+                Timeline::PathSpacing { constraint: PathConstraintId(far), keys: vec![] },
+                "missing path constraint for path spacing timeline",
+            ),
+        ];
+        for (timeline, expected) in cases {
+            let mut ir = healthy();
+            ir.animations[0].timelines.push(timeline);
+            let text = run(&ir, &page_file());
+            assert!(text.contains(expected), "expected {expected:?} in:\n{text}");
+            assert!(text.contains("77 (in animation \"idle\")"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_long_ik_chain_is_reported() {
+        let mut ir = healthy();
+        ir.ik_constraints.push(long_ik_chain());
         ir.rebuild_derived();
         let text = run(&ir, &page_file());
         assert!(text.contains("3-bone chain"), "{text}");
     }
 
     #[test]
-    fn unsupported_transform_constraint_modes_are_reported() {
-        for (local, relative, expected) in [(true, false, "local"), (false, true, "relative")] {
-            let mut ir = healthy();
-            ir.transform_constraints.push(TransformConstraint {
-                name: "tc".into(),
-                order: 0,
-                skin_required: false,
-                bones: vec![BoneId(1)],
-                target: BoneId(0),
-                offset_rotation: 0.0,
-                offset_x: 0.0,
-                offset_y: 0.0,
-                offset_scale_x: 0.0,
-                offset_scale_y: 0.0,
-                offset_shear_y: 0.0,
-                mix_rotate: 1.0,
-                mix_x: 1.0,
-                mix_y: 1.0,
-                mix_scale_x: 1.0,
-                mix_scale_y: 1.0,
-                mix_shear_y: 1.0,
-                relative,
-                local,
-            });
-            ir.rebuild_derived();
-            let text = run(&ir, &page_file());
-            assert!(text.contains(expected), "expected {expected} in:\n{text}");
-        }
+    fn a_long_ik_chain_is_still_reported_alongside_supported_constraints() {
+        let mut ir = constrained();
+        ir.ik_constraints.push(long_ik_chain());
+        ir.rebuild_derived();
+        let mut report = LoadReport::new();
+        validate_spine(&ir, &page_file(), &mut report);
+        assert_eq!(report.len(), 1, "{report}");
+        assert!(report.to_string().contains("ik with a 3-bone chain constraint \"spine\" unsupported"), "{report}");
     }
 
     #[test]
-    fn an_animation_with_no_timelines_is_reported() {
+    fn constraints_naming_missing_bones_or_slots_are_reported() {
         let mut ir = healthy();
-        ir.animations[0].timelines.clear();
+        ir.path_constraints.push(path_constraint(vec![BoneId(42)], SlotId(9)));
+        ir.transform_constraints.push(TransformConstraint { target: BoneId(42), ..transform_constraint(false, false) });
         let text = run(&ir, &page_file());
-        assert!(text.contains("no timelines"), "{text}");
+        assert!(text.contains("missing path constraint bone: pc"), "{text}");
+        assert!(text.contains("missing path constraint target slot: pc"), "{text}");
+        assert!(text.contains("missing transform constraint bone"), "{text}");
     }
 
     #[test]

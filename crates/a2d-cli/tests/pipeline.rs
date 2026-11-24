@@ -243,6 +243,121 @@ fn validate_reports_a_package_with_warnings_via_its_return_value() {
     assert!(!clean, "a package with a missing texture should not report clean");
 }
 
+/// A Spine 3.8 skeleton using what the runtime evaluates but `validate` once
+/// called unsupported: a path constraint with all three path timelines,
+/// transform constraints in local and relative mode, and an empty animation.
+const CONSTRAINED_SKELETON_JSON: &str = r#"{
+  "skeleton": { "spine": "3.8.99", "x": -60, "y": 0, "width": 120, "height": 48 },
+  "bones": [
+    { "name": "root" },
+    { "name": "torso", "parent": "root", "y": 8, "length": 20 },
+    { "name": "head", "parent": "torso", "y": 20, "length": 10 }
+  ],
+  "slots": [
+    { "name": "body", "bone": "torso", "attachment": "body" },
+    { "name": "head", "bone": "head", "attachment": "head" },
+    { "name": "rail", "bone": "root", "attachment": "rail" }
+  ],
+  "transform": [
+    { "name": "local-follow", "order": 0, "bones": [ "head" ], "target": "torso", "local": true },
+    { "name": "relative-follow", "order": 1, "bones": [ "head" ], "target": "torso", "relative": true }
+  ],
+  "path": [
+    { "name": "ride", "order": 2, "bones": [ "head" ], "target": "rail",
+      "spacingMode": "fixed", "rotateMode": "chain", "position": 0.5 }
+  ],
+  "skins": [
+    { "name": "default", "attachments": {
+        "body": { "body": { "width": 32, "height": 32 } },
+        "head": { "head": { "width": 16, "height": 16 } },
+        "rail": { "rail": { "type": "path", "lengths": [ 100 ], "vertexCount": 6,
+                            "vertices": [ -60, 0, -50, 0, -40, 0, 40, 0, 50, 0, 60, 0 ] } }
+    } }
+  ],
+  "animations": {
+    "idle": {
+      "bones": { "torso": { "rotate": [ { "time": 0, "angle": 0 }, { "time": 1, "angle": 5 } ] } },
+      "path": { "ride": {
+        "position": [ { "time": 0, "position": 0 }, { "time": 1, "position": 1 } ],
+        "spacing": [ { "time": 0, "spacing": 0 }, { "time": 1, "spacing": 4 } ],
+        "mix": [ { "time": 0, "rotateMix": 1, "translateMix": 1 }, { "time": 1, "rotateMix": 0.5, "translateMix": 0.5 } ]
+      } }
+    },
+    "stop": {}
+  }
+}
+"#;
+
+/// Runs the real binary's `validate` and returns its exit code with its output.
+fn validate_exit_code(package_dir: &std::path::Path) -> (Option<i32>, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_animated2d"))
+        .arg("validate")
+        .arg(package_dir)
+        .output()
+        .expect("the animated2d binary should be runnable");
+    (output.status.code(), String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[test]
+fn supported_constraints_and_an_empty_animation_validate_with_exit_code_zero() {
+    let dir = temp_dir("validate-supported");
+    let mut fixture = Fixture::spine_json();
+    fixture.skeleton = CONSTRAINED_SKELETON_JSON.into();
+    fixture.write_to(dir.path());
+    let package_dir = dir.path().join("hero.a2dpack");
+
+    // `inspect` builds the runtime model and says it loaded cleanly; `validate`
+    // must agree rather than call those features unsupported.
+    let text = capture(|out| a2d_cli::inspect(out, dir.path(), None).map_err(|e| e.to_string()));
+    assert!(text.contains("Loaded cleanly."), "{text}");
+
+    let text = capture(|out| a2d_cli::import(out, dir.path(), &package_dir, None).map_err(|e| e.to_string()));
+    assert!(text.contains("Loaded cleanly."), "the import itself should be clean: {text}");
+
+    // The package really holds what is being tested, so a fixture typo cannot
+    // turn this into a test of an empty skeleton.
+    let package = a2d_pack::Package::read_from(&package_dir).expect("the package should read");
+    let ir = package.model.as_spine().expect("a Spine package");
+    assert_eq!(ir.path_constraints.len(), 1);
+    assert_eq!(ir.transform_constraints.iter().filter(|c| c.local).count(), 1);
+    assert_eq!(ir.transform_constraints.iter().filter(|c| c.relative).count(), 1);
+    let idle = ir.animations.iter().find(|a| a.name == "idle").expect("idle");
+    for kind in ["path position", "path spacing", "path mix"] {
+        assert!(idle.timelines.iter().any(|t| t.type_name() == kind), "idle should key {kind}");
+    }
+
+    let text = capture(|out| a2d_cli::validate(out, &package_dir).map(|_| ()).map_err(|e| e.to_string()));
+    assert!(text.contains("Loaded cleanly."), "{text}");
+    assert!(!text.contains("unsupported"), "{text}");
+    assert!(!text.contains("clamped"), "an empty animation clamps nothing: {text}");
+    // The empty animation is still mentioned, as information.
+    assert!(text.contains("\"stop\" (no timelines"), "{text}");
+
+    let (code, text) = validate_exit_code(&package_dir);
+    assert_eq!(code, Some(0), "{text}");
+}
+
+#[test]
+fn a_genuinely_unsupported_constraint_still_fails_validate_with_exit_code_one() {
+    // A three-bone IK chain: the runtime solves only the first two bones.
+    let dir = temp_dir("validate-long-ik");
+    let mut fixture = Fixture::spine_json();
+    fixture.skeleton = CONSTRAINED_SKELETON_JSON.replace(
+        r#""transform": ["#,
+        r#""ik": [ { "name": "reach", "bones": [ "root", "torso", "head" ], "target": "head" } ],
+  "transform": ["#,
+    );
+    fixture.write_to(dir.path());
+    let package_dir = dir.path().join("hero.a2dpack");
+    capture(|out| a2d_cli::import(out, dir.path(), &package_dir, None).map_err(|e| e.to_string()));
+
+    let text = capture(|out| a2d_cli::validate(out, &package_dir).map(|_| ()).map_err(|e| e.to_string()));
+    assert!(text.contains("ik with a 3-bone chain constraint \"reach\" unsupported"), "{text}");
+
+    let (code, text) = validate_exit_code(&package_dir);
+    assert_eq!(code, Some(1), "{text}");
+}
+
 #[test]
 fn a_directory_with_no_skeleton_is_a_missing_skeleton_error() {
     let dir = temp_dir("empty");
