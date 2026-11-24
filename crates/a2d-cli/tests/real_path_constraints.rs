@@ -32,13 +32,8 @@ fn load() -> Option<GenericSpineModel> {
     let path = std::env::var("A2D_FIXTURE_SPINE_BUNDLE").ok()?;
     let bytes = std::fs::read(&path).expect("the fixture bundle should be readable");
     let mut report = LoadReport::new();
-    let inventory = a2d_import::inspect_spine_bundle(&bytes, &mut report).expect("the bundle should inspect");
-    let skeleton = inventory.skeleton.as_ref().expect("the bundle should hold a skeleton");
-    let atlas = inventory.atlas.as_ref().expect("the bundle should hold an atlas");
-    let text = String::from_utf8_lossy(&atlas.bytes);
-    let (pages, atlas_report) = a2d_spine::parse_atlas(&text).expect("the atlas should parse");
-    report.absorb(atlas_report);
-    let (ir, _) = a2d_spine::decode_skeleton(&skeleton.bytes, pages, &mut report).expect("the skeleton should decode");
+    let rig = a2d_import::discover_single_rig(&bytes, &mut report).expect("the bundle should hold one rig");
+    let ir = a2d_import::decode_rig(&rig, &mut report).expect("the rig should decode");
     Some(GenericSpineModel::load(Arc::new(ir), "rig"))
 }
 

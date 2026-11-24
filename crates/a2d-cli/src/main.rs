@@ -38,12 +38,21 @@ fn main() -> ExitCode {
             Ok(false) => return ExitCode::from(1),
             Err(e) => Err(e),
         },
-        Command::Preview { package, out: frames, exit_after, hidden } => commands::preview(
-            &mut out,
-            &package,
-            frames.as_deref(),
-            commands::ViewerFlags { exit_after: exit_after.map(std::time::Duration::from_secs_f32), hidden },
-        ),
+        Command::Preview { package, out: frames, exit_after, hidden, game } => {
+            match commands::parse_game(game.as_deref()) {
+                Ok(game) => commands::preview(
+                    &mut out,
+                    &package,
+                    frames.as_deref(),
+                    commands::ViewerFlags {
+                        exit_after: exit_after.map(std::time::Duration::from_secs_f32),
+                        hidden,
+                        game,
+                    },
+                ),
+                Err(e) => Err(e),
+            }
+        }
     };
 
     match result {

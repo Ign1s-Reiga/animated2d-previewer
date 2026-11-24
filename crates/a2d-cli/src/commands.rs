@@ -86,14 +86,36 @@ pub fn print_report(out: &mut dyn std::io::Write, report: &LoadReport) -> std::i
 
 fn resolve_importer(input: &Path, requested: Option<&str>) -> Result<Importer, DecodeError> {
     match requested {
-        None => Ok(games::guess_importer(input)),
-        Some(name) => Importer::parse(name).ok_or_else(|| {
-            DecodeError::UnsupportedFormat(format!(
-                "unknown importer {name:?}; expected one of: {}",
-                Importer::all().iter().map(|i| i.as_str()).collect::<Vec<_>>().join(", ")
-            ))
-        }),
+        None => {
+            // A bundle is identified by what it holds, and one that holds both
+            // shapes or neither is an error rather than a guess (spec §10).
+            if let Some(bytes) = unity_bundle_bytes(input) {
+                return games::identify_bundle(&bytes);
+            }
+            Ok(games::guess_importer(input))
+        }
+        Some(name) => named_importer(name),
     }
+}
+
+/// The importer a `--game` flag names.
+fn named_importer(name: &str) -> Result<Importer, DecodeError> {
+    Importer::parse(name).ok_or_else(|| {
+        DecodeError::UnsupportedFormat(format!(
+            "unknown importer {name:?}; expected one of: {}",
+            Importer::all().iter().map(|i| i.as_str()).collect::<Vec<_>>().join(", ")
+        ))
+    })
+}
+
+/// Reads an optional `--game` value for `preview`.
+pub fn parse_game(name: Option<&str>) -> Result<Option<Importer>, CliError> {
+    Ok(name.map(named_importer).transpose()?)
+}
+
+/// The refusal for a loose-file importer pointed at a Unity bundle.
+fn loose_importer_on_bundle(importer: Importer) -> DecodeError {
+    DecodeError::UnsupportedFormat(format!("the {} importer reads loose files, not Unity bundles", importer.as_str()))
 }
 
 /// One line on a model's physics rig, shared by `inspect` and `validate`.
@@ -122,7 +144,7 @@ pub fn inspect(out: &mut dyn std::io::Write, input: &Path, game: Option<&str>) -
     // alone -- Spine and Cubism ship in identical archives -- so the answer
     // comes from what is inside, and is printed there rather than guessed here.
     if let Some(bytes) = unity_bundle_bytes(input) {
-        return inspect_unity_bundle(out, &bytes);
+        return inspect_unity_bundle(out, &bytes, game);
     }
 
     let importer = resolve_importer(input, game)?;
@@ -206,13 +228,13 @@ pub fn inspect(out: &mut dyn std::io::Write, input: &Path, game: Option<&str>) -
 pub fn import(out: &mut dyn std::io::Write, input: &Path, output: &Path, game: Option<&str>) -> Result<(), CliError> {
     let importer = resolve_importer(input, game)?;
 
-    // A Cubism model arrives as one bundle holding one character, so it needs
-    // none of the pairing that discovery does for loose Spine files.
-    if importer == Importer::UnityCubism {
-        let bytes = unity_bundle_bytes(input)
-            .ok_or_else(|| DecodeError::UnsupportedFormat(format!("{} is not a Unity bundle", input.display())))?;
-        let mut report = LoadReport::new();
-        let package = a2d_import::import_bundle(&bytes, &mut report)?;
+    // A Unity bundle arrives as one file holding one character, so it needs
+    // none of the pairing that discovery does for loose files; the importer
+    // layer reads it whole.
+    // A loose-file importer pointed at a bundle goes the same way, to be refused
+    // with a message that says why.
+    if matches!(importer, Importer::UnityCubism | Importer::UnitySpine) || unity_bundle_bytes(input).is_some() {
+        let (package, report) = games::import_bundle_file(importer, input)?;
         package.write_to(output)?;
         return describe_import(out, &package.manifest.display_name.clone(), output, &package, &report);
     }
@@ -311,36 +333,18 @@ const EXPORT_SIZE: u32 = 512;
 fn open_spine_bundle(
     out: &mut dyn std::io::Write,
     path: &Path,
-    inventory: a2d_import::SpineInventory,
+    bytes: &[u8],
     mut report: LoadReport,
     frames_dir: Option<&Path>,
     flags: ViewerFlags,
 ) -> Result<(), CliError> {
-    let (Some(skeleton), Some(atlas)) = (&inventory.skeleton, &inventory.atlas) else {
-        return Err(DecodeError::UnsupportedFormat("this bundle holds no complete Spine rig".into()).into());
-    };
+    // The same discovery `import` uses, so what is previewed is what imports.
+    let rig = a2d_import::discover_single_rig(bytes, &mut report)?;
+    let ir = a2d_import::decode_rig(&rig, &mut report)?;
+    writeln!(out, "Rig:       {} bones, {} slots, {}", ir.bones.len(), ir.slots.len(), rig.skeleton_version)?;
 
-    let text = String::from_utf8_lossy(&atlas.bytes);
-    let (pages_ir, atlas_report) = a2d_spine::parse_atlas(&text)?;
-    report.absorb(atlas_report);
-    let (ir, detection) = a2d_spine::decode_skeleton(&skeleton.bytes, pages_ir, &mut report)?;
-    writeln!(out, "Rig:       {} bones, {} slots, {}", ir.bones.len(), ir.slots.len(), detection.version)?;
-
-    // Atlas pages name image files; the bundle holds them as Texture2D under
-    // the same stem. A page with no match keeps its slot so texture ids stay
-    // aligned with the atlas.
-    let bundle = a2d_unity::Bundle::parse(&std::fs::read(path)?)?;
-    let node = bundle
-        .nodes
-        .iter()
-        .find(|n| n.is_serialized())
-        .ok_or_else(|| DecodeError::UnsupportedFormat("the bundle holds no serialized file".into()))?;
-    let file = a2d_unity::SerializedFile::parse(bundle.node_data(node)?)?;
-    let decoded = a2d_unity::read_textures(&file)?;
-
-    let stem = |name: &str| {
-        name.rsplit('/').next().unwrap_or(name).rsplit_once('.').map(|(a, _)| a).unwrap_or(name).to_ascii_lowercase()
-    };
+    // A page with no texture keeps its slot so texture ids stay aligned with
+    // the atlas.
     let mut pages = Vec::with_capacity(ir.atlas.pages.len());
     for page in &ir.atlas.pages {
         let sampler = a2d_render::SamplerConfig {
@@ -349,12 +353,12 @@ fn open_spine_bundle(
             u_wrap: page.u_wrap,
             v_wrap: page.v_wrap,
         };
-        let wanted = stem(&page.name);
-        let image = decoded.iter().find(|t| stem(&t.name) == wanted).map(|t| Rgba8Image {
-            width: t.width,
-            height: t.height,
-            pixels: t.rgba.clone(),
-        });
+        let image = rig
+            .pages
+            .iter()
+            .find(|(name, _)| *name == page.name)
+            .and_then(|(_, t)| t.as_ref())
+            .map(|t| Rgba8Image { width: t.width, height: t.height, pixels: t.rgba.clone() });
         if image.is_none() {
             report.note(format!("texture page {:?} is not in this bundle", page.name));
         } else {
@@ -363,7 +367,7 @@ fn open_spine_bundle(
         pages.push((page.name.clone(), image, page.premultiplied_alpha, sampler));
     }
 
-    let name = skeleton.name.rsplit_once('.').map(|(a, _)| a).unwrap_or(&skeleton.name).to_string();
+    let name = rig.name.clone();
     let mut model = a2d_runtime::GenericSpineModel::load(std::sync::Arc::new(ir), &name);
     // Pose before framing: a skeleton's setup pose can be degenerate, and the
     // bounds are what say whether there is anything to look at.
@@ -674,6 +678,9 @@ pub struct ViewerFlags {
     pub exit_after: Option<Duration>,
     /// Create the window invisible and unfocused, for scripted runs and tests.
     pub hidden: bool,
+    /// The importer to use for a Unity bundle instead of detecting one, which
+    /// is the override for a bundle detection refuses.
+    pub game: Option<Importer>,
 }
 
 pub fn preview(
@@ -687,12 +694,18 @@ pub fn preview(
     if let Some(bytes) = unity_bundle_bytes(package_dir) {
         writeln!(out, "Input:     {}", package_dir.display())?;
 
-        // A bundle holds one family or the other, and Spine is the decisive
-        // check: a skeleton and an atlas, both recognised by content.
-        let mut report = LoadReport::new();
-        let spine = a2d_import::inspect_spine_bundle(&bytes, &mut report)?;
-        if spine.is_spine() {
-            return open_spine_bundle(out, package_dir, spine, report, frames_dir, flags);
+        // A bundle holds one family or the other; both, or neither, is an
+        // error from the same check `import` uses rather than a pick.
+        let importer = match flags.game {
+            Some(importer) => importer,
+            None => games::identify_bundle(&bytes)?,
+        };
+        match importer {
+            Importer::UnitySpine => {
+                return open_spine_bundle(out, package_dir, &bytes, LoadReport::new(), frames_dir, flags);
+            }
+            Importer::UnityCubism => {}
+            other => return Err(loose_importer_on_bundle(other).into()),
         }
 
         // Through the importer, so the motions recovered from the bundle come
@@ -879,11 +892,11 @@ fn unity_bundle_bytes(input: &Path) -> Option<Vec<u8>> {
 }
 
 /// Prints the structured inventory of a Unity bundle (spec §12).
-/// Prints what a Unity bundle holding a Spine rig contains.
+/// Prints what a Unity bundle holding Spine rigs contains.
 ///
 /// Spine survives Unity intact -- the skeleton and atlas are the editor's own
 /// bytes -- so this reports the same things `inspect` reports for loose files,
-/// and says so.
+/// and says so. Every rig is listed with the atlas it was paired with.
 fn inspect_spine_bundle(
     out: &mut dyn std::io::Write,
     inventory: a2d_import::SpineInventory,
@@ -900,36 +913,35 @@ Unity bundle"
     if !inventory.components.is_empty() {
         writeln!(out, "  components:  {}", inventory.components.join(", "))?;
     }
+    writeln!(out, "  rigs:        {}", inventory.rigs.len())?;
 
-    if let Some(skeleton) = &inventory.skeleton {
+    for rig in &inventory.rigs {
         writeln!(
             out,
             "
 Spine rig: {}",
-            skeleton.name
+            rig.skeleton_name
         )?;
-        writeln!(out, "  skeleton:    {} bytes", skeleton.bytes.len())?;
-        if let Some(kind) = &inventory.skeleton_kind {
-            writeln!(out, "  version:     {}", kind.label())?;
-        }
-        if let Some(path) = &skeleton.asset_path {
+        writeln!(out, "  skeleton:    {} bytes", rig.skeleton.len())?;
+        writeln!(out, "  version:     spine skeleton {}", rig.skeleton_version)?;
+        if let Some(path) = &rig.skeleton_path {
             writeln!(out, "  authored at: {path}")?;
         }
-    }
-    if let Some(atlas) = &inventory.atlas {
-        writeln!(out, "  atlas:       {} ({} bytes)", atlas.name, atlas.bytes.len())?;
-    }
+        match (&rig.atlas_name, &rig.atlas) {
+            (Some(name), Some(bytes)) => writeln!(out, "  atlas:       {name} ({} bytes)", bytes.len())?,
+            _ => writeln!(out, "  atlas:       (none paired)")?,
+        }
+        for (page, image) in &rig.pages {
+            match image {
+                Some(i) => writeln!(out, "  page:        {page} ({}x{})", i.width, i.height)?,
+                None => writeln!(out, "  page:        {page} (not in this bundle)")?,
+            }
+        }
 
-    // The rig itself, decoded exactly as a loose export would be. Doing it here
-    // rather than only reporting sizes is what shows the extraction is faithful.
-    if let (Some(skeleton), Some(atlas)) = (&inventory.skeleton, &inventory.atlas) {
-        let text = String::from_utf8_lossy(&atlas.bytes);
-        let decoded = a2d_spine::parse_atlas(&text).map_err(CliError::from).and_then(|(pages, atlas_report)| {
-            report.absorb(atlas_report);
-            Ok(a2d_spine::decode_skeleton(&skeleton.bytes, pages, &mut report)?)
-        });
-        match decoded {
-            Ok((ir, _)) => {
+        // The rig itself, decoded exactly as import does. Doing it here rather
+        // than only reporting sizes is what shows the extraction is faithful.
+        match a2d_import::decode_rig(rig, &mut report) {
+            Ok(ir) => {
                 writeln!(out, "  bones:       {}", ir.bones.len())?;
                 writeln!(out, "  slots:       {}", ir.slots.len())?;
                 writeln!(out, "  attachments: {}", ir.attachments.len())?;
@@ -973,15 +985,23 @@ Spine rig: {}",
     Ok(())
 }
 
-fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8]) -> Result<(), CliError> {
+fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8], game: Option<&str>) -> Result<(), CliError> {
     let mut report = LoadReport::new();
 
-    // A bundle holds one family or the other. The Spine check runs first
-    // because it is decisive -- a skeleton and an atlas, both recognised by
-    // content -- whereas the Cubism path reports a structure either way.
-    let spine = a2d_import::inspect_spine_bundle(bytes, &mut report)?;
-    if spine.is_spine() {
-        return inspect_spine_bundle(out, spine, report);
+    // Which family is inside is decided once, in the importer layer. A bundle
+    // that holds both, or cannot be read, is an error there; one that holds
+    // neither is still described below, since that is what inspect is for.
+    let chosen = match game {
+        Some(name) => Some(named_importer(name)?),
+        None => games::detect_bundle(bytes)?,
+    };
+    match chosen {
+        Some(Importer::UnitySpine) => {
+            let spine = a2d_import::inspect_spine_bundle(bytes, &mut report)?;
+            return inspect_spine_bundle(out, spine, report);
+        }
+        Some(Importer::UnityCubism) | None => {}
+        Some(other) => return Err(loose_importer_on_bundle(other).into()),
     }
 
     let inventory = a2d_import::inspect_bundle(bytes, &mut report)?;

@@ -30,7 +30,7 @@ unverified by eye for Spine.
 Implemented: `a2d-core`, `a2d-spine` (atlas, detection, JSON 2.x/3.x/4.x, binary 3.x and 4.0/4.1),
 `a2d-runtime` (transforms, timelines, skinning, deform, IK, transform constraints in all four
 modes, path constraints, mixing,
-idle), `a2d-pack`, `a2d-import` (generic + spine_bytes + unity_spine), `a2d-render` (wgpu, batching, blend
+idle), `a2d-pack`, `a2d-import` (generic + spine_bytes + unity_spine; `import` turns a Unity-packaged Spine bundle into a package), `a2d-render` (wgpu, batching, blend
 modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transparent frameless
 window — on Windows through a DirectComposition surface — drag, scale, click-through,
 always-on-top, tray, config persistence, frame pacing), `a2d-cli`.

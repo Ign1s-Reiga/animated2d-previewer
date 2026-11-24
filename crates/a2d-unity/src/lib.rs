@@ -31,6 +31,8 @@ pub mod curve;
 pub mod objects;
 pub mod reader;
 pub mod serialized;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod texture;
 
 pub use animation_clip::{AnimationClip, ClipEvent, DenseClip, GenericBinding, StreamedKey};
@@ -41,4 +43,4 @@ pub use curve::{AnimationCurve, Keyframe};
 pub use objects::{behaviour_body, behaviour_owner_name, Inventory, ObjectInfo, PPtr, ScriptInfo};
 pub use reader::{Endian, Reader};
 pub use serialized::{ClassId, SerializedFile};
-pub use texture::{read_textures, Texture, TextureFormat};
+pub use texture::{read_texture_object, read_textures, Texture, TextureFormat};

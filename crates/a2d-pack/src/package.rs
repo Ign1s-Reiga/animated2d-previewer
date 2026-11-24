@@ -174,6 +174,23 @@ impl Package {
         // touched, so a refused model leaves nothing behind.
         let manifest_json = self.manifest.to_json()?;
         let model_bytes = self.encode_model()?;
+        // File names too: a name that would escape `textures/` is refused here,
+        // before `manifest.json` and `model.bin` have been written, not after.
+        let texture_names =
+            self.textures.iter().map(|t| safe_file_name(&t.file)).collect::<Result<Vec<String>, DecodeError>>()?;
+        for entry in &self.manifest.textures {
+            safe_file_name(&entry.file)?;
+        }
+        // Names equal but for case are one file on Windows and macOS, so the
+        // second would overwrite the first.
+        let mut folded: Vec<String> = texture_names.iter().map(|n| n.to_lowercase()).collect();
+        folded.sort();
+        if let Some(pair) = folded.windows(2).find(|w| w[0] == w[1]) {
+            return Err(DecodeError::corrupt(format!(
+                "two texture files are named {:?} apart from case, which would be one file on some systems",
+                pair[0]
+            )));
+        }
 
         fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
         let manifest_path = dir.join("manifest.json");
@@ -184,9 +201,8 @@ impl Package {
         if !self.textures.is_empty() {
             let textures = dir.join("textures");
             fs::create_dir_all(&textures).map_err(|e| io(&textures, e))?;
-            for texture in &self.textures {
-                let name = safe_file_name(&texture.file)?;
-                let path = textures.join(&name);
+            for (texture, name) in self.textures.iter().zip(&texture_names) {
+                let path = textures.join(name);
                 fs::write(&path, &texture.bytes).map_err(|e| io(&path, e))?;
             }
         }
@@ -269,13 +285,24 @@ pub fn safe_file_name(name: &str) -> Result<String, DecodeError> {
         // Both separators are checked explicitly rather than via `Path`, whose
         // parsing is platform-dependent: a package written on Windows must not
         // become unsafe when read on Linux.
-        || trimmed.chars().any(|c| matches!(c, '/' | '\\' | ':' | '\0'));
+        || trimmed.chars().any(|c| matches!(c, '/' | '\\' | ':' | '?' | '*' | '<' | '>' | '|' | '"') || c.is_control())
+        // Windows drops a trailing dot, so the file would not be the one named.
+        || trimmed.ends_with('.')
+        || is_reserved_device_name(trimmed);
     if rejected {
         return Err(DecodeError::corrupt(format!("texture file name {name:?} is not a plain file name")));
     }
     Ok(trimmed.to_string())
 }
 
+/// Names Windows reserves for devices, with or without an extension.
+fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.chars().count() == 4
+            && matches!(stem.chars().nth(3), Some('1'..='9' | '¹' | '²' | '³')))
+}
 fn source_format_of(ir: &SpineIr) -> String {
     let version = &ir.metadata.source_version;
     let mut parts = version.split('.');
@@ -774,6 +801,62 @@ mod tests {
         assert!(package.manifest.textures[0].premultiplied_alpha);
     }
 
+    #[test]
+    fn names_windows_cannot_store_as_named_are_refused() {
+        for name in [
+            "a?.png",
+            "a*.png",
+            "a<b.png",
+            "a>b.png",
+            "a|b.png",
+            "a\"b.png",
+            "a\u{1}b.png",
+            "page.",
+            "CON",
+            "con.png",
+            "Nul.txt",
+            "AUX.png",
+            "PRN",
+            "COM1.png",
+            "lpt9",
+            "com5.tga",
+            "COM¹.png",
+            "lpt³",
+        ] {
+            assert!(safe_file_name(name).is_err(), "{name:?} should be refused");
+        }
+        for name in ["COM0.png", "COM10.png", "console.png", "auxiliary.png", "a.b.png", "hero_2.png"] {
+            assert!(safe_file_name(name).is_ok(), "{name:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn two_texture_names_equal_but_for_case_are_refused_before_anything_is_written() {
+        let dir = std::env::temp_dir().join(format!("a2d-pack-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut package = Package::from_spine(rich_ir(), "X");
+        package.textures.push(TextureFile { file: "Hero.png".into(), bytes: vec![1] });
+        package.textures.push(TextureFile { file: "hero.png".into(), bytes: vec![2] });
+        let err = package.write_to(&dir).unwrap_err();
+        assert!(err.to_string().contains("apart from case"), "{err}");
+        assert!(!dir.exists());
+    }
+    #[test]
+    fn a_texture_name_that_escapes_the_directory_leaves_nothing_on_disk() {
+        let dir = std::env::temp_dir().join(format!("a2d-pack-unsafe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut package = Package::from_spine(rich_ir(), "X");
+        package.textures.push(TextureFile { file: "images/page.png".into(), bytes: vec![1, 2, 3] });
+        let err = package.write_to(&dir).unwrap_err();
+        assert!(err.to_string().contains("not a plain file name"), "{err}");
+        assert!(!dir.exists(), "the refusal must come before anything is written");
+
+        // A bad name in the manifest alone is refused the same way.
+        let mut package = Package::from_spine(rich_ir(), "X");
+        package.manifest.textures[0].file = "..".into();
+        assert!(package.write_to(&dir).is_err());
+        assert!(!dir.exists());
+    }
     #[test]
     fn the_spine_manifest_default_follows_the_shared_rule() {
         for (names, want) in [(["attack", "stand"], "stand"), (["attack", "x_normal"], "x_normal")] {

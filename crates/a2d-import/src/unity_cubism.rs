@@ -42,6 +42,8 @@ use a2d_core::{DecodeError, Degradation, LoadReport};
 use a2d_pack::manifest::TextureEntry as PackTextureEntry;
 use a2d_pack::package::TextureFile;
 use a2d_pack::Package;
+
+use crate::png::encode_png;
 use a2d_unity::{
     animator_controller_pptr, behaviour_body, behaviour_owner_name, AnimationClip, AnimatorController, Bundle, ClassId,
     Inventory, ObjectInfo, PPtr, Reader, SerializedFile,
@@ -828,30 +830,6 @@ fn sanitize(name: &str, index: usize) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-/// Encodes decoded pixels as a PNG.
-fn encode_png(width: u32, height: u32, rgba: &[u8], label: &str) -> Result<Vec<u8>, DecodeError> {
-    let expected = width as usize * height as usize * 4;
-    if rgba.len() != expected {
-        return Err(DecodeError::corrupt(format!(
-            "texture {label} is {width}x{height} but carries {} bytes, not {expected}",
-            rgba.len()
-        )));
-    }
-    let mut out = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| DecodeError::corrupt(format!("could not start PNG for {label}: {e}")))?;
-        writer
-            .write_image_data(rgba)
-            .map_err(|e| DecodeError::corrupt(format!("could not encode PNG for {label}: {e}")))?;
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

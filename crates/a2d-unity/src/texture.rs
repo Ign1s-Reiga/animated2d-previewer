@@ -70,6 +70,22 @@ impl TextureFormat {
             TextureFormat::Rgba32 | TextureFormat::Bgra32 => w * h * 4,
         }
     }
+
+    /// Bytes of `levels` successive mip levels starting at `width` x `height`,
+    /// each half the last (never below 1x1), stopping early at 1x1.
+    fn mip_chain_size(self, width: u32, height: u32, levels: u32) -> u64 {
+        let (mut w, mut h) = (width, height);
+        let mut total = 0u64;
+        for _ in 0..levels {
+            total += self.encoded_size(w, h);
+            if w == 1 && h == 1 {
+                break;
+            }
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        total
+    }
 }
 
 /// A decoded texture page.
@@ -93,6 +109,19 @@ impl std::fmt::Debug for Texture {
             .field("rgba", &self.rgba.len())
             .finish()
     }
+}
+
+/// Reads and decodes the one `Texture2D` with this path id.
+///
+/// For callers that know which texture they need: an unrelated texture in a
+/// format not decoded here, or one streamed from a resource file, then costs
+/// nothing instead of failing the whole read.
+pub fn read_texture_object(file: &SerializedFile, path_id: i64) -> Result<Texture, DecodeError> {
+    let object = file
+        .find_object(path_id)
+        .filter(|o| o.class_id == ClassId::TEXTURE_2D)
+        .ok_or_else(|| DecodeError::corrupt(format!("no Texture2D with path id {path_id}")))?;
+    read_texture(file.object_data(object)?)
 }
 
 /// Reads and decodes every `Texture2D` in a serialized file.
@@ -119,7 +148,7 @@ fn read_texture(bytes: &[u8]) -> Result<Texture, DecodeError> {
     let complete_size = r.i32()?;
     let _mips_stripped = r.i32()?;
     let format_raw = r.i32()?;
-    let _mip_count = r.i32()?;
+    let mip_count = r.i32()?;
 
     if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
         return Err(DecodeError::corrupt(format!("texture {name:?} declares {width}x{height}")));
@@ -134,17 +163,24 @@ fn read_texture(bytes: &[u8]) -> Result<Texture, DecodeError> {
     })?;
 
     // The declared size must agree with the geometry, which is the check that
-    // the header was read correctly rather than merely plausibly.
-    let expected = format.encoded_size(width as u32, height as u32);
-    if expected != complete_size as u64 {
+    // the header was read correctly rather than merely plausibly. A payload may
+    // also carry the whole mip chain after the base level; that is accepted
+    // only when its size is the exact sum of the chain the header implies (or
+    // the full chain down to 1x1), and only level 0 is decoded.
+    let (w, h) = (width as u32, height as u32);
+    let base = format.encoded_size(w, h);
+    let declared = complete_size as u64;
+    let chain_ok = declared == format.mip_chain_size(w, h, mip_count.max(1) as u32)
+        || declared == format.mip_chain_size(w, h, u32::MAX);
+    if declared != base && !chain_ok {
         return Err(DecodeError::corrupt(format!(
-            "texture {name:?} is {width}x{height} in {format:?}, which needs {expected} bytes, \
-             but declares {complete_size}"
+            "texture {name:?} is {width}x{height} in {format:?}, which needs {base} bytes \
+             (or a whole mip chain of them), but declares {complete_size}"
         )));
     }
 
     let data = locate_image(bytes, complete_size as usize, &name)?;
-    let rgba = decode(format, width as u32, height as u32, data, &name)?;
+    let rgba = decode(format, w, h, &data[..base as usize], &name)?;
     Ok(Texture { name, width: width as u32, height: height as u32, format, rgba })
 }
 
@@ -415,5 +451,67 @@ mod tests {
         for cut in 0..80 {
             let _ = read_texture(&vec![0u8; cut]);
         }
+    }
+}
+
+#[cfg(test)]
+mod mip_tests {
+    use super::*;
+    use crate::testing::BundleBuilder;
+    use crate::{Bundle, SerializedFile};
+
+    fn read(builder: &BundleBuilder) -> Result<Vec<Texture>, DecodeError> {
+        let bytes = builder.build();
+        let bundle = Bundle::parse(&bytes).expect("bundle");
+        let node = bundle.nodes.iter().find(|n| n.is_serialized()).expect("node");
+        let file = SerializedFile::parse(bundle.node_data(node).expect("data")).expect("file");
+        read_textures(&file)
+    }
+
+    fn red_block() -> Vec<u8> {
+        let mut b = vec![0u8; 16];
+        b[0] = 255;
+        b[1] = 255;
+        b[8..10].copy_from_slice(&0xF800u16.to_le_bytes());
+        b[10..12].copy_from_slice(&0xF800u16.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn a_dxt5_payload_carrying_its_mip_chain_decodes_level_zero() {
+        // 8x8: four blocks, then 4x4, 2x2 and 1x1 at one block each.
+        let mut data = red_block().repeat(4);
+        data.extend_from_slice(&[0u8; 48]);
+        assert_eq!(TextureFormat::Dxt5.mip_chain_size(8, 8, 4), 112);
+        assert_eq!(data.len(), 112);
+        let textures = read(&BundleBuilder::new().texture_mips("t", 8, 8, 12, 4, &data)).expect("decodes");
+        assert_eq!((textures[0].width, textures[0].height), (8, 8));
+        assert!(textures[0].rgba.chunks_exact(4).all(|p| p == [255, 0, 0, 255]), "level 0 only");
+    }
+
+    #[test]
+    fn the_full_chain_is_accepted_when_the_header_counts_one_level() {
+        let mut data = red_block().repeat(4);
+        data.extend_from_slice(&[0u8; 48]);
+        assert!(read(&BundleBuilder::new().texture_mips("t", 8, 8, 12, 1, &data)).is_ok());
+    }
+
+    #[test]
+    fn an_uncompressed_payload_carrying_its_mip_chain_decodes_level_zero() {
+        // 2x2 RGBA32 then one 1x1 level: 16 + 4 bytes.
+        let mut data = [9u8, 8, 7, 255].repeat(4);
+        data.extend_from_slice(&[1, 2, 3, 4]);
+        let textures = read(&BundleBuilder::new().texture_mips("t", 2, 2, 4, 2, &data)).expect("decodes");
+        assert!(textures[0].rgba.chunks_exact(4).all(|p| p == [9, 8, 7, 255]));
+    }
+
+    #[test]
+    fn any_other_size_is_still_refused() {
+        // One byte more than the base level, and not a chain.
+        let err = read(&BundleBuilder::new().texture_mips("t", 2, 2, 4, 1, &[0u8; 17])).unwrap_err();
+        assert!(err.to_string().contains("declares 17"), "{err}");
+        // Neither the base level nor any chain.
+        let err = read(&BundleBuilder::new().texture_mips("t", 2, 2, 4, 3, &[0u8; 21])).unwrap_err();
+        assert!(err.to_string().contains("declares 21"), "{err}");
     }
 }
