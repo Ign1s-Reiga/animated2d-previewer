@@ -10,8 +10,14 @@
 //!
 //! The goal is `point - center`, per component (see [`LookRig`] for the space and
 //! the units). The point is the driven target with its z at `rest_target.2`, or
-//! the rest target when nothing drives the rig. A rig starts *at* its rest goal,
-//! so default playback has no ease-in; releasing the target eases back to it.
+//! the rest target when nothing drives the rig. A rig starts *at zero*, as the
+//! SDK's look controller starts its smoothed value, and eases to the goal with
+//! the smoothing below (about half a second at a damping of 0.15 s), so the
+//! first frames of playback carry no look offset. Releasing the target eases
+//! back to the rest goal. [`LookState::rest`] puts the position at the settled
+//! rest goal instead: the deterministic still pose (`pose_at`) uses it, because a
+//! pose must be a function of the timestamp alone and not of how long the model
+//! has been running.
 //!
 //! # The smoothing
 //!
@@ -103,7 +109,8 @@ pub(crate) struct LookState {
 }
 
 impl LookState {
-    /// The state for `rig` on a model with `parameters`, at rest; `None` for a
+    /// The state for `rig` on a model with `parameters`, with the smoothed
+    /// position at zero and still (it eases in from there); `None` for a
     /// rig that cannot be used with them (see [`LookRig::problem`]).
     pub fn new(rig: &LookRig, parameters: &[Parameter]) -> Option<LookState> {
         if rig.problem(parameters).is_some() {
@@ -117,7 +124,7 @@ impl LookState {
                 Some((index, axis_index(p.axis), p.factor))
             })
             .collect();
-        let mut state = LookState {
+        Some(LookState {
             blend: rig.blend,
             damping: rig.damping,
             rest_target: [rig.rest_target.0, rig.rest_target.1, rig.rest_target.2],
@@ -126,9 +133,7 @@ impl LookState {
             position: [0.0; 3],
             velocity: [0.0; 3],
             target: None,
-        };
-        state.rest();
-        Some(state)
+        })
     }
 
     /// Points the rig at `target`, or releases it. A target that is not finite
@@ -147,7 +152,8 @@ impl LookState {
         [point[0] - self.center[0], point[1] - self.center[1], point[2] - self.center[2]]
     }
 
-    /// Puts the position at the rest goal, still, and lets go of the target.
+    /// Puts the position at the settled rest goal, still, and lets go of the
+    /// target (not the load state: that is zero, see [`LookState::new`]).
     pub fn rest(&mut self) {
         self.target = None;
         self.velocity = [0.0; 3];
@@ -167,6 +173,11 @@ impl LookState {
     /// Writes the rig's parameters into `values`, each combined with what is
     /// there and then kept in its range the way a motion's output is: wrapped for
     /// a repeating parameter, clamped otherwise.
+    ///
+    /// The SDK generation these rigs come from adds without clamping at this
+    /// point. Whether the official Core clamps the value before deforming is not
+    /// established (it is closed source and `docs/cubism-moc3.md` only records that
+    /// *our* evaluation clamps), so the range is kept here as before.
     ///
     /// This reads what the motion (or idle) wrote this frame and is applied on
     /// top of it, so it must run on freshly written values, once per frame: the
@@ -326,10 +337,43 @@ mod tests {
     }
 
     #[test]
-    fn a_rig_starts_at_its_rest_goal_less_the_centre() {
-        let s =
+    fn a_rig_starts_at_zero_and_rest_puts_it_at_the_goal_less_the_centre() {
+        let mut s =
             LookState::new(&rig(LookBlend::Additive, (0.5, 0.25, 1.0), (0.1, 0.0, 0.5)), &params()).expect("usable");
+        assert_eq!(s.position(), [0.0; 3]);
+        // No contribution at t = 0: A = 0 * 10, B = 0 * 0.5 added to 2 and 0.8.
+        let p = params();
+        let mut values = vec![2.0, 0.8];
+        s.apply(&mut values, &p, &[false, false]);
+        assert_eq!(values, vec![2.0, 0.8]);
+        s.rest();
         assert_eq!(s.position(), [0.4, 0.25, 0.5]);
+    }
+
+    #[test]
+    fn the_ease_in_follows_smooth_damp_toward_the_rest_goal() {
+        // Goal x = 0.4 (rest 0.5 less centre 0.1), damping 0.15, dt 1/60:
+        // exp = 0.8009582, omega = 13.33333, x = 0.222222.
+        // Step 1: change -0.4, temp = -0.4 * 13.33333 / 60 = -0.0888889,
+        //   velocity = (0 + 0.0888889 * 13.33333) * exp = 0.949283,
+        //   position = 0.4 + (-0.4 - 0.0888889) * exp = 0.0084204.
+        // Step 2: change = -0.3915795, temp = (0.949283 - 5.221061) / 60 = -0.0711963,
+        //   position = 0.4 + (-0.3915795 - 0.0711963) * exp = 0.4 - 0.4627758 * 0.8009582 = 0.0293359.
+        let mut s =
+            LookState::new(&rig(LookBlend::Additive, (0.5, 0.0, 0.0), (0.1, 0.0, 0.0)), &params()).expect("usable");
+        s.advance(1.0 / 60.0);
+        close(s.position()[0], 0.008_420_4, 1e-5);
+        s.advance(1.0 / 60.0);
+        close(s.position()[0], 0.029_335_9, 1e-5);
+        // About half a second in, it is most of the way; much later, there.
+        for _ in 0..28 {
+            s.advance(1.0 / 60.0);
+        }
+        assert!(s.position()[0] > 0.35 && s.position()[0] < 0.4, "{}", s.position()[0]);
+        for _ in 0..600 {
+            s.advance(1.0 / 60.0);
+        }
+        close(s.position()[0], 0.4, 1e-4);
     }
 
     #[test]
@@ -350,7 +394,8 @@ mod tests {
     fn each_blend_combines_with_the_value_the_parameter_has() {
         let p = params();
         let at = |blend| {
-            let s = LookState::new(&rig(blend, (0.4, 0.0, 1.0), (0.0, 0.0, 0.0)), &p).expect("usable");
+            let mut s = LookState::new(&rig(blend, (0.4, 0.0, 1.0), (0.0, 0.0, 0.0)), &p).expect("usable");
+            s.rest();
             let mut values = vec![2.0, 0.8];
             s.apply(&mut values, &p, &[false, false]);
             values
@@ -370,7 +415,8 @@ mod tests {
     #[test]
     fn a_repeating_parameter_wraps_instead_of_clamping() {
         let p = params();
-        let s = LookState::new(&rig(LookBlend::Additive, (1.0, 0.0, 0.0), (0.0, 0.0, 0.0)), &p).expect("usable");
+        let mut s = LookState::new(&rig(LookBlend::Additive, (1.0, 0.0, 0.0), (0.0, 0.0, 0.0)), &p).expect("usable");
+        s.rest();
         let mut values = vec![25.0, 0.0];
         s.apply(&mut values, &p, &[true, false]);
         close(values[0], -25.0, 1e-4); // 35 on [-30, 30)
