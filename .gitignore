@@ -8,3 +8,6 @@ tests/fixtures/local/*
 
 # Imported packages are build output.
 *.a2dpack/
+
+# Characters for scripts/test_assets.py. Real assets stay local, never committed.
+/Test Assets/

@@ -22,6 +22,55 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Running the CLI over every local character
+
+`scripts/test_assets.py` (Python 3.10+, standard library only) runs `inspect`,
+`import` and `validate` on each character in a local, gitignored folder, one at a
+time, and prints a per-character result. It is a smoke test of the whole import
+path against real files, not a replacement for the committed tests.
+
+```bash
+python scripts/test_assets.py                       # builds the CLI, tests <repo>/Test Assets/
+python scripts/test_assets.py --only hero --render  # also render frames (needs a GPU)
+python scripts/test_assets.py --view 5              # open each one in the viewer for 5 s
+```
+
+**Folder layout.** Each direct child of the folder is one character: a file with no loose-set
+extension (a Unity AssetBundle), a directory (a `.skel.bytes` / `.atlas.txt` /
+`.png` set, or Spine JSON plus atlas), e.g. `Test Assets/hero/` or
+`Test Assets/some_bundle`; loose files sharing a stem (`hero.skel.bytes`,
+`hero.atlas.txt`, `hero.png`) are grouped into one character `hero` (stripping at most two of `bytes txt skel atlas json png webp jpg jpeg`, as the CLI does; extra atlas pages such as `hero2.png` are not attached, so put a multi-page character in a directory). Nothing is recursed into; hidden entries, `.gitkeep` and
+README files are skipped. The folder is `--assets <dir>`, else the
+`A2D_TEST_ASSETS` environment variable (so a large dump can be pointed at without
+its path entering the repository), else `<repo>/Test Assets/` (gitignored).
+
+**Options.**
+
+| Option | Meaning |
+| --- | --- |
+| `--only SUBSTR`, `--include GLOB`, `--exclude GLOB` | select by name; globs are case-insensitive and repeatable, e.g. `--include "live2d_*" --include "spine_*"` |
+| `--limit N` | stop after N selected entries (sorted, after filtering) |
+| `--skip-unrecognized` | an entry that is evidently not a character is `skipped`, not `failed`: `inspect` says a lone file or directory is not a Spine skeleton (a heuristic on CLI messages: a loose skeleton whose detection is ambiguous or corrupt currently surfaces the same way, a CLI gap, so check skipped logs when it matters), or reports `Importer: (undetermined)` (a Unity bundle with no Cubism model or Spine rig; import is then not run), or `import` finds neither |
+| `--game NAME` | pass `--game` to `inspect` and `import` |
+| `--render` | also `preview -o` (needs a GPU; a failure shows in the `render` column and exits 2) |
+| `--view SECONDS` | open each character in the real viewer (sequential; a failure or timeout shows in the `view` column and exits 2) |
+| `--jobs N` | characters in parallel for inspect/import/validate/render (default 1) |
+| `--timeout S` | per-step timeout, default 300 s |
+| `--bin PATH`, `--toolchain NAME` | use a built binary, or build with `cargo +NAME` |
+| `--out DIR` | parent folder for run output (default `<repo>/target/asset-test`); every run writes a fresh `<out>/<YYYYmmdd-HHMMSS>/` and nothing existing is deleted; refused if it is, contains or sits inside the assets folder |
+| `--keep-packages` | keep each `.a2dpack` (otherwise deleted once the character is done, after render and view) |
+| `--full-table` | list every character at the end (above 50 entries only non-ok ones are listed) |
+| `--allow-problems` | exit 0 when characters only have validation problems |
+
+**Output.** One progress line per character, a table and totals, step logs in
+`<run>/logs/<key>/<step>.log` (`<key>` is `<index>-<name>`, unique per entry and recorded in `summary.json`), and `<run>/summary.json` (`<run>` is the fresh per-run folder) with every entry (exit codes,
+durations, the problem and information lines). Status is `ok` (validate exit 0),
+`problems` (validate exit 1; the lines under `Problems:` and under `Recorded at import`
+are counted), `failed` (a step errored or timed out) or `skipped`.
+
+**Exit code.** A bad `--game`, a failed build or an unusable folder aborts with 2. 0 if every character is `ok` or `skipped`; 1 if any has problems but
+none failed (0 with `--allow-problems`); 2 if any failed.
+
 ## Kinds of test
 
 | Kind | Where | What it covers |

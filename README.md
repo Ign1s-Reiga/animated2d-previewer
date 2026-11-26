@@ -272,6 +272,10 @@ sha256sum -c SHA256SUMS --ignore-missing
 gitignore された `tests/fixtures/local/` などローカルに置き、リポジトリには合成または
 手書きの最小モデルと IR スナップショットだけを置きます。
 
+ローカルのキャラクターを 1 体ずつ `inspect` / `import` / `validate` にかけるには
+`python scripts/test_assets.py`（既定は gitignore 済みの `Test Assets/`、`A2D_TEST_ASSETS` や
+`--assets` で変更可。[`tests/README.md`](tests/README.md)）。
+
 ---
 
 ## やらないこと
