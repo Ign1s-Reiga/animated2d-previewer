@@ -1,37 +1,72 @@
 # Animated2D Desktop Viewer
 
-複数のゲームから抽出した 2D キャラクターアセットを、**元ゲームのランタイムに依存せず**再生する
-デスクトップビューア／ランタイム。
+ゲームから抽出した 2D キャラクターアセットを、**元ゲームのランタイムに依存せず**再生する
+デスクトップビューア／ランタイムです。目的はひとつ、**デスクトップでキャラクターを正しく
+再生すること**です。
 
-対応予定のソースエコシステム:
+対象のソースエコシステム:
 
-- **Live2D Cubism**（Cubism 3+ を優先、Cubism 2 は後回し）
+- **Live2D Cubism**（Cubism 3 以降。Cubism 2 は未対応）
 - **Spine**（複数の歴史的バージョン）
-- 上記を Unity パッケージ化したゲーム固有の変種
+- 上記を Unity の AssetBundle に同梱した変種
 
-インポータの初期対象は、Unity バンドルに同梱された Cubism モデル、`.skel.bytes` /
-`.atlas.txt` 形式で配布される Spine スケルトン、Unity バンドルに同梱された Spine リグ
-の 3 系統です。インポータは対象タイトル名ではなく、復元するアセットの形で命名します。
+インポータは対象タイトル名ではなく、復元するアセットの形で命名しています。
 
-> **ステータス: Phase 1 完了（Spine 経路・実アセットで検証済み）／Phase 2 一部完了／
-> Phase 5 調査完了／Phase 6 実装済み**
-> Spine アセットの検出・デコード・正規化・パッケージ化・アニメーション評価・GPU 描画・
-> 透過デスクトップウィンドウが動作します。`animated2d preview` でビューアが開きます。
-> Unity バンドル内の Spine リグ（`unity_spine`）を取り出してデコードできます。
-> Cubism モデルは MOC3 を独自実装で読み、ポーズ・クリッピング・描画順まで含めて
-> ビューアに表示でき、パッケージが持つモーションを再生します。
-> 詳細は下の「実装状況」を参照してください。
+| インポータ | 入力 |
+| --- | --- |
+| `unity_cubism` | Unity AssetBundle に同梱された Cubism モデル |
+| `spine_bytes` | `.skel.bytes` / `.atlas.txt` / `.png` で配布される Spine スケルトン |
+| `unity_spine` | Unity AssetBundle に同梱された Spine リグ（立ち絵・idle のみ） |
+| `generic` | 素の Spine JSON / バイナリ / atlas |
+
+---
+
+## 現在の状態
+
+Spine と Cubism の両方をインポートし、同じ透過デスクトップビューアで再生できます。
+
+- **Spine:** 3.8 バイナリは、Unity に同梱された実物のリグで検証済みです。IK /
+  transform / path の各コンストレイント、deform、描画順、クリッピング、ミキシング、
+  bounding box によるヒット判定を実装しています。
+- **Cubism:** MOC3 を独自に解析し（Cubism Core は使いません）、AnimationClip から復元した
+  モーション、物理演算、視線追従リグ、アニメーションする描画順、グルー、デフォーマの
+  不透明度を再生します。エモーションは元の AnimatorController の遷移どおり 1 回再生して
+  既定モーションへ戻ります。実在する 3 体のモデル（各フル版と軽量版）で確認しています。
+
+**未検証の点:**
+
+- Spine 4.0 / 4.1 バイナリデコーダは実物のエクスポートで検証していません。テストは
+  自前のフィクスチャライタとの往復のみで、デコーダとライタが互いに一致していることしか
+  示しません。そのためカウント値・文字列参照・ファイル終端を厳しく検証し、レイアウトが
+  違えば壊れた結果を返さず明確なエラーで落ちます。4.x は JSON 形式の利用を推奨します。
+- Spine の transform / path コンストレイントは、プロパティテストと手計算の幾何で
+  固めたもので、公式ランタイムとの比較はしていません。複数キャラクターで idle が正しく
+  再生されることの目視確認も完了していません。
+- Cubism の評価規則は手計算のテストと実モデルでの確認で固めたもので、公式ランタイムとの
+  比較はしていません。根拠と未確定事項は [`docs/cubism-moc3.md`](docs/cubism-moc3.md) に
+  記録しています。
+
+**既知の未対応:**
+
+- Spine: 2.x / 4.2 バイナリ。4.0 / 4.1 バイナリは読み込むたびに未検証である旨を報告します。
+- Cubism: 表情、ポーズ、パーツ不透明度カーブ、モデル単位のカーブ（不透明度・まばたき・
+  リップシンク）、複数テクスチャページ、ヒット判定、作者が設定したモーションのフェード
+  時間（クロスフェードはビューアの既定時間を使います。AnimatorController の遷移で既定
+  モーションへ戻る場合だけは元の時間を使います）。
+
+いずれも黙って捨てず、読み込み時に報告します。
 
 ---
 
 ## 設計の核
 
-**Spine → Cubism への直接変換は行いません。** 双方を別々の内部 IR に正規化し、
-上位の共通インターフェース（`AnimatedModel`）の裏に隠します。
+**Spine と Cubism を相互変換しません。** 双方を別々の内部 IR に正規化し、共通の
+インターフェース（`AnimatedModel`）の裏に隠します。モデルはレンダラ非依存の描画
+プリミティブ（`RenderMesh`）を出力し、レンダラはそれを描くだけです。
 
 ```text
 Game Asset Bundle / Extracted Files
-        ↓  importers/   ゲーム固有の探索・再構成のみ
+        ↓  importers/   アセットの探索と再構成のみ
 Source Format Detector
         ↓  formats/     バージョン別デコード → IR
 Spine Decoder | Cubism Decoder
@@ -45,40 +80,116 @@ Renderer
 Desktop Host
 ```
 
-守るべき不変条件は 2 つだけです。
+守る不変条件は 2 つです。
 
 1. **ゲーム固有の知識を `importers/` より下流に漏らさない**
 2. **ソースバージョン固有の知識を `formats/` より下流に漏らさない**
-
-レンダラがどのインポータ由来かを知る必要が出てきたら、設計が間違っています。
 
 ---
 
 ## クレート構成
 
-Rust の cargo workspace。レンダリングは `wgpu`、デスクトップシェルは `winit` + `tray-icon`。
+Rust の cargo workspace です。レンダリングは `wgpu`、デスクトップシェルは `winit` +
+`tray-icon` を使います。
 
 | クレート | 役割 |
 | --- | --- |
-| `a2d-core` | IR 型・数学・アニメーションデータモデル・エラー型・共通トレイト |
-| `a2d-spine` | Spine バージョン検出、v2/v3/v4 デコーダ、Generic Spine IR への正規化 |
-| `a2d-cubism` | moc3 / motion3 / physics / pose のデコードと正規化 |
-| `a2d-unity` | Unity serialized file / AssetBundle のオブジェクトグラフ読み取り |
-| `a2d-import` | generic / spine_bytes / unity_cubism / unity_spine の各インポータ |
-| `a2d-pack` | `.a2dpack` の読み書き、マニフェスト、決定論的シリアライズ |
-| `a2d-runtime` | スケルトン／パラメータ評価、タイムライン、コンストレイント、ミキシング |
-| `a2d-render` | wgpu デバイス、テクスチャキャッシュ、バッチング、クリッピング |
-| `a2d-desktop` | 透過ウィンドウ、ドラッグ、クリックスルー、トレイ、設定永続化 |
+| `a2d-core` | IR 型、数学、`AnimatedModel`、`RenderMesh`、エラー分類、`LoadReport` |
+| `a2d-spine` | atlas パーサ、内容ベースのバージョン検出、JSON（2.x / 3.x / 4.x）とバイナリ（3.x / 4.0・4.1）のデコーダ |
+| `a2d-cubism` | MOC3 の解析、キーフォーム補間、ワープ／回転デフォーマ、グルー、モーション、物理演算、視線追従 |
+| `a2d-unity` | UnityFS コンテナ、serialized file、オブジェクト目録、MonoBehaviour 本体、AnimationClip、AnimatorController、Transform 階層の読み取り |
+| `a2d-import` | `generic` / `spine_bytes` / `unity_cubism` / `unity_spine` の各インポータ |
+| `a2d-pack` | `.a2dpack` の読み書き、マニフェスト、決定論的シリアライズ、`validate` |
+| `a2d-runtime` | Spine のボーン変換、タイムライン、スキニング、コンストレイント、ミキシング、idle |
+| `a2d-render` | wgpu 描画、テクスチャキャッシュ、バッチング、ブレンドモード、ステンシルクリッピング、オフスクリーン描画 |
+| `a2d-desktop` | 透過フレームレスウィンドウ、ドラッグ、クリックスルー、最前面、トレイ、設定の永続化 |
 | `a2d-cli` | `animated2d` バイナリ |
 
-依存方向は一方通行です。`a2d-render` と `a2d-runtime` は `a2d-import` / `a2d-unity` に
+依存は一方向です。`a2d-render` と `a2d-runtime` は `a2d-import` や `a2d-unity` に
 依存できません。逆向きに必要になった型は `a2d-core` へ移します。
+
+---
+
+## CLI
+
+```bash
+animated2d inspect  <input>                  # 形式・バージョン・テクスチャ・アニメーション・未対応機能を表示
+animated2d import   <input> -o <out.a2dpack> # 正規化済みパッケージを作る
+animated2d validate <package.a2dpack>        # パッケージを検査する
+animated2d preview  <package.a2dpack>        # デスクトップビューアで開く
+animated2d preview  <package.a2dpack> -o <dir>  # 0.0 / 0.25 / 0.5 / 1.0 秒を PNG に描画
+```
+
+- `<input>` は単一のアセットでもディレクトリでも構いません。判定はファイルの内容で行い、
+  拡張子には頼りません。判定が曖昧なときは推測せずエラーにします。
+- `--game <name>` で使うインポータを指定できます（`generic` / `spine_bytes` /
+  `unity_cubism` / `unity_spine`）。`inspect` と `import` で使え、`preview` では
+  Unity バンドルを直接開くときだけ効きます。
+- `preview` に Unity バンドルを直接渡すと、パッケージを作らずにその場で開きます。
+- `preview -o` は GPU が必要です。各フレームのドローコール数・三角形数・フレーム
+  バッファのフィンガープリントを表示し、PNG を書き出します。
+- `preview` の `--exit-after <秒>` は手動終了と同じ経路でビューアを閉じます。計測は
+  ウィンドウが開いてから始まり、終了時に描画したフレーム数を表示します。`--hidden` は
+  ウィンドウを不可視で開きます。どちらもスクリプトやテスト向けです。
+
+### `validate`
+
+テクスチャ欠損、未解決のアタッチメントや参照、非対応のタイムライン・コンストレイント、
+不正なボーン親子やスロット参照、壊れた atlas 参照を検査します。インポート時に記録された
+内容もあわせて表示します。
+
+インポート時の記録は 2 種類に分かれます。
+
+- **情報:** 元のランタイムとまったく同じに再生されることを確認できたもの（何も捨てず、
+  近似もしていない）。表示はしますが、検査は失敗しません。
+- **問題:** それ以外のすべて。データを捨てた、近似した、あるいは元と同じだと確認できて
+  いないもの。1 件でもあれば終了コード 1 になります（パッケージを読み込めない場合は
+  別の終了コードです）。
+
+「情報」に分類するのは、元の挙動を検証できた場合だけです。
+
+---
+
+## ビューア
+
+| 操作 | 動作 |
+| --- | --- |
+| ドラッグ | キャラクターを移動 |
+| スクロール | 拡大縮小 |
+| `Space` | 一時停止／再開 |
+| `Tab` | 次のアニメーション |
+| `M` | 次のモデル |
+| `L` | マウスカーソルを目で追う（視線追従リグを持つ Cubism モデル） |
+| `T` | 最前面表示の切り替え |
+| `C` | クリックスルーの切り替え |
+| `F` | 左右反転 |
+| `R` | 位置とサイズをリセット |
+| `Esc` | 終了 |
+
+トレイメニューからは、モデルとアニメーションの選択、一時停止、最前面、クリックスルー、
+カーソル追従、位置とサイズのリセット、終了を操作できます。クリックスルー中はウィンドウが
+マウスを受け取らないため、トレイが唯一の操作手段になります（左右反転と拡大縮小は
+トレイにありません）。
+
+終了時に保存し、次回起動時に復元するもの:
+
+- ウィンドウの位置とサイズ、最前面・クリックスルー・カーソル追従の設定（すべてのモデル）
+- 選択中のモデルとアニメーション、拡大率、位置、左右反転（Spine のパッケージのみ。
+  Cubism のパッケージや直接開いた Unity バンドルは記憶しません）
+
+保存先は、Windows では `%APPDATA%\animated2d\config.json`、
+macOS では `~/Library/Application Support/animated2d/config.json`、それ以外では
+`$XDG_CONFIG_HOME/animated2d/config.json` です。環境変数 `A2D_CONFIG_DIR` で上書き
+できます。
+
+Windows では透過ウィンドウを DirectComposition 経由で描画します。表示には `--release`
+ビルドを推奨します（デバッグビルドでは CPU 側の評価が遅くなります）。
 
 ---
 
 ## 内部パッケージ形式 `.a2dpack`
 
-ビューアは生のゲームアセットを読みません。必ず正規化済みパッケージを読みます。
+ビューアは生のゲームアセットを読まず、必ず正規化済みパッケージを読みます。
 
 ```text
 character.a2dpack/
@@ -91,7 +202,7 @@ character.a2dpack/
 
 ```json
 {
-  "formatVersion": 2,
+  "formatVersion": 9,
   "modelType": "spine",
   "sourceGame": "spine_bytes",
   "sourceFormat": "spine-3.8",
@@ -102,129 +213,14 @@ character.a2dpack/
 }
 ```
 
-シリアライズは決定論的（フィールド順固定・マップはソート・浮動小数の書式固定）である必要が
-あります。ゴールデンテストがこれに依存します。
+シリアライズは決定論的です（フィールド順は固定、マップはソート、浮動小数の書式も固定）。
+レイアウトを変えるたびに `formatVersion` を上げ、ローダは古い版も読みます。
+インポート時の記録は、問題が `importWarnings`、情報が `importNotes` に入ります（空なら
+省略。`validate` を参照）。
 
 ---
 
-## ナイトリービルド
-
-`main` の最新コミットから自動ビルドされたバイナリを、`nightly` プレリリースとして
-公開しています。ビルドのたびに同じタグへ置き換えられるため、以下のリンクは常に
-最新版を指します。
-
-| プラットフォーム | ダウンロード |
-| --- | --- |
-| Windows (x86_64) | [`animated2d-x86_64-pc-windows-msvc.zip`](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/download/nightly/animated2d-x86_64-pc-windows-msvc.zip) |
-| Linux (x86_64) | [`animated2d-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/download/nightly/animated2d-x86_64-unknown-linux-gnu.tar.gz) |
-| macOS (Apple silicon) | [`animated2d-aarch64-apple-darwin.tar.gz`](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/download/nightly/animated2d-aarch64-apple-darwin.tar.gz) |
-
-一覧とリリースノートは [Releases](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/tag/nightly)、ビルドの実行ログは
-[Actions](https://github.com/Ign1s-Reiga/animated2d-previewer/actions/workflows/nightly.yml) にあります。
-チェックサムは同じリリースの `SHA256SUMS` で検証できます。
-
-```bash
-sha256sum -c SHA256SUMS --ignore-missing
-```
-
-**注意事項:**
-
-- **プレリリースです。** タグ付きの安定版ではなく、`main` の状態をそのまま反映します。
-- **署名していません。** Windows SmartScreen と macOS Gatekeeper の両方が警告します。
-  macOS では実行前に `xattr -d com.apple.quarantine animated2d` が必要です。
-- **CI にグラフィックスアダプタはありません。** GPU テストとウィンドウテストは自動的に
-  スキップされるため、ナイトリーが緑であることは「コードが通り、デコーダ・ランタイム・
-  パッケージングのテストが通った」ことを意味し、「描画が正しい」ことは意味しません。
-
-自分でビルドする場合は下の「開発環境」を参照してください。
-
----
-
-## CLI
-
-```bash
-animated2d inspect  <input>                  # ゲーム/形式/バージョン/テクスチャ/アニメ名/非対応機能
-animated2d import   <input> -o <out.a2dpack>
-animated2d validate <package>
-animated2d preview  <package> [--exit-after <秒>]   # ビューアで直接開く
-```
-
-`validate` のチェック項目: テクスチャ欠損 / 未解決アタッチメント / 非対応タイムライン /
-不正なボーン親子 / 不正なスロット参照 / 壊れた atlas 参照 / 非対応コンストレイント。
-
----
-
-## 実装状況
-
-| クレート | 状態 |
-| --- | --- |
-| `a2d-core` | **実装済み** — IR、数学、`AnimatedModel`、`RenderMesh`、エラー分類、`LoadReport` |
-| `a2d-spine` | **実装済み** — atlas パーサ、内容ベースのバージョン検出、JSON デコーダ（2.x/3.x/4.x 方言）、バイナリデコーダ（3.x / 4.0・4.1）、正規化 |
-| `a2d-runtime` | **実装済み（Spine）** — ボーン変換（全 5 継承モード）、タイムライン評価、スキニング、deform、IK（1/2 ボーン）、transform コンストレイント（world / local × absolute / relative の 4 モード）、path コンストレイント（Tangent / Chain / ChainScale、4 種の spacing モード）、トラック／キュー／クロスフェード、idle ロジック |
-| `a2d-pack` | **実装済み** — 決定論的な `model.bin`、`manifest.json`、`validate` |
-| `a2d-import` | **実装済み（generic / spine_bytes / unity_spine）＋ unity_cubism は調査まで** — 内容ベースの分類、アセット探索、サフィックス正規化 |
-| `a2d-cli` | **実装済み** — `inspect` / `import` / `validate` / `preview`（実描画・PNG 出力対応） |
-| `a2d-render` | **実装済み** — wgpu 描画、テクスチャキャッシュ、バッチング、4 ブレンドモード、ステンシルクリッピング、high-DPI、透過背景、オフスクリーン描画と読み戻し |
-| `a2d-desktop` | **実装済み** — 透過フレームレスウィンドウ、ドラッグ、スクロール拡縮、クリックスルー、最前面、トレイメニュー、モデル／アニメーション選択、設定永続化 |
-| `a2d-unity` | **実装済み（読み取り）** — UnityFS コンテナ、serialized file、オブジェクト目録。実バンドルで検証済み |
-| `a2d-cubism` | **一部実装** — MOC3 読み取り（ID / カウント / キャンバス / パラメータ範囲 / ドローアブルの UV・三角形 / キーフォーム / デフォーマ / 不透明度 / クリッピングマスク / ブレンドモード / パート / 描画順）。独自パーサ方針（Cubism Core は使いません）。ポーズ・クリッピング・描画順まで正しく描画でき、`AnimatedModel` としてビューアに表示できます。未対応：クロスフェード・パーツ不透明度カーブ、アニメーションする描画順、物理・ポーズ・表情。詳細は [`docs/cubism-moc3.md`](docs/cubism-moc3.md) |
-
-未対応の機能は黙って無視されるのではなく、`LoadReport` として `inspect` / `import` /
-`validate` に必ず出力されます。既知の未対応: Spine 2.x バイナリ、Spine 4.2 バイナリ。
-Spine のコンストレイントは IK / transform / path すべて実装済みです。
-
-**4.0 / 4.1 バイナリデコーダは実物のエクスポートで未検証です。** テストは自前のライタとの
-往復のみで、これはデコーダとライタが一致していることしか示しません（フィクスチャ自体が
-デコーダと同じレイアウト理解で書かれているためです）。そのため、カウント値・文字列参照・
-ファイル終端を厳しく検証し、レイアウトが違えば静かに壊れた結果を返すのではなく明確な
-エラーで落ちるようにしてあります。読み込み時には毎回その旨を警告します。実物の
-`.skel` を 1 つデコードして比較するまでは、4.x は JSON 形式の利用を推奨します。
-
-```bash
-animated2d preview character.a2dpack            # デスクトップビューアで開く
-animated2d preview character.a2dpack -o frames/ # オフスクリーン描画して PNG 出力
-```
-
-`-o` なしでは透過ウィンドウが開きます。`-o` を付けると `0.0s / 0.25s / 0.5s / 1.0s` を
-オフスクリーン描画し、ドローコール数・三角形数・フレームバッファのフィンガープリントを
-表示しつつ各フレームを PNG として書き出します。GPU が無い環境ではエラーになります
-（テストはスキップされます）。
-
-```bash
-animated2d preview character.a2dpack --exit-after 5   # 5 秒後に自動終了
-```
-
-`--exit-after <秒>` は終了操作（`Esc` / トレイ / 閉じるボタン）とまったく同じ経路で
-ビューアを閉じます。スクリーンショットの自動撮影や、終了時に設定が本当に保存されるかを
-確かめるスモークテストのための機能です。計測はウィンドウが開いてから始まります
-（デバイス生成に数秒かかることがあるため）。終了時には提示したフレーム数を表示するので、
-ウィンドウが実際に描画したかどうかを外から確認できます。
-
-### ビューアの操作
-
-| 操作 | 動作 |
-| --- | --- |
-| ドラッグ | キャラクターを移動 |
-| スクロール | 拡大縮小 |
-| `Space` | 一時停止／再開 |
-| `Tab` | 次のアニメーション |
-| `M` | 次のモデル |
-| `T` | 最前面表示の切り替え |
-| `C` | クリックスルーの切り替え |
-| `F` | 左右反転 |
-| `R` | 位置とサイズをリセット |
-| `Esc` | 終了 |
-
-すべてトレイメニューからも操作できます。クリックスルー中はウィンドウがマウスイベントを
-受け取らないため、トレイが唯一の操作手段になります。
-
-ウィンドウ位置・サイズ・選択中のモデルとアニメーション・拡大率は終了時に保存され、
-次回起動時に復元されます（Windows なら `%APPDATA%\animated2d\config.json`、macOS なら
-`~/Library/Application Support/animated2d/config.json`、それ以外は
-`$XDG_CONFIG_HOME/animated2d/config.json`）。環境変数 `A2D_CONFIG_DIR` を
-設定するとその場所を上書きできます。
-
-## 開発環境
+## ビルドと開発
 
 ```bash
 cargo build --workspace
@@ -233,75 +229,75 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-初期ターゲットプラットフォームは **Windows** です。WSL2 側でロジック・パーサ・
-ゴールデンテストを回し、ウィンドウ／トレイ／透過まわりは Windows ネイティブで確認する
-運用を想定しています。
+CI はプルリクエストと `main` への push ごとに、Linux で fmt・clippy・テスト、Windows で
+clippy を実行します。主なターゲットは **Windows** です。
+
+### ナイトリービルド
+
+`main` にコミットがあった日に毎晩ビルドしたバイナリを、`nightly` プレリリースとして公開して
+います。同じタグに上書きされるため、以下のリンクは常に最新版を指します。
+
+| プラットフォーム | ダウンロード |
+| --- | --- |
+| Windows (x86_64) | [`animated2d-x86_64-pc-windows-msvc.zip`](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/download/nightly/animated2d-x86_64-pc-windows-msvc.zip) |
+| Linux (x86_64) | [`animated2d-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/download/nightly/animated2d-x86_64-unknown-linux-gnu.tar.gz) |
+| macOS (Apple silicon) | [`animated2d-aarch64-apple-darwin.tar.gz`](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/download/nightly/animated2d-aarch64-apple-darwin.tar.gz) |
+
+一覧とリリースノートは [Releases](https://github.com/Ign1s-Reiga/animated2d-previewer/releases/tag/nightly)、
+ビルドログは [Actions](https://github.com/Ign1s-Reiga/animated2d-previewer/actions/workflows/nightly.yml)
+にあります。チェックサムは同じリリースの `SHA256SUMS` で検証できます。
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+- **プレリリースです。** タグ付きの安定版ではなく、`main` の状態をそのまま反映します。
+- **署名していません。** Windows SmartScreen と macOS Gatekeeper が警告を出します。
+  macOS では実行前に `xattr -d com.apple.quarantine animated2d` が必要です。
+- **公開前にフォーマット・lint・テストを通します。CI に GPU はありません。** GPU テストとウィンドウテストは自動でスキップされます。
+  ナイトリーが緑でも、描画が正しいことまでは保証しません。
 
 ---
 
-## テスト方針
+## テスト
 
 | 種別 | 内容 |
 | --- | --- |
-| ユニット | バイナリパーサ、バージョン検出、ボーン変換、ウェイトスキニング、補間、ベジェ、描画順、クリッピング、atlas パース、命名正規化 |
-| ゴールデン | `ソースアセット → インポータ → IR → 決定論的シリアライズ` をフィクスチャと比較 |
-| ビジュアル回帰 | `0.0s / 0.25s / 0.5s / 1.0s` の固定タイムスタンプで描画し、画像またはフレームバッファハッシュを許容誤差付きで比較 |
-| 実装間検証 | 公式 Spine / Cubism ランタイムや既存ビューアと同一タイムスタンプの見た目を比較 |
+| ユニット | バイナリパーサ、バージョン検出、ボーン変換、スキニング、補間、ベジェ、描画順、クリッピング、atlas、命名の正規化 |
+| ゴールデン | `ソースアセット → インポータ → IR → 決定論的シリアライズ` をコミット済みフィクスチャと比較 |
+| ビジュアル回帰 | `0.0s / 0.25s / 0.5s / 1.0s` で描画し、決定論性・時間による変化・描画範囲を検査（Spine・Cubism とも）。基準画像はコミットせず、`A2D_BASELINE_DIR` を設定したときだけ許容誤差付きで比較 |
+| 実アセット | `#[ignore]` 付きで、環境変数で指定したローカルの実アセットに対して実行（[`tests/README.md`](tests/README.md)） |
 
-微細な変形リグレッションを検出できるのはビジュアル回帰テストだけです。
-
-**アセットの取り扱い:** 抽出したゲームアセットと proprietary SDK バイナリはコミットしません。
-実アセットは gitignore された `tests/fixtures/local/` に置き、リポジトリには合成／手書きの
-最小モデルと IR スナップショットのみを置きます。
+抽出したゲームアセットと proprietary SDK バイナリはコミットしません。実アセットは
+gitignore された `tests/fixtures/local/` などローカルに置き、リポジトリには合成または
+手書きの最小モデルと IR スナップショットだけを置きます。
 
 ---
 
-## ロードマップ
+## やらないこと
 
-| Phase | 内容 | ゴール |
-| --- | --- | --- |
-| 1 | atlas パーサ、実ターゲット 1 バージョンの skeleton デコーダ、ボーン／スロット／region・mesh・weighted mesh、基本タイムライン、GPU 描画 | Spine キャラを 1 体正しく表示 |
-| 2 | deform / draw order / color / clipping / IK / transform constraint / ミキシング | 複数キャラの idle が正しく再生される |
-| 3 | Unity バンドル調査、MOC3 抽出、Texture2D 抽出、AnimationClip 復元、Cubism パッケージ生成 | サンプルの Cubism バンドルを表示し idle を再生 |
-| 4 | `GenericCubismModel : AnimatedModel` をビューアに統合 | 1 つのビューアで 2 系統のランタイム |
-| 5 | unity_spine インポータ（立ち絵のみ） | Unity 同梱の Spine キャラの idle を Generic Spine Runtime で表示 |
-| 6 | 透過ウィンドウ、ドラッグ、クリックスルー、トレイ、idle ロジック、設定永続化 | デスクトップマスコット化 |
-
-### MVP の完了条件
-
-1. `.skel.bytes` 形式の Spine キャラをインポートして表示できる
-2. Unity 同梱の Cubism モデルをインポートして表示できる
-3. 両方で idle アニメーションが動く
-4. 同一のデスクトップビューア UI から両方を開ける
-5. レンダラにゲーム固有の分岐が 1 つも無い
-6. ビューアが生アセットではなく正規化済みパッケージを読む
-7. パーサ／ランタイムの自動テストが通る
-8. 各ランタイムファミリに最低 1 つビジュアル回帰テストがある
-
----
-
-## やらないこと（初期バージョン）
-
-- Spine Editor / Cubism Editor との完全互換
+- Spine Editor / Cubism Editor との互換
 - モデルの編集・オーサリング
-- 独自形式から proprietary な Spine/Cubism プロジェクト形式への書き戻し
+- proprietary なプロジェクト形式への書き戻し
 - 戦闘固有の挙動、ゲームサーバのエミュレーション
-- Spine → Cubism の直接変換
+- Spine と Cubism の相互変換
 - 3D レンダリング
-- 基本表示ができる前に元エンジンの全機能を再現すること
 
 ---
 
-## 未決定事項
+## 設計上の決定
 
-- **Cubism Core の扱い**: 公式 Cubism Core はライセンス条件のある proprietary ネイティブ
-  ライブラリです。独自 MOC3 パーサを書くかどうかで `a2d-cubism` の設計が変わるため、
-  MOC3 まわりの実装前に方針を決める必要があります。
-- **デスクトップシェル**: 既定案は `winit` + `wgpu` + `tray-icon`（透過・クリックスルー・
-  最前面すべて可能で、wgpu サーフェスを直接持てる）。Next.js 製のコントロールパネルが
-  欲しい場合は Tauri v2 が代案ですが、WebView 下での wgpu 合成に手間がかかります。
-- **Unity デシリアライズ**: 既存クレートを使うか、`a2d-unity` に最小実装を書くか。
-  実バンドルで検証してから決めます。
+- **Cubism Core は使いません。** MOC3 は `a2d-cubism` が独自に解析します。プロジェクトを
+  再配布可能に保ち、proprietary バイナリに依存しないためです。
+- **Unity の読み取りは自前実装です。** `a2d-unity` が UnityFS と serialized file を
+  直接読みます。外部依存は LZ4 の展開（`lz4_flex`）だけです。
+- **デスクトップシェルは `winit` + `wgpu` + `tray-icon` です。**
+
+技術資料:
+[`docs/requirements.md`](docs/requirements.md)（仕様）、
+[`docs/cubism-moc3.md`](docs/cubism-moc3.md)、
+[`docs/cubism-physics.md`](docs/cubism-physics.md)、
+[`docs/unity-animator-controller.md`](docs/unity-animator-controller.md)。
 
 ---
 
