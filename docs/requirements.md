@@ -570,6 +570,14 @@ Validation must check:
 - malformed atlas references
 - unsupported constraints
 
+`validate` exits non-zero on any problem its checks find and on anything the importer recorded
+other than information. Information is opt-in: an entry counts as such (`importNotes` in the
+manifest, format 9 onward) only when the package plays as the source would, with nothing dropped
+or approximated, and it is printed without failing validation. Every other entry the importer
+recorded, notes about dropped data included, fails it. A package older than format 9 cannot tell
+the two apart, so `validate` treats its recorded entries as problems and says that a re-import
+would separate them.
+
 ### preview
 
 ```bash

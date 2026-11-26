@@ -82,6 +82,8 @@ pub(super) fn recover(
 ) -> Recovered {
     let label = controller.name.as_str();
     if controller.layers.is_empty() {
+        // A note, not information: with no default motion the viewer does not
+        // play nothing, it falls back to a motion chosen by name.
         report.note(format!("controller {label:?} has no layer; no default motion or handovers are recovered"));
         return Recovered::default();
     }
@@ -137,10 +139,14 @@ pub(super) fn recover(
                 }
             }
             Err(why) => {
-                report.note(format!("no default motion: the default state {} {why}", state_label(default_state)))
+                let line = format!("no default motion: the default state {} {why}", state_label(default_state));
+                // Always a note: with no default motion the viewer falls back to a
+                // motion chosen by name, so it does not play what the source plays.
+                report.note(line)
             }
         }
     } else {
+        // A note for the same reason: the viewer still picks something to play.
         report.note("no default motion: the controller has no default state");
     }
 
@@ -234,6 +240,9 @@ pub(super) fn recover(
         report.note(format!("controller {label:?}: {}", issues.join("; ")));
     }
     if !motionless.is_empty() {
+        // A note: such a state may still be reached (by another state's transition
+        // or an any-state transition), where the source would then play nothing,
+        // and nothing here shows it is unreachable.
         report.note(format!(
             "controller {label:?} has {} state(s) with no clip and no transition: {}",
             motionless.len(),
@@ -346,6 +355,7 @@ fn timing_problems(state: &State) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use a2d_core::Degradation;
     use a2d_unity::animator_controller::{
         BlendTree, BlendTreeNode, Condition, Layer, Selector, StateMachine, Transition,
     };
@@ -702,6 +712,68 @@ mod tests {
             let (r, text) = run(&pair(transition(0, 0.9, 0.25)), &clips);
             assert_eq!(r.default_motion, None);
             assert!(text.contains("no default motion") && text.contains(words), "{text}");
+        }
+    }
+
+    /// The entries a recovery reports, with whether each is information.
+    fn entries(c: &AnimatorController, clips: &[Result<ClipMotion, ClipGap>]) -> Vec<(bool, String)> {
+        let mut report = LoadReport::new();
+        recover(c, clips, &mut report);
+        report.warnings().iter().map(|d| (matches!(d, Degradation::Info(_)), d.to_string())).collect()
+    }
+
+    /// The one entry whose text contains `needle`, as `(is_info, text)`.
+    fn entry(entries: &[(bool, String)], needle: &str) -> (bool, String) {
+        let found: Vec<_> = entries.iter().filter(|(_, t)| t.contains(needle)).collect();
+        assert_eq!(found.len(), 1, "{needle:?} in {entries:?}");
+        found[0].clone()
+    }
+
+    #[test]
+    fn no_controller_entry_is_information_because_the_viewer_falls_back_to_a_motion_by_name() {
+        let two = motions(&[("Idle", 4.0), ("Wave", 2.0)]);
+        let one = motions(&[("Wave", 2.0)]);
+        let mut all: Vec<(bool, String)> = Vec::new();
+
+        // A default state with no clip, with and without a transition; several
+        // clips; a clip that could not be recovered.
+        let c = controller(vec![state(100, &[], vec![]), state(101, &[0], vec![transition(0, 0.9, 0.25)])], 1);
+        all.push(entry(&entries(&c, &one), "no default motion"));
+        let c = controller(vec![state(100, &[], vec![transition(1, 0.9, 0.25)]), state(101, &[0], vec![])], 1);
+        all.push(entry(&entries(&c, &one), "no default motion"));
+        let c = controller(vec![state(100, &[0, 1], vec![]), state(101, &[1], vec![])], 2);
+        all.push(entry(&entries(&c, &two), "no default motion"));
+        let mut gap = two.clone();
+        gap[0] = Err(ClipGap::NotConverted);
+        all.push(entry(&entries(&pair(transition(0, 0.9, 0.25)), &gap), "no default motion"));
+
+        // No layer, and no default state (a machine with no state at all; a
+        // default pointing past its states is an unresolved reference instead).
+        let mut c = pair(transition(0, 0.9, 0.25));
+        c.layers.clear();
+        all.push(entry(&entries(&c, &[]), "has no layer"));
+        let c = controller(vec![], 0);
+        all.push(entry(&entries(&c, &[]), "no default state"));
+
+        // States with no clip and no transition, which another state may reach.
+        let c = controller(
+            vec![state(100, &[0], vec![]), state(101, &[], vec![]), state(102, &[], vec![transition(0, 0.75, 0.25)])],
+            1,
+        );
+        let got = entries(&c, &motions(&[("Idle", 4.0)]));
+        all.push(entry(&got, "no clip and no transition"));
+        all.push(entry(&got, "plays no clip but has 1 transition"));
+
+        let mut c = pair(transition(0, 0.9, 0.25));
+        let layer = c.layers[0].clone();
+        c.layers.push(layer);
+        all.push(entry(&entries(&c, &two), "only the first is read"));
+        let mut c = pair(transition(0, 0.9, 0.25));
+        c.state_machines[0].states[1].transitions[0].destination = 9;
+        all.push(entry(&entries(&c, &two), "unresolved references"));
+
+        for (is_info, text) in &all {
+            assert!(!is_info, "must be a failing Note: {text}");
         }
     }
 

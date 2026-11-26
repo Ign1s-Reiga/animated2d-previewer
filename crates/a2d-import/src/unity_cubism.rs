@@ -395,7 +395,8 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
 }
 
 /// Copies the import report into the manifest, so `preview` and `validate`
-/// can show it after the bundle is gone.
+/// can show it after the bundle is gone. Notes and other degradations are kept
+/// apart; see [`crate::generic::record_report`].
 ///
 /// Unresolved motion and physics targets and repeat notes are left out: they are re-derived
 /// from the IR every time the package is opened and validated, so persisting
@@ -411,8 +412,7 @@ fn record_warnings(package: &mut Package, report: &LoadReport) {
         }
         _ => Vec::new(),
     };
-    package.manifest.import_warnings =
-        report.warnings().iter().filter(|w| !rederived.contains(w)).map(|w| w.to_string()).collect();
+    crate::generic::record_report(package, report.warnings().iter().filter(|w| !rederived.contains(w)));
 }
 
 /// The default motion and handovers of a bundle, found without assembling a
@@ -598,9 +598,9 @@ fn pick_among(all: &[i64], referenced: &[i64], foreign: &[String], report: &mut 
 /// a controller the source had switched off, a second controller (the first is
 /// used), and whatever conversion had to drop.
 ///
-/// A disabled controller (`m_Enabled` is 0) is not recovered: the source ran
-/// with no physics, and a viewer that swayed hair the original never swayed
-/// would be showing something else. The body is still decoded first, so a
+/// A disabled controller (`m_Enabled` is 0) is not recovered, on the assumption
+/// that the source ran with no physics (unverified: an older SDK may still run
+/// it), and it is reported as a failing note, not as information. The body is still decoded first, so a
 /// layout change is reported either way.
 fn recover_physics(file: &SerializedFile, inventory: &Inventory, report: &mut LoadReport) -> Option<Physics> {
     let mut controllers = inventory.by_script("CubismPhysicsController");
@@ -633,9 +633,12 @@ fn physics_if_enabled(
     report: &mut LoadReport,
 ) -> Option<Physics> {
     if enabled == Some(0) {
+        // A note, not information: an older SDK may still run a disabled controller
+        // through an update controller, so "disabled means no physics" is not
+        // established (docs/cubism-physics.md).
         report.note(format!(
-            "physics controller {label:?} is disabled in the source (m_Enabled is 0), which ran without physics; \
-             it is not recovered"
+            "physics controller {label:?} is disabled in the source (m_Enabled is 0); it is not recovered, \
+             assuming the source ran without physics"
         ));
         return None;
     }
@@ -761,6 +764,7 @@ fn clip_motions(
             return Vec::new();
         }
     };
+    let fades_may_be_authored = drivers::fades_may_be_authored(file, inventory);
     let script_class =
         |p: PPtr| p.is_local().then(|| inventory.script(p.path_id)).flatten().map(|s| s.class_name.clone());
 
@@ -773,7 +777,9 @@ fn clip_motions(
             .and_then(|object| AnimationClip::parse(file.object_data(object)?));
         match clip {
             Ok(clip) => {
-                if let Some(motion) = clip_motion::to_motion(&clip, &names, &script_class, report) {
+                if let Some(motion) =
+                    clip_motion::to_motion(&clip, &names, &script_class, fades_may_be_authored, report)
+                {
                     motions.push((info.path_id, motion));
                 }
             }
@@ -859,15 +865,18 @@ mod tests {
     }
 
     #[test]
-    fn report_warnings_are_recorded_in_the_manifest_in_order() {
+    fn only_information_is_recorded_as_a_note_and_everything_else_as_a_warning() {
         let mut package = cubism_package(Vec::new());
         let mut report = LoadReport::new();
-        report.note("a note");
+        report.info("an information line");
+        report.note("a note that may describe a loss");
         report.warn(Degradation::MissingReference { kind: "texture".into(), name: "any Texture2D".into() });
         record_warnings(&mut package, &report);
-        let expected: Vec<String> = report.warnings().iter().map(|w| w.to_string()).collect();
-        assert_eq!(package.manifest.import_warnings, expected);
-        assert_eq!(expected.len(), 2);
+        assert_eq!(package.manifest.import_notes, vec!["an information line".to_string()]);
+        assert_eq!(
+            package.manifest.import_warnings,
+            vec!["a note that may describe a loss".to_string(), "missing texture: any Texture2D".to_string()]
+        );
     }
 
     #[test]
@@ -885,10 +894,11 @@ mod tests {
         for d in ir.unresolved_motion_targets() {
             report.warn(d);
         }
-        report.note("kept");
+        report.info("kept");
         assert_eq!(report.len(), 2);
         record_warnings(&mut package, &report);
-        assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
+        assert_eq!(package.manifest.import_notes, vec!["kept".to_string()]);
+        assert!(package.manifest.import_warnings.is_empty(), "{:?}", package.manifest.import_warnings);
     }
 
     #[test]
@@ -913,9 +923,10 @@ mod tests {
             report.warn(d);
         }
         assert_eq!(report.len(), 1);
-        report.note("kept");
+        report.info("kept");
         record_warnings(&mut package, &report);
-        assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
+        assert_eq!(package.manifest.import_notes, vec!["kept".to_string()]);
+        assert!(package.manifest.import_warnings.is_empty(), "{:?}", package.manifest.import_warnings);
         // Validation derives the same note once, so import then validate shows it once.
         let a2d_pack::PackageModel::Cubism(ir) = &package.model else { panic!("cubism package expected") };
         let mut validated = LoadReport::new();
@@ -948,9 +959,10 @@ mod tests {
             report.warn(d);
         }
         assert_eq!(report.len(), 1);
-        report.note("kept");
+        report.info("kept");
         record_warnings(&mut package, &report);
-        assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
+        assert_eq!(package.manifest.import_notes, vec!["kept".to_string()]);
+        assert!(package.manifest.import_warnings.is_empty(), "{:?}", package.manifest.import_warnings);
         let a2d_pack::PackageModel::Cubism(ir) = &package.model else { panic!("cubism package expected") };
         let mut validated = LoadReport::new();
         a2d_pack::validate::validate_cubism(ir, a2d_pack::FORMAT_VERSION, &[], &mut validated);
@@ -1066,6 +1078,8 @@ mod tests {
         let mut report = LoadReport::new();
         assert!(physics_if_enabled(&rig, Some(0), "ctl", &mut report).is_none());
         assert!(report.to_string().contains("disabled in the source"), "{report}");
+        // Not verified to match the source, so it is a failing Note, never Info.
+        assert!(matches!(report.warnings()[0], Degradation::Note(_)), "{report}");
 
         for enabled in [Some(1), None] {
             let mut report = LoadReport::new();
@@ -1097,9 +1111,10 @@ mod tests {
         for d in unresolved {
             report.warn(d);
         }
-        report.note("kept");
+        report.info("kept");
         record_warnings(&mut package, &report);
-        assert_eq!(package.manifest.import_warnings, vec!["kept".to_string()]);
+        assert_eq!(package.manifest.import_notes, vec!["kept".to_string()]);
+        assert!(package.manifest.import_warnings.is_empty(), "{:?}", package.manifest.import_warnings);
         assert!(package.encode_model().is_ok());
     }
 

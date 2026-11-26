@@ -484,7 +484,7 @@ pub(crate) fn import_rig(rig: &SpineRig, report: &mut LoadReport) -> Result<Pack
             None => report.warn(Degradation::MissingReference { kind: "texture page".into(), name: page.clone() }),
         }
     }
-    package.manifest.import_warnings = report.warnings().iter().map(|w| w.to_string()).collect();
+    crate::generic::record_report(&mut package, report.warnings());
     Ok(package)
 }
 
@@ -547,6 +547,7 @@ mod tests {
         assert_eq!(package.textures[0].file, "hero.png");
         assert!(package.validate().is_empty(), "{:?}", package.validate());
         assert!(package.manifest.import_warnings.is_empty(), "{:?}", package.manifest.import_warnings);
+        assert!(package.manifest.import_notes.is_empty(), "{:?}", package.manifest.import_notes);
 
         // The package survives a trip through disk, which is what `preview` does.
         let dir = std::env::temp_dir().join(format!("a2d-unity-spine-{}", std::process::id()));
@@ -593,7 +594,11 @@ mod tests {
         let package = import_rig(&rigs[0], &mut report).expect("import");
         let warnings = notes(&report);
         assert!(warnings.iter().any(|w| w.contains("atlas") && w.contains("hero.atlas")), "{warnings:?}");
-        assert_eq!(package.manifest.import_warnings, warnings, "the bundle-level notes travel with the package");
+        let mut recorded = package.manifest.recorded_at_import();
+        let mut expected = warnings.clone();
+        recorded.sort();
+        expected.sort();
+        assert_eq!(recorded, expected, "the bundle-level entries travel with the package, in one field or the other");
     }
 
     #[test]
@@ -805,6 +810,7 @@ mod tests {
         let package = import_spine_bundle(&builder.build(), &mut report).expect("import");
         assert_eq!(package.textures.len(), 1);
         assert!(package.manifest.import_warnings.is_empty(), "{:?}", package.manifest.import_warnings);
+        assert!(package.manifest.import_notes.is_empty(), "{:?}", package.manifest.import_notes);
     }
 
     #[test]
@@ -816,7 +822,7 @@ mod tests {
         let mut report = LoadReport::new();
         let package = import_spine_bundle(&builder.build(), &mut report).expect("the rig still imports");
         assert!(package.textures.is_empty());
-        let text = package.manifest.import_warnings.join("\n");
+        let text = package.manifest.recorded_at_import().join("\n");
         assert!(text.contains("hero.png") && text.contains("could not be decoded") && text.contains("999"), "{text}");
         assert!(text.contains("texture page"), "the page is also reported missing: {text}");
     }

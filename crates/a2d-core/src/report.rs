@@ -22,7 +22,13 @@ pub enum Degradation {
     /// A field was present but held a value outside the range the format allows.
     ClampedValue { context: String, field: String, detail: String },
     /// Anything else worth telling the user, with no dedicated variant yet.
+    /// A `Note` may describe real loss, so it fails `validate` like the rest;
+    /// only [`Degradation::Info`] is exempt.
     Note(String),
+    /// The package plays as the source would: nothing was dropped or
+    /// approximated relative to the source. Recorded so the user knows how it
+    /// was reconstructed. The only variant that does not fail `validate`.
+    Info(String),
 }
 
 impl fmt::Display for Degradation {
@@ -44,7 +50,7 @@ impl fmt::Display for Degradation {
             Degradation::ClampedValue { context, field, detail } => {
                 write!(f, "clamped {field} in {context}: {detail}")
             }
-            Degradation::Note(msg) => f.write_str(msg),
+            Degradation::Note(msg) | Degradation::Info(msg) => f.write_str(msg),
         }
     }
 }
@@ -70,6 +76,11 @@ impl LoadReport {
 
     pub fn note(&mut self, message: impl Into<String>) {
         self.warn(Degradation::Note(message.into()));
+    }
+
+    /// Records something that loses nothing; see [`Degradation::Info`].
+    pub fn info(&mut self, message: impl Into<String>) {
+        self.warn(Degradation::Info(message.into()));
     }
 
     /// Folds another report into this one, preserving order and deduplicating.
@@ -151,5 +162,24 @@ mod tests {
         b.note("two");
         a.absorb(b);
         assert_eq!(a.len(), 2);
+    }
+
+    #[test]
+    fn info_displays_as_plain_text_and_deduplicates() {
+        let mut r = LoadReport::new();
+        r.info("recovered from clips");
+        r.info("recovered from clips");
+        r.note("recovered from clips");
+        // Same text, different meaning: a Note is not an Info.
+        assert_eq!(r.len(), 2);
+        assert_eq!(r.warnings()[0].to_string(), "recovered from clips");
+        assert_eq!(r.warnings()[0], Degradation::Info("recovered from clips".into()));
+        assert_ne!(r.warnings()[0], r.warnings()[1]);
+        assert_eq!(
+            r.to_string(),
+            "Loaded with warnings:
+- recovered from clips
+- recovered from clips"
+        );
     }
 }

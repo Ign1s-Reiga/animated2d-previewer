@@ -207,15 +207,28 @@ impl Package {
             }
         }
 
-        if !self.manifest.import_warnings.is_empty() {
+        if !self.manifest.import_warnings.is_empty() || !self.manifest.import_notes.is_empty() {
             let metadata = dir.join("metadata");
             fs::create_dir_all(&metadata).map_err(|e| io(&metadata, e))?;
             let report = metadata.join("import-report.txt");
-            let mut text = String::from("Loaded with warnings:\n");
-            for warning in &self.manifest.import_warnings {
-                text.push_str("- ");
-                text.push_str(warning);
+            let mut text = String::new();
+            for (heading, entries) in [
+                ("Loaded with warnings:", &self.manifest.import_warnings),
+                ("Information (nothing was dropped or approximated):", &self.manifest.import_notes),
+            ] {
+                if entries.is_empty() {
+                    continue;
+                }
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(heading);
                 text.push('\n');
+                for entry in entries {
+                    text.push_str("- ");
+                    text.push_str(entry);
+                    text.push('\n');
+                }
             }
             fs::write(&report, text).map_err(|e| io(&report, e))?;
         }
@@ -258,17 +271,40 @@ impl Package {
     }
 
     /// Checks the package for the problems spec §14 lists for `validate`.
+    ///
+    /// The report holds what these checks find in the package as it is now,
+    /// plus the entries of `manifest.import_warnings` (as `recorded at import:
+    /// ...`), because many import-time degradations leave no trace in the model
+    /// and cannot be re-derived here. An import warning whose text equals a
+    /// finding the checks produced is not repeated. `manifest.import_notes`
+    /// hold only information (the package plays as the source would) and are
+    /// not included, so they never fail validation.
+    ///
+    /// A package older than format 9 kept notes and warnings together in
+    /// `import_warnings`; it gets one extra note saying so.
     pub fn validate(&self) -> LoadReport {
-        let mut report = LoadReport::new();
-        for warning in &self.manifest.import_warnings {
-            report.note(format!("recorded at import: {warning}"));
-        }
+        let mut findings = LoadReport::new();
         match &self.model {
-            PackageModel::Spine(ir) => crate::validate::validate_spine(ir, &self.textures, &mut report),
+            PackageModel::Spine(ir) => crate::validate::validate_spine(ir, &self.textures, &mut findings),
             PackageModel::Cubism(ir) => {
-                crate::validate::validate_cubism(ir, self.manifest.format_version, &self.textures, &mut report)
+                crate::validate::validate_cubism(ir, self.manifest.format_version, &self.textures, &mut findings)
             }
         }
+        let derived: Vec<String> = findings.warnings().iter().map(|w| w.to_string()).collect();
+
+        let mut report = LoadReport::new();
+        for warning in &self.manifest.import_warnings {
+            if !derived.contains(warning) {
+                report.note(format!("recorded at import: {warning}"));
+            }
+        }
+        if self.manifest.format_version < 9 && !self.manifest.import_warnings.is_empty() {
+            report.note(
+                "this package predates classified import notes (format 9): some of the entries recorded at import \
+                 may only be information; re-import the source to separate them",
+            );
+        }
+        report.absorb(findings);
         report
     }
 }
@@ -699,8 +735,8 @@ mod tests {
     #[test]
     fn writers_always_write_the_current_version() {
         let bytes = Package::from_spine(rich_ir(), "Hero").encode_model().unwrap();
-        assert_eq!(FORMAT_VERSION, 8);
-        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 8);
+        assert_eq!(FORMAT_VERSION, 9);
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 9);
     }
 
     #[test]
@@ -893,5 +929,65 @@ mod tests {
     fn windows_style_paths_are_refused() {
         assert!(safe_file_name("..\\secret").is_err());
         assert!(safe_file_name("dir\\file.png").is_err());
+    }
+
+    /// A package whose checks find nothing.
+    fn healthy_package() -> Package {
+        let package = Package::from_spine(SpineIr::default(), "Hero");
+        assert!(package.validate().is_empty(), "{}", package.validate());
+        package
+    }
+
+    /// A package with one defect the checks themselves find.
+    fn defective_package() -> Package {
+        let mut ir = SpineIr::default();
+        ir.atlas.pages.push(AtlasPage { size: Some((64, 64)), ..AtlasPage::new("hero.png") });
+        let package = Package::from_spine(ir, "Hero");
+        assert!(!package.validate().is_empty());
+        package
+    }
+
+    #[test]
+    fn import_notes_never_fail_validation() {
+        let mut package = healthy_package();
+        package.manifest.import_notes = vec!["motions were recovered from clips".into()];
+        assert!(package.validate().is_empty(), "{}", package.validate());
+    }
+
+    #[test]
+    fn an_import_warning_fails_validation_even_when_the_model_shows_no_trace() {
+        let mut package = healthy_package();
+        package.manifest.import_warnings = vec!["ik constraint \"reach\" unsupported".into()];
+        let report = package.validate();
+        assert!(!report.is_empty());
+        assert!(report.to_string().contains("recorded at import: ik constraint \"reach\" unsupported"), "{report}");
+    }
+
+    #[test]
+    fn an_import_warning_the_checks_rederive_is_listed_once() {
+        let mut package = defective_package();
+        let derived: Vec<String> = package.validate().warnings().iter().map(|w| w.to_string()).collect();
+        package.manifest.import_warnings = derived.clone();
+        let report = package.validate();
+        assert_eq!(report.len(), derived.len(), "{report}");
+        assert!(!report.to_string().contains("recorded at import"), "{report}");
+    }
+
+    #[test]
+    fn a_package_older_than_format_9_with_import_warnings_gets_the_hint() {
+        let mut package = healthy_package();
+        package.manifest.import_warnings = vec!["something the importer said".into()];
+        package.manifest.format_version = 8;
+        let text = package.validate().to_string();
+        assert!(text.contains("predates classified import notes"), "{text}");
+        assert!(text.contains("recorded at import: something the importer said"), "{text}");
+
+        package.manifest.format_version = FORMAT_VERSION;
+        assert!(!package.validate().to_string().contains("predates classified import notes"));
+
+        // Nothing recorded, nothing to say.
+        package.manifest.format_version = 8;
+        package.manifest.import_warnings.clear();
+        assert!(package.validate().is_empty());
     }
 }

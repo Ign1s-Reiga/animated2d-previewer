@@ -76,8 +76,9 @@ fn recovered_physics_survives_a_package_byte_for_byte_and_validates() {
     assert_eq!(back.physics, model(&package).physics);
     assert_eq!(Package::from_cubism(back, "x", "y").encode_model().expect("re-encode"), first);
 
-    // Expected: notes recorded at import and the repeat notes `validate`
-    // re-derives for inferred looping parameters. Anything else is a real problem.
+    // Expected: entries recorded at import (informational notes never reach
+    // `validate`) and the repeat notes `validate` re-derives for inferred looping
+    // parameters. Anything else is a real problem.
     let problems = support::unexpected_validate_warnings(&package);
     assert!(problems.is_empty(), "validate reported: {problems:#?}");
 }

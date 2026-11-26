@@ -57,7 +57,7 @@ fn a_real_bundle_gives_a_default_motion_and_a_handover_back_to_it_for_every_othe
     let text = loaded.to_string();
     assert!(!text.contains("does not apply them yet"), "{text}");
     assert!(
-        !package.manifest.import_warnings.iter().any(|w| w.contains("does not apply them yet")),
+        !package.manifest.recorded_at_import().iter().any(|w| w.contains("does not apply them yet")),
         "the stale note must not appear in the manifest"
     );
     println!("import notes:\n{report}\nload notes:\n{text}");

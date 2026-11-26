@@ -49,6 +49,14 @@
 //! out too. The controller's own position, rotation and scale are all excluded
 //! from the goal (it is measured in that space, not through it).
 //!
+//! # Why the recovered rig is reported as a failing note
+//!
+//! Whether the rest target matches what the source computes depends on the
+//! target's script (only the stock target returns its transform's position) and
+//! on active state (the target's `m_Enabled`, its GameObject's `m_IsActive` and
+//! its ancestors'), and none of that is verified here. The import therefore
+//! reports the rig as a note, never as information, so it fails `validate`.
+//!
 //! # Center
 //!
 //! A null `Center` is zero in the SDK's current source (`centerPosition =

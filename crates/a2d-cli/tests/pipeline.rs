@@ -81,7 +81,8 @@ fn import_writes_a_package_that_validates_cleanly() {
 
     let text = capture(|out| a2d_cli::validate(out, &package_dir).map(|_| ()).map_err(|e| e.to_string()));
     assert!(text.contains("textures:      1/1"), "{text}");
-    assert!(text.contains("Loaded cleanly."), "{text}");
+    assert!(text.contains("No problems found."), "{text}");
+    assert!(!text.contains("Recorded at import"), "a clean import has no notes to list: {text}");
 }
 
 #[test]
@@ -94,7 +95,7 @@ fn the_manifest_matches_its_committed_golden() {
     let actual = std::fs::read_to_string(package_dir.join("manifest.json")).unwrap();
     let expected = "\
 {
-  \"formatVersion\": 8,
+  \"formatVersion\": 9,
   \"modelType\": \"spine\",
   \"sourceGame\": \"generic\",
   \"sourceFormat\": \"spine-3.8\",
@@ -243,6 +244,151 @@ fn validate_reports_a_package_with_warnings_via_its_return_value() {
     assert!(!clean, "a package with a missing texture should not report clean");
 }
 
+const IMPORT_NOTE_A: &str = "motions were recovered from clips without fade data";
+const IMPORT_NOTE_B: &str = "look-at rig recovered from the prefab";
+/// A degradation that is not a note and that leaves no trace in the model.
+const IMPORT_WARNING: &str = "sequence timeline unsupported in animation \"idle\"";
+
+/// What to record in the manifest of an imported fixture package.
+struct Recorded {
+    notes: Vec<&'static str>,
+    warnings: Vec<&'static str>,
+    with_texture: bool,
+    format_version: Option<u32>,
+}
+
+/// Imports the synthetic Spine fixture and rewrites the package with the given
+/// entries recorded in its manifest.
+fn package_with_recorded(label: &str, recorded: Recorded) -> (TempDir, std::path::PathBuf) {
+    let dir = temp_dir(label);
+    let mut fixture = Fixture::spine_json();
+    if !recorded.with_texture {
+        fixture.texture = None;
+    }
+    fixture.write_to(dir.path());
+    let package_dir = dir.path().join("hero.a2dpack");
+    capture(|out| a2d_cli::import(out, dir.path(), &package_dir, None).map_err(|e| e.to_string()));
+
+    let mut package = a2d_pack::Package::read_from(&package_dir).expect("the package should read");
+    package.manifest.import_notes = recorded.notes.iter().map(|s| s.to_string()).collect();
+    package.manifest.import_warnings = recorded.warnings.iter().map(|s| s.to_string()).collect();
+    if let Some(version) = recorded.format_version {
+        package.manifest.format_version = version;
+    }
+    std::fs::remove_dir_all(&package_dir).expect("the old package should be removable");
+    package.write_to(&package_dir).expect("the package should write");
+    (dir, package_dir)
+}
+
+#[test]
+fn import_notes_are_information_and_do_not_fail_validate() {
+    let recorded = Recorded {
+        notes: vec![IMPORT_NOTE_A, IMPORT_NOTE_B],
+        warnings: vec![],
+        with_texture: true,
+        format_version: None,
+    };
+    let (_dir, package_dir) = package_with_recorded("validate-notes", recorded);
+
+    let mut out = Vec::new();
+    let clean = a2d_cli::validate(&mut out, &package_dir).expect("validate should run");
+    let text = String::from_utf8(out).expect("UTF-8");
+    assert!(clean, "{text}");
+    assert!(text.contains("Recorded at import (information, does not fail validation):"), "{text}");
+    assert!(text.contains(&format!("- {IMPORT_NOTE_A}")), "{text}");
+    assert!(text.contains(&format!("- {IMPORT_NOTE_B}")), "{text}");
+    assert!(text.contains("No problems found."), "{text}");
+    assert!(!text.contains("Problems:"), "{text}");
+
+    let (code, text) = validate_exit_code(&package_dir);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains(IMPORT_NOTE_A) && text.contains(IMPORT_NOTE_B), "{text}");
+}
+
+#[test]
+fn an_import_warning_with_no_trace_in_the_model_still_fails_validate() {
+    let recorded = Recorded { notes: vec![], warnings: vec![IMPORT_WARNING], with_texture: true, format_version: None };
+    let (_dir, package_dir) = package_with_recorded("validate-warning", recorded);
+
+    let (code, text) = validate_exit_code(&package_dir);
+    assert_eq!(code, Some(1), "{text}");
+    let problems = text.split("Problems:").nth(1).expect("a Problems section");
+    assert!(problems.contains(&format!("recorded at import: {IMPORT_WARNING}")), "{text}");
+    assert!(!text.contains("Recorded at import (information"), "no notes were recorded: {text}");
+}
+
+#[test]
+fn import_notes_do_not_hide_a_real_problem_and_stay_out_of_the_problems() {
+    let recorded = Recorded { notes: vec![IMPORT_NOTE_A], warnings: vec![], with_texture: false, format_version: None };
+    let (_dir, package_dir) = package_with_recorded("validate-notes-problem", recorded);
+
+    let (code, text) = validate_exit_code(&package_dir);
+    assert_eq!(code, Some(1), "{text}");
+    let (info, problems) = text.split_once("Problems:").expect("a Problems section");
+    assert!(info.contains("Recorded at import (information, does not fail validation):"), "{text}");
+    assert!(info.contains(&format!("- {IMPORT_NOTE_A}")), "{text}");
+    assert!(problems.contains("texture page"), "{text}");
+    assert!(!problems.contains(IMPORT_NOTE_A), "a note is not a problem: {text}");
+    assert!(!text.contains("No problems found."), "{text}");
+}
+
+#[test]
+fn data_dropped_by_a_real_decoder_is_a_failing_import_warning_not_information() {
+    // A top-level key the decoder does not know (a newer exporter's `physics`
+    // constraints, say) is dropped, and the dropped data leaves nothing in the
+    // model for `validate` to find. It must still fail validation.
+    let dir = temp_dir("validate-unknown-key");
+    let mut fixture = Fixture::spine_json();
+    assert!(fixture.skeleton.trim_start().starts_with('{'));
+    fixture.skeleton = fixture.skeleton.replacen('{', "{ \"physics\": [],", 1);
+    fixture.write_to(dir.path());
+    let package_dir = dir.path().join("hero.a2dpack");
+    let text = capture(|out| a2d_cli::import(out, dir.path(), &package_dir, None).map_err(|e| e.to_string()));
+    assert!(text.contains("ignored unknown key `physics`"), "{text}");
+
+    let package = a2d_pack::Package::read_from(&package_dir).expect("the package should read");
+    assert!(package.manifest.import_notes.is_empty(), "nothing here is information: {:?}", package.manifest);
+    assert!(
+        package.manifest.import_warnings.iter().any(|w| w.contains("physics")),
+        "{:?}",
+        package.manifest.import_warnings
+    );
+
+    let (code, text) = validate_exit_code(&package_dir);
+    assert_eq!(code, Some(1), "{text}");
+    let problems = text.split("Problems:").nth(1).expect("a Problems section");
+    assert!(problems.contains("recorded at import:") && problems.contains("physics"), "{text}");
+}
+
+#[test]
+fn a_defect_recorded_at_import_and_found_again_is_listed_once() {
+    // The importer records the missing page, and `validate` finds it too.
+    let dir = temp_dir("validate-dedup");
+    let mut fixture = Fixture::spine_json();
+    fixture.texture = None;
+    fixture.write_to(dir.path());
+    let package_dir = dir.path().join("hero.a2dpack");
+    capture(|out| a2d_cli::import(out, dir.path(), &package_dir, None).map_err(|e| e.to_string()));
+    let package = a2d_pack::Package::read_from(&package_dir).expect("the package should read");
+    assert!(!package.manifest.import_warnings.is_empty(), "the import should have recorded the missing page");
+
+    let (code, text) = validate_exit_code(&package_dir);
+    assert_eq!(code, Some(1), "{text}");
+    assert_eq!(text.matches("hero.png").count(), 1, "the missing page is listed once: {text}");
+}
+
+#[test]
+fn a_package_older_than_format_9_with_import_warnings_gets_a_hint() {
+    let recorded =
+        Recorded { notes: vec![], warnings: vec![IMPORT_NOTE_A], with_texture: true, format_version: Some(8) };
+    let (_dir, package_dir) = package_with_recorded("validate-old-format", recorded);
+
+    let (code, text) = validate_exit_code(&package_dir);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains(&format!("recorded at import: {IMPORT_NOTE_A}")), "{text}");
+    assert!(text.contains("predates classified import notes"), "{text}");
+}
+
 /// A Spine 3.8 skeleton using what the runtime evaluates but `validate` once
 /// called unsupported: a path constraint with all three path timelines,
 /// transform constraints in local and relative mode, and an empty animation.
@@ -327,7 +473,7 @@ fn supported_constraints_and_an_empty_animation_validate_with_exit_code_zero() {
     }
 
     let text = capture(|out| a2d_cli::validate(out, &package_dir).map(|_| ()).map_err(|e| e.to_string()));
-    assert!(text.contains("Loaded cleanly."), "{text}");
+    assert!(text.contains("No problems found."), "{text}");
     assert!(!text.contains("unsupported"), "{text}");
     assert!(!text.contains("clamped"), "an empty animation clamps nothing: {text}");
     // The empty animation is still mentioned, as information.

@@ -97,6 +97,10 @@ fn the_look_rig_is_noted_with_its_parameters_and_absent_drivers_are_not() {
         }
         _ => panic!("more than one hit area note: {notes:?}"),
     }
-    // The notes are persisted, so `validate` and `preview` show them after the bundle is gone.
-    assert!(package.manifest.import_warnings.iter().any(|w| w.starts_with("look-at rig")));
+    // The note is persisted, so `validate` and `preview` show it after the bundle is gone. It is
+    // information only for the rig shape whose reconstruction is verified; any other shape keeps it
+    // a warning. Either way it is recorded exactly once.
+    let in_notes = package.manifest.import_notes.iter().filter(|w| w.starts_with("look-at rig")).count();
+    let in_warnings = package.manifest.import_warnings.iter().filter(|w| w.starts_with("look-at rig")).count();
+    assert_eq!(in_notes + in_warnings, 1, "{:?}", package.manifest.recorded_at_import());
 }

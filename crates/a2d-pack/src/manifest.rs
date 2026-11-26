@@ -23,7 +23,11 @@ use serde::{Deserialize, Serialize};
 /// * 7 -- Cubism `model.bin` gains its default motion and handovers. Spine is
 ///   unchanged.
 /// * 8 -- Cubism `model.bin` gains its optional look rig. Spine is unchanged.
-pub const FORMAT_VERSION: u32 = 8;
+/// * 9 -- the manifest splits the import report: `importNotes` holds the
+///   informational notes and `importWarnings` only the other degradations.
+///   `model.bin` is unchanged. Older manifests keep everything in
+///   `importWarnings`, unclassified.
+pub const FORMAT_VERSION: u32 = 9;
 
 /// Which runtime family loads this package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,10 +87,21 @@ pub struct Manifest {
     pub default_animation: Option<String>,
     pub textures: Vec<TextureEntry>,
     pub animations: Vec<AnimationEntry>,
-    /// Degradations recorded at import time, preserved so `validate` can repeat
-    /// them without re-reading the original assets.
+    /// Degradations the importer recorded that are anything but information
+    /// (unsupported or missing data, clamped values, and notes about data
+    /// dropped or approximated), preserved so `preview` and `validate` can
+    /// repeat them without re-reading the original assets. Many leave no trace
+    /// in the model, so `validate` cannot re-derive them: they fail validation.
+    /// In a package older than format 9 this field holds every recorded entry,
+    /// information included, because the two were not told apart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub import_warnings: Vec<String>,
+    /// Information the importer recorded (format 9 onward): how the package was
+    /// reconstructed, where it plays as the source would, with nothing dropped
+    /// or approximated. `preview` and `validate` print them, and they never
+    /// fail validation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_notes: Vec<String>,
 }
 
 impl Manifest {
@@ -101,7 +116,14 @@ impl Manifest {
             textures: Vec::new(),
             animations: Vec::new(),
             import_warnings: Vec::new(),
+            import_notes: Vec::new(),
         }
+    }
+
+    /// Everything the importer recorded, warnings first and then notes, for the
+    /// surfaces (`preview`) that show both without caring which is which.
+    pub fn recorded_at_import(&self) -> Vec<String> {
+        self.import_warnings.iter().chain(&self.import_notes).cloned().collect()
     }
 
     /// Serialises to deterministic pretty JSON with a trailing newline.
@@ -162,6 +184,7 @@ mod tests {
                 AnimationEntry { name: "walk".into(), duration: 0.8 },
             ],
             import_warnings: vec!["path constraint unsupported".into()],
+            import_notes: vec!["motions were recovered from clips".into()],
         }
     }
 
@@ -217,6 +240,7 @@ mod tests {
         let json = m.to_json().unwrap();
         assert!(!json.contains("defaultAnimation"), "{json}");
         assert!(!json.contains("importWarnings"), "{json}");
+        assert!(!json.contains("importNotes"), "{json}");
         assert!(!json.contains("\"size\""), "{json}");
     }
 
@@ -263,6 +287,26 @@ mod tests {
         assert_eq!(m.model_type, ModelType::Cubism);
         assert_eq!(m.default_animation, None);
         assert!(m.import_warnings.is_empty());
+    }
+
+    #[test]
+    fn import_notes_round_trip_under_their_own_key() {
+        let m = sample();
+        let json = m.to_json().unwrap();
+        assert!(json.contains("\"importNotes\""), "{json}");
+        let back = Manifest::from_json(&json).unwrap();
+        assert_eq!(back.import_notes, vec!["motions were recovered from clips".to_string()]);
+        assert_eq!(back.import_warnings, vec!["path constraint unsupported".to_string()]);
+    }
+
+    #[test]
+    fn a_format_8_manifest_without_import_notes_still_loads() {
+        let json = r#"{"formatVersion":8,"modelType":"spine","sourceGame":"x","sourceFormat":"spine-3.8",
+                       "displayName":"X","textures":[],"animations":[],"importWarnings":["something"]}"#;
+        let m = Manifest::from_json(json).unwrap();
+        assert_eq!(m.format_version, 8);
+        assert!(m.import_notes.is_empty());
+        assert_eq!(m.import_warnings, vec!["something".to_string()]);
     }
 
     #[test]
