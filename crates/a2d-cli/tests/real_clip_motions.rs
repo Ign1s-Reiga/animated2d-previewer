@@ -76,6 +76,20 @@ fn clips_become_motions_that_target_real_parameters_and_survive_a_package() {
         assert!(!ir.motions.is_empty());
     }
 
+    // A binding that matches no parameter is information only when its path
+    // names no object of the prefab (the source's Animator binds nothing for
+    // it); one that names a real object would still fail `validate` below.
+    let absent = report
+        .warnings()
+        .iter()
+        .filter(|w| matches!(w, a2d_core::Degradation::Info(t) if t.contains("bound to objects the prefab does not contain")))
+        .count();
+    println!("{absent} motion(s) with curves bound to objects the prefab does not contain");
+    assert!(
+        !report.to_string().contains("match no parameter in this model"),
+        "a binding names an existing object that is not a parameter:\n{report}"
+    );
+
     // Every curve drives a parameter the MOC3 actually has.
     assert!(ir.unresolved_motion_targets().is_empty(), "a curve targets an id the model lacks");
 

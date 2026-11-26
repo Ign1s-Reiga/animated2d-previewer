@@ -40,7 +40,10 @@ pub use animator_controller::{animator_controller_pptr, AnimatorController};
 pub use bundle::{Bundle, Compression, Node};
 pub use crc32::{crc32, crc32_str};
 pub use curve::{AnimationCurve, Keyframe};
-pub use objects::{behaviour_body, behaviour_owner_name, Inventory, ObjectInfo, PPtr, ScriptInfo};
+pub use objects::{
+    animator_hierarchy_paths, behaviour_body, behaviour_owner_id, behaviour_owner_name, AnimatorHierarchy, Inventory,
+    ObjectInfo, PPtr, ScriptInfo,
+};
 pub use reader::{Endian, Reader};
 pub use serialized::{ClassId, SerializedFile};
 pub use texture::{read_texture_object, read_textures, Texture, TextureFormat};

@@ -29,6 +29,17 @@
 //! clip may animate the model's opacity (`CubismRenderController`, `Opacity`),
 //! which has no counterpart in the IR.
 //!
+//! A parameter curve that matches no parameter is told apart by whether its
+//! path names any object of the prefab. Unity's `Animator` binds a clip to its
+//! own hierarchy and drives nothing for a path that resolves to no object, so
+//! a path outside the hierarchy is information (the source drops the curve as
+//! well), but only when that hierarchy is provably the one the clips bind
+//! against: the bundle holds exactly one enabled `Animator`, on a root whose
+//! GameObject carries the `CubismModel` behaviour, the whole hierarchy under it
+//! was read, and it contains the path of every curve already resolved to a
+//! model parameter. A path that does name an object, or any doubt
+//! about the hierarchy, stays a failing entry.
+//!
 //! Three more kinds are recognised by name so their notes say what was ignored
 //! instead of quoting a hash: a part's opacity (class `CubismPart`, `Opacity`,
 //! path `crc32("Parts/" + id)`), and the model-level eye-blink and mouth
@@ -51,7 +62,7 @@
 //! A constant curve becomes one key at time zero. A dense curve becomes linear
 //! keys, **on an unverified layout** (no real clip had one); that is reported.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use a2d_core::ir::cubism::{CurveKey, Motion, MotionCurve};
 use a2d_core::{DecodeError, Degradation, LoadReport};
@@ -81,6 +92,10 @@ pub(super) struct NameTable {
     by_hash: HashMap<u32, String>,
     /// Part paths, used only to name a part in a note.
     parts: HashMap<u32, String>,
+    /// The hash of every path under the model's `Animator`, when the whole
+    /// hierarchy could be read. `None` means it could not, and then nothing is
+    /// claimed about a binding that matches no parameter.
+    hierarchy: Option<HashSet<u32>>,
 }
 
 impl NameTable {
@@ -101,6 +116,30 @@ impl NameTable {
             self.parts.entry(crc32_str(&format!("Parts/{id}"))).or_insert_with(|| id.to_string());
         }
         self
+    }
+
+    /// Records every path an `Animator` on the model root can resolve a binding
+    /// to (relative, root name dropped; see `a2d_unity::animator_hierarchy_paths`).
+    ///
+    /// The set is accepted only when it is the subtree the parameter curves
+    /// bind against: it must hold the path of every parameter this table
+    /// resolves. Otherwise (an `Animator` on a wrapper above the model, say) it
+    /// is refused, nothing is claimed, and the reason is returned.
+    pub(super) fn with_hierarchy(mut self, paths: &HashSet<String>) -> (NameTable, Option<String>) {
+        let hashes: HashSet<u32> = paths.iter().map(|p| crc32_str(p)).collect();
+        let mut missing: Vec<&str> =
+            self.by_hash.iter().filter(|(h, _)| !hashes.contains(h)).map(|(_, id)| id.as_str()).collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            let reason = format!(
+                "the Animator's hierarchy lacks the path of {} model parameter(s) (first: {:?}), so it is not the model's own subtree",
+                missing.len(),
+                missing[0]
+            );
+            return (self, Some(reason));
+        }
+        self.hierarchy = Some(hashes);
+        (self, None)
     }
 
     fn add(&mut self, hash: u32, id: &str) -> Result<(), DecodeError> {
@@ -136,8 +175,12 @@ struct Hashes {
 /// What a binding turned out to drive.
 enum Target {
     Parameter(String),
-    /// A parameter-shaped binding whose path matches no parameter here.
+    /// A parameter-shaped binding whose path matches no parameter here, though
+    /// it does name an object of the prefab (or the hierarchy is unknown).
     Unresolved,
+    /// A parameter-shaped binding whose path hash (carried) names no object
+    /// under the `Animator` at all, so the source binds it to nothing.
+    AbsentFromPrefab(u32),
     ModelOpacity,
     /// A part's opacity; the id when the path names a part of this model.
     PartOpacity(Option<String>),
@@ -160,6 +203,9 @@ fn classify(
     match class.as_deref() {
         Some(PARAMETER_CLASS) if binding.attribute == value_hash && plain_flags => match names.get(binding.path) {
             Some(id) => Target::Parameter(id.to_string()),
+            None if names.hierarchy.as_ref().is_some_and(|h| !h.contains(&binding.path)) => {
+                Target::AbsentFromPrefab(binding.path)
+            }
             None => Target::Unresolved,
         },
         Some(RENDER_CONTROLLER_CLASS) if binding.attribute == opacity_hash => Target::ModelOpacity,
@@ -177,6 +223,8 @@ fn classify(
 #[derive(Default)]
 struct Tally {
     unresolved: usize,
+    /// Path hashes of bindings that name no object of the prefab.
+    absent: Vec<u32>,
     /// Indices of the clip's model-opacity bindings, kept to tell a curve that
     /// is constant at the default from one that animates.
     opacity: Vec<usize>,
@@ -352,6 +400,7 @@ pub(super) fn to_motion(
     for (index, binding) in clip.bindings.iter().enumerate() {
         match classify(binding, names, script_class, &hashes) {
             Target::Unresolved => tally.unresolved += 1,
+            Target::AbsentFromPrefab(hash) => tally.absent.push(hash),
             Target::ModelOpacity => tally.opacity.push(index),
             Target::PartOpacity(id) => tally.parts.push(id),
             Target::EyeBlink => tally.eye_blink += 1,
@@ -375,6 +424,7 @@ pub(super) fn to_motion(
     let motion_label = format!("motion {:?}", clip.name);
     let mut losses: Vec<Degradation> = Vec::new();
     let mut info: Vec<String> = Vec::new();
+    let mut absent_info: Option<String> = None;
     let lost = |losses: &mut Vec<Degradation>, n: usize, text: &str| {
         if n > 0 {
             losses.push(Degradation::Note(format!("{motion_label}: {n} {text}")));
@@ -394,6 +444,22 @@ pub(super) fn to_motion(
                 tally.unresolved
             ),
         });
+    }
+    if !tally.absent.is_empty() {
+        // The clip binds these to objects the prefab does not have. Unity's
+        // `Animator` resolves paths against its own hierarchy and drives nothing
+        // for a path that resolves to no object, so dropping them matches the
+        // source.
+        let mut hashes = tally.absent.clone();
+        hashes.sort_unstable();
+        hashes.dedup();
+        let shown: Vec<String> = hashes.iter().take(3).map(|h| format!("{h:#010x}")).collect();
+        let more = if hashes.len() > shown.len() { ", ..." } else { "" };
+        absent_info = Some(format!(
+            "{motion_label}: {} curve(s) bound to objects the prefab does not contain (path hashes {}{more}); the source's Animator binds nothing for them",
+            tally.absent.len(),
+            shown.join(", ")
+        ));
     }
     if tally.off_segments > 0 {
         // An approximation, not a clamp: the segment is kept, but not exactly.
@@ -462,6 +528,9 @@ pub(super) fn to_motion(
     };
     for loss in losses {
         report.warn(loss);
+    }
+    if let Some(line) = absent_info {
+        report.warn(Degradation::Info(line));
     }
 
     if curves.is_empty() {
@@ -559,6 +628,80 @@ mod tests {
         let mut report = LoadReport::new();
         let motion = to_motion(clip, &table(), &resolver, false, &mut report);
         (motion, report)
+    }
+
+    /// The prefab holds `Parameters`, `Parameters/ParamA..C` and `Parts`, and
+    /// `Parameters/ParamExtra`, an object that is not a model parameter.
+    fn hierarchy_table() -> NameTable {
+        let paths: HashSet<String> =
+            ["", "Parameters", "Parameters/ParamA", "Parameters/ParamB", "Parameters/ParamC", "Parameters/ParamExtra"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+        let (names, reason) = table().with_hierarchy(&paths);
+        assert_eq!(reason, None);
+        names
+    }
+
+    #[test]
+    fn a_hierarchy_lacking_a_parameter_path_is_refused_and_claims_nothing() {
+        // No `Parameters/ParamC`: this is some other subtree (a wrapper's).
+        let paths: HashSet<String> =
+            ["", "Parameters/ParamA", "Parameters/ParamB"].into_iter().map(String::from).collect();
+        let (names, reason) = table().with_hierarchy(&paths);
+        assert!(reason.as_deref().is_some_and(|r| r.contains("lacks the path of 1 model parameter")), "{reason:?}");
+        let c = clip(
+            vec![vec![sk(0.0, [0.0; 3], 0.0)], vec![sk(0.0, [0.0; 3], 0.0)]],
+            vec![],
+            vec![param("ParamA"), param("NoSuchObject")],
+        );
+        let (_, report) = convert_with(&c, &names);
+        assert!(report.warnings().iter().any(|w| matches!(w, Degradation::MissingReference { .. })), "{report}");
+        assert!(!report.to_string().contains("does not contain"), "{report}");
+    }
+
+    fn convert_with(clip: &AnimationClip, names: &NameTable) -> (Option<Motion>, LoadReport) {
+        let mut report = LoadReport::new();
+        let motion = to_motion(clip, names, &resolver, false, &mut report);
+        (motion, report)
+    }
+
+    #[test]
+    fn a_binding_to_no_object_of_the_prefab_is_information_and_one_to_an_existing_object_still_fails() {
+        let keys = || vec![sk(0.0, [0.0; 3], 0.0)];
+        let c = clip(
+            vec![keys(), keys(), keys(), keys()],
+            vec![],
+            vec![param("ParamA"), param("NoSuchObject"), param("AlsoMissing"), param("ParamExtra")],
+        );
+        let (m, report) = convert_with(&c, &hierarchy_table());
+        assert_eq!(m.unwrap().curves.len(), 1);
+        let absent: Vec<_> = report
+            .warnings()
+            .iter()
+            .filter(|w| matches!(w, Degradation::Info(t) if t.contains("does not contain")))
+            .collect();
+        assert_eq!(absent.len(), 1, "{report}");
+        assert!(absent[0].to_string().contains("2 curve(s) bound to objects the prefab does not contain"), "{report}");
+        // The one that names a real object (not a parameter) keeps failing.
+        let failing: Vec<_> = report.warnings().iter().filter(|w| !matches!(w, Degradation::Info(_))).collect();
+        assert_eq!(failing.len(), 1, "{report}");
+        assert!(failing[0].to_string().contains("1 binding(s) of motion \"Idle\" match no parameter"), "{report}");
+    }
+
+    #[test]
+    fn only_absent_bindings_leave_nothing_failing_and_an_unknown_hierarchy_claims_nothing() {
+        let c = clip(
+            vec![vec![sk(0.0, [0.0; 3], 0.0)], vec![sk(0.0, [0.0; 3], 0.0)]],
+            vec![],
+            vec![param("ParamA"), param("NoSuchObject")],
+        );
+        let (_, report) = convert_with(&c, &hierarchy_table());
+        assert!(report.warnings().iter().all(|w| matches!(w, Degradation::Info(_))), "{report}");
+        // Without a hierarchy the very same binding is a failing entry.
+        let (_, report) = convert_with(&c, &table());
+        assert!(report.warnings().iter().any(|w| matches!(w, Degradation::MissingReference { .. })), "{report}");
+        assert!(!report.to_string().contains("does not contain"), "{report}");
     }
 
     fn convert(clip: &AnimationClip) -> (Motion, LoadReport) {

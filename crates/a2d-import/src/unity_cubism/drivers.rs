@@ -347,14 +347,14 @@ pub(in crate::unity_cubism) mod tests {
     }
 
     /// `(path_id, type_index, bytes)` into a version-17 file with no type tree.
-    /// Type 0 is GameObject, 1 MonoScript, 2 MonoBehaviour, 3 Transform.
+    /// Type 0 is GameObject, 1 MonoScript, 2 MonoBehaviour, 3 Transform, 4 Animator.
     pub(in crate::unity_cubism) fn build(objects: &[(i64, usize, Vec<u8>)]) -> SerializedFile {
         let mut meta = Vec::new();
         meta.extend_from_slice(b"2022.3.0f1\0");
         put_i32(&mut meta, 5);
         meta.push(0);
-        put_i32(&mut meta, 4);
-        for class in [1i32, 115, 114, 4] {
+        put_i32(&mut meta, 5);
+        for class in [1i32, 115, 114, 4, 95] {
             put_i32(&mut meta, class);
             meta.push(0);
             meta.extend_from_slice(&(-1i16).to_le_bytes());

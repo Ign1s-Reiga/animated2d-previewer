@@ -45,8 +45,8 @@ use a2d_pack::Package;
 
 use crate::png::encode_png;
 use a2d_unity::{
-    animator_controller_pptr, behaviour_body, behaviour_owner_name, AnimationClip, AnimatorController, Bundle, ClassId,
-    Inventory, ObjectInfo, PPtr, Reader, SerializedFile,
+    animator_controller_pptr, animator_hierarchy_paths, behaviour_body, behaviour_owner_id, behaviour_owner_name,
+    AnimationClip, AnimatorController, Bundle, ClassId, Inventory, ObjectInfo, PPtr, Reader, SerializedFile,
 };
 
 /// The `.moc3` payload plus how it was found.
@@ -709,6 +709,50 @@ fn is_covered(covered: &HashSet<String>, clip: &str) -> bool {
     covered.contains(&clip.to_ascii_lowercase())
 }
 
+/// The hierarchy the clips' parameter curves bind against: the subtree of the
+/// one enabled `Animator`, provided that `Animator` sits on the `GameObject`
+/// that carries the `CubismModel`. The reason is returned when it cannot be
+/// vouched for.
+fn model_hierarchy(file: &SerializedFile, inventory: &Inventory) -> Result<HashSet<String>, String> {
+    let found = animator_hierarchy_paths(file).map_err(|e| e.to_string())?;
+    let on_model = inventory
+        .by_script("CubismModel")
+        .filter_map(|o| file.find_object(o.path_id))
+        .any(|o| matches!(behaviour_owner_id(file, o), Ok(Some(id)) if id == found.game_object));
+    if on_model {
+        Ok(found.paths)
+    } else {
+        Err("the Animator's GameObject does not carry the CubismModel".to_string())
+    }
+}
+
+/// Attaches the model's hierarchy to the name table when it can be vouched
+/// for; otherwise nothing is claimed about unmatched bindings and the reason
+/// comes back.
+fn with_model_hierarchy(
+    names: clip_motion::NameTable,
+    file: &SerializedFile,
+    inventory: &Inventory,
+) -> (clip_motion::NameTable, Option<String>) {
+    match model_hierarchy(file, inventory) {
+        Ok(paths) => names.with_hierarchy(&paths),
+        Err(reason) => (names, Some(reason)),
+    }
+}
+
+/// One note, when bindings that match no parameter were reported (more
+/// `MissingReference` entries than `before`) while the hierarchy was not
+/// attached: they could not be told apart from bindings to absent objects.
+fn note_unread_hierarchy(report: &mut LoadReport, before: usize, reason: Option<&str>) {
+    let Some(reason) = reason else { return };
+    let missing = report.warnings().iter().filter(|w| matches!(w, Degradation::MissingReference { .. })).count();
+    if missing > before {
+        report.note(format!(
+            "clip bindings to objects absent from the prefab could not be told apart from other unmatched bindings: {reason}"
+        ));
+    }
+}
+
 /// Decodes every `AnimationClip` that has no matching fade data.
 ///
 /// Parameter names come from the `GameObject` that carries each
@@ -757,8 +801,10 @@ fn clip_motions(
             behaviour_owner_name(file, object).ok().flatten().filter(|n| !n.is_empty())
         })
         .collect();
-    let names = match clip_motion::NameTable::new(ids.iter().map(String::as_str)) {
-        Ok(names) => names.with_parts(part_ids.iter().map(String::as_str)),
+    let (names, hierarchy_reason) = match clip_motion::NameTable::new(ids.iter().map(String::as_str)) {
+        // Without the whole model hierarchy nothing is claimed about a binding
+        // that matches no parameter: it stays a failing entry.
+        Ok(names) => with_model_hierarchy(names.with_parts(part_ids.iter().map(String::as_str)), file, inventory),
         Err(error) => {
             report.note(format!("{} AnimationClip(s) were not recovered: {error}", pending.len()));
             return Vec::new();
@@ -768,6 +814,7 @@ fn clip_motions(
     let script_class =
         |p: PPtr| p.is_local().then(|| inventory.script(p.path_id)).flatten().map(|s| s.class_name.clone());
 
+    let missing_before = report.warnings().iter().filter(|w| matches!(w, Degradation::MissingReference { .. })).count();
     let mut motions = Vec::new();
     for info in pending {
         let label = info.name.clone().unwrap_or_else(|| format!("clip#{}", info.path_id));
@@ -786,6 +833,7 @@ fn clip_motions(
             Err(error) => report.note(format!("motion {label:?} was not recovered from its AnimationClip: {error}")),
         }
     }
+    note_unread_hierarchy(report, missing_before, hierarchy_reason.as_deref());
     motions
 }
 
@@ -1142,5 +1190,105 @@ mod tests {
             physics: None,
         };
         assert!(!empty.is_cubism());
+    }
+
+    // --- The hierarchy the clips bind against. ---
+
+    mod hierarchy {
+        use super::super::drivers::tests::{behaviour, build, mono_script, put_i32, put_pptr, put_string};
+        use super::*;
+
+        fn go(components: &[i64], name: &str) -> Vec<u8> {
+            let mut o = Vec::new();
+            put_i32(&mut o, components.len() as i32);
+            for c in components {
+                put_pptr(&mut o, 0, *c);
+            }
+            put_i32(&mut o, 0);
+            put_string(&mut o, name);
+            o
+        }
+
+        fn transform(owner: i64, children: &[i64], father: i64) -> Vec<u8> {
+            let mut o = Vec::new();
+            put_pptr(&mut o, 0, owner);
+            o.extend_from_slice(&[0; 40]);
+            put_i32(&mut o, children.len() as i32);
+            for c in children {
+                put_pptr(&mut o, 0, *c);
+            }
+            put_pptr(&mut o, 0, father);
+            o
+        }
+
+        fn animator(owner: i64) -> Vec<u8> {
+            let mut o = Vec::new();
+            put_pptr(&mut o, 0, owner);
+            o.extend_from_slice(&[1, 0, 0, 0]);
+            put_pptr(&mut o, 0, 0);
+            put_pptr(&mut o, 0, 0);
+            o
+        }
+
+        /// Wrapper(10) > Model(20) > Parameters(30). The `CubismModel` is on the
+        /// model; the one Animator is on `animator_on`.
+        fn scene(animator_on: i64) -> SerializedFile {
+            build(&[
+                (10, 0, go(&[11], "Wrapper")),
+                (11, 3, transform(10, &[21], 0)),
+                (20, 0, go(&[21, 22], "Model")),
+                (21, 3, transform(20, &[31], 11)),
+                (22, 2, behaviour(20, 90, &[])),
+                (30, 0, go(&[31], "Parameters")),
+                (31, 3, transform(30, &[], 21)),
+                (90, 1, mono_script("CubismModel")),
+                (99, 4, animator(animator_on)),
+            ])
+        }
+
+        #[test]
+        fn the_animator_must_sit_on_the_gameobject_that_carries_the_cubism_model() {
+            // On the model's own GameObject the model's subtree is the answer.
+            // (The model has a parent here, which the strict reader refuses, so
+            // build the same scene with the model as the root.)
+            let rooted = build(&[
+                (20, 0, go(&[21, 22], "Model")),
+                (21, 3, transform(20, &[], 0)),
+                (22, 2, behaviour(20, 90, &[])),
+                (90, 1, mono_script("CubismModel")),
+                (99, 4, animator(20)),
+            ]);
+            let paths = model_hierarchy(&rooted, &Inventory::build(&rooted)).unwrap();
+            assert!(paths.contains(""));
+            // An Animator on the wrapper above the model: not the model's subtree.
+            let wrapped = scene(10);
+            let why = model_hierarchy(&wrapped, &Inventory::build(&wrapped)).unwrap_err();
+            assert!(why.contains("does not carry the CubismModel"), "{why}");
+            // An Animator on the model that is not a root is refused by the reader.
+            let inner = scene(20);
+            assert!(model_hierarchy(&inner, &Inventory::build(&inner)).is_err());
+        }
+
+        #[test]
+        fn a_refused_hierarchy_attaches_nothing_and_says_why_once_when_bindings_failed() {
+            let names = clip_motion::NameTable::new(["P"]).unwrap();
+            let wrapped = scene(10);
+            let (names, reason) = with_model_hierarchy(names, &wrapped, &Inventory::build(&wrapped));
+            let reason = reason.expect("refused");
+            // A hierarchy that is the model's own but lacks a parameter's path.
+            let paths: HashSet<String> = ["", "Other"].into_iter().map(String::from).collect();
+            assert!(names.with_hierarchy(&paths).1.is_some());
+
+            let mut report = LoadReport::new();
+            note_unread_hierarchy(&mut report, 0, Some(&reason));
+            assert!(report.is_empty(), "no unmatched binding failed, so nothing to explain");
+            report.warn(Degradation::MissingReference { kind: "parameter".into(), name: "x".into() });
+            note_unread_hierarchy(&mut report, 0, Some(&reason));
+            note_unread_hierarchy(&mut report, 1, Some(&reason));
+            note_unread_hierarchy(&mut report, 0, None);
+            let notes: Vec<_> = report.warnings().iter().filter(|w| matches!(w, Degradation::Note(_))).collect();
+            assert_eq!(notes.len(), 1, "{report}");
+            assert!(notes[0].to_string().contains(&reason), "{report}");
+        }
     }
 }
