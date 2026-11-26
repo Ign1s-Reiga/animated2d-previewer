@@ -139,7 +139,7 @@ physics, with the reason reported. It is never read on a best guess.
 | body fits no layout | note; model loads without physics |
 | more than one controller | note; the first is used |
 | `m_Enabled` is 0 | note; **not recovered** (see below) |
-| an output reads a particle outside `1..particleCount` | that output is dropped, note |
+| an output reads a particle outside `1..particleCount` | that output and every later output of its group are dropped, information |
 | a group has a non-finite value, a weight outside 0..100, a negative radius or an unknown component | that group is dropped, note |
 | gravity or wind non-finite, or nothing usable left | no physics, note |
 | an input or output id names no parameter | kept; reported by `validate` and at import, derived from the IR |
@@ -156,8 +156,10 @@ On real data, one of the three first models has an output whose particle index i
 one past the end of its two-particle group (it is that group's only output).
 The SDK generation these rigs come from stops processing a group's outputs at
 the first one it cannot use, so the importer does the same: the bad output and
-every output after it are dropped, and the note says how many. Later SDKs skip
-only the bad one. It made no difference here because the output was alone.
+every output after it are dropped, and the entry says how many. Because the
+source drops exactly the same outputs, the entry is information and does not fail
+`validate`. Later SDKs skip only the bad one, but the importer accepts only the
+older layout. It made no difference here because the output was alone.
 
 Import notes number groups by their place in the **source** ("source physics
 group N"); `validate` and the model number them by their place in the IR, which
