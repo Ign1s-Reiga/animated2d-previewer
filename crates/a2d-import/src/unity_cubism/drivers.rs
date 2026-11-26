@@ -10,9 +10,11 @@
 //! Recognition is by the script's class name (the names are the public Cubism
 //! Unity SDK's) and by presence only, with two exceptions. The pointer of an
 //! expression controller is read, to tell an empty list from a set one. The
-//! look-at rig is recovered in full (`look.rs`) and checked against the
-//! model's parameters: it is carried into the package, and its note says it
-//! was recovered, or why it was not. Playback applies it at its rest target and follows a pointer when the host drives it.
+//! look-at rig is recovered in full (`look.rs`), only when the source would
+//! apply it, and checked against the model's parameters: it is carried into the
+//! package and reported as information (nothing is dropped), or, when it is not
+//! recovered, as a note that says why. Playback applies it at its rest target
+//! and follows a pointer when the host drives it.
 //! Hit areas are reported too: hit testing is not implemented, so a drawable
 //! the source marked as hittable hits nothing here.
 //! Components that only do bookkeeping (the parameter store, the update
@@ -22,7 +24,7 @@
 
 use std::collections::BTreeMap;
 
-use a2d_core::ir::cubism::{LookBlend, LookRig, Parameter};
+use a2d_core::ir::cubism::{LookAxis, LookBlend, LookRig, Parameter};
 use a2d_core::LoadReport;
 use a2d_unity::{behaviour_body, behaviour_owner_name, ClassId, Inventory, SerializedFile};
 
@@ -56,6 +58,8 @@ pub(super) struct Scan {
     pub look: Option<LookRig>,
     /// Why there is no rig although look components are present.
     pub look_failure: Option<String>,
+    /// Reasons the recovered rig may differ from the source (see `look.rs`).
+    pub look_caveats: Vec<String>,
 }
 
 impl Scan {
@@ -69,10 +73,19 @@ impl Scan {
     }
 }
 
-/// Notes the components found, one per kind. Every entry is a note, a recovered
-/// look-at rig included: whether its rest target matches the source depends on
-/// the target's script and active state, which is not verified.
+/// Reports the components found, one line per kind. Every line is a note except
+/// a recovered look-at rig, which is information only when there are no
+/// caveats and the offset at rest is exactly zero (and the blend is additive):
+/// `look::recover` hands back a rig only after verifying that the source would
+/// apply it (controller and target enabled and active, the target the SDK's
+/// standard one), and [`look_unverified`] lists the remaining doubts: the SDK
+/// generations' disagreement on the center, and whether the Cubism Core clamps
+/// a parameter the way playback does. With none, the rig adds nothing at rest,
+/// so playback and source agree.
 pub(super) fn note_scan(scan: &Scan, report: &mut LoadReport) {
+    if let Some(info) = look_info(scan) {
+        report.info(info);
+    }
     for note in notes(scan) {
         report.note(note);
     }
@@ -117,6 +130,7 @@ pub(super) fn scan(file: &SerializedFile, inventory: &Inventory) -> Scan {
     let look = look::recover(file, inventory);
     out.look = look.rig;
     out.look_failure = look.failure;
+    out.look_caveats = look.caveats;
     for info in &inventory.objects {
         let Some(script) = &info.script else { continue };
         *out.classes.entry(script.class_name.clone()).or_insert(0) += 1;
@@ -143,37 +157,92 @@ pub(super) fn scan(file: &SerializedFile, inventory: &Inventory) -> Scan {
     out
 }
 
-/// The notes for a scan; empty when nothing unapplied is present.
+/// What keeps a recovered rig from being verified: the recovery's caveats plus
+/// the clamp. The source adds the offset to the parameter and hands the raw sum
+/// to the Cubism Core; whether the Core clamps it is not established, while
+/// playback clamps (or wraps) after adding. That cannot matter when the offset
+/// is zero, so the rig is verified only when it is additive and every look
+/// parameter's offset at rest, `factor * (rest target - center)[axis]`, is
+/// exactly zero.
+pub(super) fn look_unverified(scan: &Scan, rig: &LookRig) -> Vec<String> {
+    let mut out = scan.look_caveats.clone();
+    if rig.blend != LookBlend::Additive {
+        out.push(
+            "the blend is not additive, and how the Cubism Core treats the source's raw value is not established"
+                .into(),
+        );
+    }
+    let goal = [rig.rest_target.0 - rig.center.0, rig.rest_target.1 - rig.center.1, rig.rest_target.2 - rig.center.2];
+    let axis = |a: LookAxis| match a {
+        LookAxis::X => 0,
+        LookAxis::Y => 1,
+        LookAxis::Z => 2,
+    };
+    if rig.parameters.iter().any(|p| p.factor * goal[axis(p.axis)] != 0.0) {
+        out.push("the rig adds a non-zero offset at rest; the source passes the raw sum to the Cubism Core, whether the Core clamps it is not established, and playback clamps or wraps it".into());
+    }
+    out
+}
+
+fn look_description(scan: &Scan, rig: &LookRig) -> String {
+    let mut ids: Vec<String> = scan.look_ids.iter().flatten().cloned().collect();
+    ids.sort();
+    ids.dedup();
+    format!(
+        "{} look parameter(s) drive [{}], {} blend, damping {} s",
+        rig.parameters.len(),
+        ids.join(", "),
+        match rig.blend {
+            LookBlend::Additive => "additive",
+            LookBlend::Multiply => "multiply",
+            LookBlend::Override => "override",
+        },
+        rig.damping
+    )
+}
+
+/// The information line for a verified, recovered look-at rig; `None` when
+/// there is no rig (its absence is a note, see [`notes`]) or when it is not
+/// verified (see [`look_unverified`]).
+pub(super) fn look_info(scan: &Scan) -> Option<String> {
+    let rig = scan.look.as_ref()?;
+    if !look_unverified(scan, rig).is_empty() {
+        return None;
+    }
+    Some(format!(
+        "look-at rig ({LOOK_CONTROLLER}) recovered: {}; the controller and its standard look target are enabled and active as the source requires, and the prefab-defined target gives a zero offset at rest, so nothing is added to any parameter; following a pointer is the host's option",
+        look_description(scan, rig)
+    ))
+}
+
+/// The notes for a scan; empty when nothing unapplied is present. A recovered,
+/// verified look-at rig is not among them (see [`look_info`]).
 pub(super) fn notes(scan: &Scan) -> Vec<String> {
     let mut out = Vec::new();
     let count = |name: &str| scan.classes.get(name).copied().unwrap_or(0);
-    if count(LOOK_CONTROLLER) > 0 || !scan.look_ids.is_empty() {
+    if let Some(rig) = &scan.look {
+        let unverified = look_unverified(scan, rig);
+        if !unverified.is_empty() {
+            out.push(format!(
+                "look-at rig ({LOOK_CONTROLLER}) recovered: {}; applied at its rest target, follows a pointer when the host drives it; not verified against the source: {}",
+                look_description(scan, rig),
+                unverified.join("; ")
+            ));
+        }
+    } else if count(LOOK_CONTROLLER) > 0 || !scan.look_ids.is_empty() {
         let mut ids: Vec<String> = scan.look_ids.iter().flatten().cloned().collect();
         ids.sort();
         ids.dedup();
         let unnamed = scan.look_ids.iter().filter(|i| i.is_none()).count();
-        let mut line = match (&scan.look, &scan.look_failure) {
-            (Some(rig), _) => format!(
-                "look-at rig ({LOOK_CONTROLLER}) recovered: {} look parameter(s) drive [{}], {} blend, damping {} s; applied at its rest target, follows a pointer when the host drives it",
-                rig.parameters.len(),
-                ids.join(", "),
-                match rig.blend {
-                    LookBlend::Additive => "additive",
-                    LookBlend::Multiply => "multiply",
-                    LookBlend::Override => "override",
-                },
-                rig.damping
-            ),
-            (None, _) => format!(
-                "look-at rig ({LOOK_CONTROLLER}) is present and not applied: {} look parameter(s) drive [{}]",
-                scan.look_ids.len(),
-                ids.join(", ")
-            ),
-        };
+        let mut line = format!(
+            "look-at rig ({LOOK_CONTROLLER}) is present and not applied: {} look parameter(s) drive [{}]",
+            scan.look_ids.len(),
+            ids.join(", ")
+        );
         if unnamed > 0 {
             line.push_str(&format!(", {unnamed} with no readable owner"));
         }
-        if let (None, Some(failure)) = (&scan.look, &scan.look_failure) {
+        if let Some(failure) = &scan.look_failure {
             line.push_str(&format!("; not recovered: {failure}"));
         }
         out.push(line);
@@ -246,7 +315,7 @@ pub(in crate::unity_cubism) mod tests {
     }
 
     #[test]
-    fn a_recovered_look_rig_is_one_note_naming_its_parameters_and_that_it_is_not_applied() {
+    fn a_recovered_look_rig_is_one_information_line_naming_its_parameters_and_the_verification() {
         let mut s =
             scan_of(&[(LOOK_CONTROLLER, 1), (LOOK_PARAMETER, 2)], &[Some("AngleX"), Some("EyeBallX")], (false, false));
         let mut r = rig();
@@ -258,10 +327,10 @@ pub(in crate::unity_cubism) mod tests {
             });
         }
         s.look = Some(r);
-        let n = notes(&s);
+        assert!(notes(&s).is_empty(), "a verified rig is not a note");
         assert_eq!(
-            n,
-            ["look-at rig (CubismLookController) recovered: 2 look parameter(s) drive [AngleX, EyeBallX], additive blend, damping 0.15 s; applied at its rest target, follows a pointer when the host drives it"]
+            look_info(&s).as_deref(),
+            Some("look-at rig (CubismLookController) recovered: 2 look parameter(s) drive [AngleX, EyeBallX], additive blend, damping 0.15 s; the controller and its standard look target are enabled and active as the source requires, and the prefab-defined target gives a zero offset at rest, so nothing is added to any parameter; following a pointer is the host's option")
         );
     }
 
@@ -457,22 +526,100 @@ pub(in crate::unity_cubism) mod tests {
     }
 
     #[test]
-    fn a_recovered_look_rig_is_reported_as_a_note_never_as_information() {
+    fn a_verified_look_rig_is_information_and_never_fails_a_report() {
         use a2d_core::Degradation;
-        let rig = LookRig {
-            blend: LookBlend::Additive,
-            damping: 0.15,
-            rest_target: (0.0, 0.0, 0.0),
-            center: (0.0, 0.0, 0.0),
-            parameters: Vec::new(),
-        };
         let mut scan = scan_of(&[(LOOK_CONTROLLER, 1)], &[Some("ParamAngleX")], (false, false));
-        scan.look = Some(rig);
+        scan.look = Some(rig());
         let mut report = LoadReport::new();
         note_scan(&scan, &mut report);
         assert_eq!(report.len(), 1, "{report}");
         assert!(report.to_string().contains("look-at rig (CubismLookController) recovered"), "{report}");
+        assert!(matches!(report.warnings()[0], Degradation::Info(_)), "{report}");
+    }
+
+    fn driven(axis: a2d_core::ir::cubism::LookAxis, factor: f32) -> a2d_core::ir::cubism::LookParameter {
+        a2d_core::ir::cubism::LookParameter { parameter: "AngleX".into(), axis, factor }
+    }
+
+    fn report_of(scan: &Scan) -> LoadReport {
+        let mut report = LoadReport::new();
+        note_scan(scan, &mut report);
+        report
+    }
+
+    #[test]
+    fn a_recovered_rig_is_information_only_when_its_offset_at_rest_is_exactly_zero() {
+        use a2d_core::ir::cubism::LookAxis;
+        use a2d_core::Degradation;
+        // Zero because the target equals the center on the driven axis, or the factor is zero.
+        for (rest, center, axis, factor) in [
+            ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), LookAxis::X, 3.0),
+            ((0.5, 0.0, 0.0), (0.5, 0.0, 0.0), LookAxis::X, 3.0),
+            ((0.5, 0.0, 0.0), (0.0, 0.0, 0.0), LookAxis::Y, 3.0),
+            ((0.5, 0.2, 0.0), (0.0, 0.0, 0.0), LookAxis::Z, 1.0),
+            ((0.5, 0.0, 0.0), (0.0, 0.0, 0.0), LookAxis::X, 0.0),
+        ] {
+            let mut s = scan_of(&[(LOOK_CONTROLLER, 1)], &[Some("AngleX")], (false, false));
+            let mut r = rig();
+            r.rest_target = rest;
+            r.center = center;
+            r.parameters.push(driven(axis, factor));
+            s.look = Some(r);
+            let report = report_of(&s);
+            assert!(matches!(report.warnings()[0], Degradation::Info(_)), "{rest:?} {center:?}: {report}");
+        }
+        // Non-zero on a driven axis: a failing note, rig still recovered, clamp named.
+        for (rest, axis) in [((0.5, 0.0, 0.0), LookAxis::X), ((0.0, 0.0, 1e-7), LookAxis::Z)] {
+            let mut s = scan_of(&[(LOOK_CONTROLLER, 1)], &[Some("AngleX")], (false, false));
+            let mut r = rig();
+            r.rest_target = rest;
+            r.parameters.push(driven(axis, 1.0));
+            s.look = Some(r);
+            let report = report_of(&s);
+            assert_eq!(report.len(), 1, "{report}");
+            assert!(matches!(report.warnings()[0], Degradation::Note(_)), "{report}");
+            let text = report.to_string();
+            assert!(text.contains("non-zero offset at rest") && text.contains("clamp"), "{text}");
+            assert!(text.contains("applied at its rest target"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_non_additive_or_generation_dependent_rig_is_a_failing_note_even_when_zero_at_rest() {
+        use a2d_core::Degradation;
+        let mut s = scan_of(&[(LOOK_CONTROLLER, 1)], &[Some("AngleX")], (false, false));
+        let mut r = rig();
+        r.blend = LookBlend::Override;
+        s.look = Some(r);
+        let report = report_of(&s);
         assert!(matches!(report.warnings()[0], Degradation::Note(_)), "{report}");
+        assert!(report.to_string().contains("not additive"), "{report}");
+
+        let mut s = scan_of(&[(LOOK_CONTROLLER, 1)], &[Some("AngleX")], (false, false));
+        s.look = Some(rig());
+        s.look_caveats = vec!["the SDK generations disagree on the center".into()];
+        let report = report_of(&s);
+        assert_eq!(report.len(), 1, "{report}");
+        assert!(matches!(report.warnings()[0], Degradation::Note(_)), "{report}");
+        assert!(report.to_string().contains("generations disagree"), "{report}");
+    }
+
+    #[test]
+    fn a_look_rig_that_is_not_recovered_stays_a_failing_note() {
+        use a2d_core::Degradation;
+        for why in [
+            "the controller has no target, so the source applies nothing",
+            "the target's look-target script is not the SDK's CubismLookTargetBehaviour (Game.Foo)",
+            "the controller's active state: a GameObject is unreadable",
+        ] {
+            let mut scan = scan_of(&[(LOOK_CONTROLLER, 1)], &[Some("ParamAngleX")], (false, false));
+            scan.look_failure = Some(why.into());
+            let mut report = LoadReport::new();
+            note_scan(&scan, &mut report);
+            assert_eq!(report.len(), 1, "{report}");
+            assert!(matches!(report.warnings()[0], Degradation::Note(_)), "{report}");
+            assert!(report.to_string().contains(&format!("not recovered: {why}")), "{report}");
+        }
     }
 
     #[test]

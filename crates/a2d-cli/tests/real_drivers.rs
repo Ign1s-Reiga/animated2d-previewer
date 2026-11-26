@@ -1,9 +1,12 @@
 //! Runtime-driver components of a real Unity bundle are reported, not dropped.
 //!
 //! The prefabs carry one look-at rig and no eye blink, mouth, harmonic motion,
-//! breath, expression or pose-part components. The rig is recovered into the
-//! package, and playback applies it at its rest target, so the import says so;
-//! the others must not be reported when they are absent.
+//! breath, expression or pose-part components. The importer verifies that the
+//! source would apply the rig (controller and standard look target enabled and
+//! active) and recovers it into the package. The line is information only when
+//! the offset the rig adds at rest is exactly zero (so the unestablished clamp
+//! cannot matter) and the center is generation-independent; otherwise it is a
+//! failing note. The others must not be reported when they are absent.
 //!
 //! The asset is never committed (spec §11). `A2D_FIXTURE_CUBISM` names one
 //! bundle file (not a directory):
@@ -21,7 +24,7 @@ fn bundle_bytes() -> Option<Vec<u8>> {
 
 #[test]
 #[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
-fn the_look_rig_is_noted_with_its_parameters_and_absent_drivers_are_not() {
+fn the_verified_look_rig_is_information_with_its_parameters_and_absent_drivers_are_not() {
     let Some(bytes) = bundle_bytes() else { return };
     let mut report = LoadReport::default();
     let package = a2d_import::import_bundle(&bytes, &mut report).expect("the bundle should import");
@@ -30,19 +33,38 @@ fn the_look_rig_is_noted_with_its_parameters_and_absent_drivers_are_not() {
     let look: Vec<&String> = notes.iter().filter(|n| n.starts_with("look-at rig")).collect();
     assert_eq!(look.len(), 1, "exactly one look note expected: {notes:?}");
     println!("{}", look[0]);
-    assert!(look[0].contains("recovered") && look[0].contains("applied at its rest target"), "{}", look[0]);
-    assert!(!look[0].contains("no readable owner") && !look[0].contains("not recovered"), "{}", look[0]);
+    assert!(look[0].contains("recovered"), "{}", look[0]);
     let model = package.model.as_cubism().expect("a Cubism package");
     let rig = model.look.as_ref().expect("the look rig is recovered into the model");
     println!("rig: {rig:?}");
     assert!(!rig.parameters.is_empty());
+    // Information exactly when additive and every driven axis is exactly zero at rest.
+    let goal = [rig.rest_target.0 - rig.center.0, rig.rest_target.1 - rig.center.1, rig.rest_target.2 - rig.center.2];
+    let zero_at_rest = rig.blend == a2d_core::ir::cubism::LookBlend::Additive
+        && rig.parameters.iter().all(|p| {
+            let axis = match p.axis {
+                a2d_core::ir::cubism::LookAxis::X => 0,
+                a2d_core::ir::cubism::LookAxis::Y => 1,
+                a2d_core::ir::cubism::LookAxis::Z => 2,
+            };
+            p.factor * goal[axis] == 0.0
+        });
+    let kind: Vec<bool> = report
+        .warnings()
+        .iter()
+        .filter(|w| w.to_string().starts_with("look-at rig"))
+        .map(|w| matches!(w, a2d_core::Degradation::Info(_)))
+        .collect();
+    assert_eq!(kind, [zero_at_rest], "information iff zero at rest, else a failing note");
+    println!("look line is {}", if zero_at_rest { "INFO" } else { "NOTE" });
     assert_eq!(rig.problem(&model.parameters), None);
     assert!(rig.damping.is_finite() && rig.damping >= 0.0);
     let (tx, ty, tz) = rig.rest_target;
     assert!([tx, ty, tz].iter().all(|v| v.is_finite()));
     // Within the model's own extent: a target far outside it would mean the unit is wrong.
     assert!(tx.abs() < 10.0 && ty.abs() < 10.0 && tz.abs() < 10.0, "{:?}", rig.rest_target);
-    assert_eq!(rig.center, (0.0, 0.0, 0.0), "a null Center is the controller's own origin");
+    // A null Center, or one pointing at the unmoved root's own transform, is the origin.
+    assert_eq!(rig.center, (0.0, 0.0, 0.0), "the Center resolves to the controller's own origin");
     assert!(look[0].contains(&format!("{} look parameter(s)", rig.parameters.len())), "{}", look[0]);
     for p in &rig.parameters {
         assert!(p.factor.is_finite() && p.factor != 0.0, "{p:?}");
@@ -97,10 +119,10 @@ fn the_look_rig_is_noted_with_its_parameters_and_absent_drivers_are_not() {
         }
         _ => panic!("more than one hit area note: {notes:?}"),
     }
-    // The note is persisted, so `validate` and `preview` show it after the bundle is gone. It is
-    // information only for the rig shape whose reconstruction is verified; any other shape keeps it
-    // a warning. Either way it is recorded exactly once.
+    // The line is persisted so `validate` and `preview` show it after the bundle is gone: once, in the
+    // notes when it is information, in the warnings when it is a failing note.
     let in_notes = package.manifest.import_notes.iter().filter(|w| w.starts_with("look-at rig")).count();
     let in_warnings = package.manifest.import_warnings.iter().filter(|w| w.starts_with("look-at rig")).count();
-    assert_eq!(in_notes + in_warnings, 1, "{:?}", package.manifest.recorded_at_import());
+    let want = if zero_at_rest { (1, 0) } else { (0, 1) };
+    assert_eq!((in_notes, in_warnings), want, "{:?}", package.manifest.recorded_at_import());
 }
