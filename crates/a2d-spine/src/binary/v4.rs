@@ -1517,6 +1517,30 @@ mod tests {
     }
 
     #[test]
+    fn a_4x_rotate_timeline_is_not_unwrapped() {
+        let bytes = fixture(|w| {
+            w.varint(0); // no slot timelines
+            w.varint(1); // one bone
+            w.varint(0); // bone index
+            w.varint(1); // one channel
+            w.u8(BONE_ROTATE);
+            w.varint(2); // frames
+            w.varint(0); // beziers
+            w.f32(0.0).f32(10.0); // frame 0
+            w.f32(1.0).f32(350.0); // frame 1
+            w.u8(CURVE_LINEAR);
+            for _ in 0..6 {
+                w.varint(0);
+            }
+        });
+        let (ir, _) = decode_fixture(&bytes).expect("should decode");
+        let Some(Timeline::BoneRotate { keys, .. }) = ir.animations[0].timelines.first() else {
+            panic!("expected a rotate timeline");
+        };
+        assert_eq!(keys[1].value, 350.0, "4.x uses key values directly");
+    }
+
+    #[test]
     fn a_rotate_timeline_reads_its_frames_and_bezier() {
         let bytes = fixture(|w| {
             w.varint(0); // no slot timelines

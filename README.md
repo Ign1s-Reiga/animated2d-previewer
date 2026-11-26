@@ -202,7 +202,7 @@ character.a2dpack/
 
 ```json
 {
-  "formatVersion": 9,
+  "formatVersion": 10,
   "modelType": "spine",
   "sourceGame": "spine_bytes",
   "sourceFormat": "spine-3.8",
@@ -215,6 +215,7 @@ character.a2dpack/
 
 シリアライズは決定論的です（フィールド順は固定、マップはソート、浮動小数の書式も固定）。
 レイアウトを変えるたびに `formatVersion` を上げ、ローダは古い版も読みます。
+形式 10 から、回転タイムラインのキーは最短弧で補間できる形に展開して保存します。それ以前のパッケージで回転キーの差が 180 度を超えるものは、`validate` が「ボーンが遠回りに回る場合があるので再インポートしてください」と通知します。
 インポート時の記録は、問題が `importWarnings`、情報が `importNotes` に入ります（空なら
 省略。`validate` を参照）。
 

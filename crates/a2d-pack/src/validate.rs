@@ -11,7 +11,10 @@ use a2d_core::{Degradation, LoadReport};
 use crate::package::TextureFile;
 
 /// Runs every Spine-side check against a decoded package.
-pub fn validate_spine(ir: &SpineIr, textures: &[TextureFile], report: &mut LoadReport) {
+///
+/// `format_version` is the manifest's: a few findings exist only for packages
+/// written before a decoder fix whose effect is baked into `model.bin`.
+pub fn validate_spine(ir: &SpineIr, format_version: u32, textures: &[TextureFile], report: &mut LoadReport) {
     check_textures(ir, textures, report);
     check_atlas_references(ir, report);
     check_attachments(ir, report);
@@ -19,6 +22,31 @@ pub fn validate_spine(ir: &SpineIr, textures: &[TextureFile], report: &mut LoadR
     check_slot_references(ir, report);
     check_constraints(ir, report);
     check_timelines(ir, report);
+    check_rotate_keys_unwrapped(ir, format_version, report);
+}
+
+/// Spine 3.x rotate keys cross the 360 degree seam the short way; the importer
+/// has unwrapped them since package format 10. An older package keeps the raw
+/// angles, so a pair of keys more than 180 degrees apart plays as a long spin.
+fn check_rotate_keys_unwrapped(ir: &SpineIr, format_version: u32, report: &mut LoadReport) {
+    if format_version >= 10 {
+        return;
+    }
+    let spins = ir.animations.iter().flat_map(|a| &a.timelines).any(|t| match t {
+        Timeline::BoneRotate { keys, .. } => keys.windows(2).any(|w| {
+            // Mirrors the [-180, 180) wrap: an exact +180 step is played the
+            // other way round by the old behaviour, an exact -180 is not.
+            let d = w[1].value - w[0].value;
+            d >= 180.0 || d < -180.0
+        }),
+        _ => false,
+    });
+    if spins {
+        report.note(
+            "imported before shortest-arc rotate keys (package format 10): some bones may spin the long way; \
+             re-import the source",
+        );
+    }
 }
 
 /// Missing textures: every atlas page must have a file in `textures/`.
@@ -475,7 +503,7 @@ mod tests {
     use a2d_core::ir::atlas::{Atlas, AtlasPage, AtlasRegion};
     use a2d_core::ir::ids::{AtlasPageId, AtlasRegionId, AttachmentId, BoneId, SlotId};
     use a2d_core::ir::spine::*;
-    use a2d_core::{Rgba, Vec2};
+    use a2d_core::{Interpolation, Rgba, Vec2};
 
     fn healthy() -> SpineIr {
         let mut ir = SpineIr {
@@ -528,14 +556,62 @@ mod tests {
 
     fn run(ir: &SpineIr, textures: &[TextureFile]) -> String {
         let mut report = LoadReport::new();
-        validate_spine(ir, textures, &mut report);
+        validate_spine(ir, crate::FORMAT_VERSION, textures, &mut report);
         report.to_string()
+    }
+
+    fn with_rotate(first: f32, second: f32) -> SpineIr {
+        let mut ir = healthy();
+        let key = |time: f32, value: f32| ScalarKey { time, value, interp: Interpolation::Linear };
+        let mut anim = Animation::new("idle");
+        anim.timelines.push(Timeline::BoneRotate { bone: BoneId(1), keys: vec![key(0.0, first), key(1.0, second)] });
+        anim.duration = anim.max_key_time();
+        ir.animations.push(anim);
+        ir
+    }
+
+    fn notes_for(ir: &SpineIr, format_version: u32) -> String {
+        let mut report = LoadReport::new();
+        validate_spine(ir, format_version, &page_file(), &mut report);
+        report.to_string()
+    }
+
+    #[test]
+    fn an_old_package_with_a_long_rotate_jump_is_noted() {
+        let text = notes_for(&with_rotate(10.0, 350.0), 9);
+        assert!(
+            text.contains(
+                "imported before shortest-arc rotate keys (package format 10): some bones may spin the long way; \
+             re-import the source"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_current_package_with_the_same_keys_is_not_noted() {
+        let text = notes_for(&with_rotate(10.0, 350.0), 10);
+        assert!(!text.contains("shortest-arc"), "{text}");
+    }
+
+    #[test]
+    fn an_old_package_without_a_long_rotate_jump_is_not_noted() {
+        let text = notes_for(&with_rotate(10.0, 120.0), 9);
+        assert!(!text.contains("shortest-arc"), "{text}");
+        let text = notes_for(&with_rotate(180.0, 0.0), 9);
+        assert!(!text.contains("shortest-arc"), "an exact -180 step is not wrapped: {text}");
+    }
+
+    #[test]
+    fn an_exact_plus_180_step_is_noted() {
+        let text = notes_for(&with_rotate(0.0, 180.0), 9);
+        assert!(text.contains("shortest-arc"), "{text}");
     }
 
     #[test]
     fn a_healthy_package_validates_cleanly() {
         let mut report = LoadReport::new();
-        validate_spine(&healthy(), &page_file(), &mut report);
+        validate_spine(&healthy(), crate::FORMAT_VERSION, &page_file(), &mut report);
         assert!(report.is_empty(), "{report}");
     }
 
@@ -808,7 +884,7 @@ mod tests {
     fn what_the_runtime_evaluates_validates_cleanly() {
         let ir = constrained();
         let mut report = LoadReport::new();
-        validate_spine(&ir, &page_file(), &mut report);
+        validate_spine(&ir, crate::FORMAT_VERSION, &page_file(), &mut report);
         assert!(report.is_empty(), "{report}");
     }
 
@@ -926,7 +1002,7 @@ mod tests {
         ir.ik_constraints.push(long_ik_chain());
         ir.rebuild_derived();
         let mut report = LoadReport::new();
-        validate_spine(&ir, &page_file(), &mut report);
+        validate_spine(&ir, crate::FORMAT_VERSION, &page_file(), &mut report);
         assert_eq!(report.len(), 1, "{report}");
         assert!(report.to_string().contains("ik with a 3-bone chain constraint \"spine\" unsupported"), "{report}");
     }

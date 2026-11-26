@@ -115,7 +115,15 @@ fn read_bone_timelines(
         if let Some(keys) = f.get("rotate") {
             // Spine 3.x names the value `angle`; 4.x names it `value`.
             let raw = read_scalar_keys(keys, &context, family, 1, &["angle", "value"], 0.0, report)?;
-            anim.timelines.push(Timeline::BoneRotate { bone, keys: resolve_scalar(&raw) });
+            let mut keys = resolve_scalar(&raw);
+            // Spine 3.x interpolates rotation along the shortest arc; the IR
+            // (4.x shape) interpolates key values directly, so unwrap.
+            // 2.x is believed to wrap too, but that is unverified, so the 2.x
+            // family is left unchanged rather than guessed at.
+            if family == SpineFamily::V3 {
+                crate::normalize::unwrap_rotate_keys(&mut keys);
+            }
+            anim.timelines.push(Timeline::BoneRotate { bone, keys });
         }
         for (key, default, make) in [
             ("translate", 0.0f32, TranslateKind::Translate),
@@ -892,6 +900,51 @@ mod tests {
             other => panic!("expected a rotate timeline, got {other:?}"),
         }
         assert!(report.is_empty(), "{report}");
+    }
+
+    fn rotate_values(anim: &Animation) -> Vec<f32> {
+        match &anim.timelines[0] {
+            Timeline::BoneRotate { keys, .. } => keys.iter().map(|k| k.value).collect(),
+            other => panic!("expected a rotate timeline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v3_rotate_keys_are_unwrapped_to_the_shortest_arc() {
+        let (anim, _) = decode(
+            json!({"idle": {"bones": {"torso": {"rotate": [{"time": 0, "angle": 10}, {"time": 1, "angle": 350}]}}}}),
+            SpineFamily::V3,
+        );
+        assert_eq!(rotate_values(&anim), vec![10.0, -10.0]);
+    }
+
+    #[test]
+    fn v3_rotate_keys_are_unwrapped_after_sorting_by_time() {
+        let (anim, _) = decode(
+            json!({"idle": {"bones": {"torso": {"rotate": [
+                {"time": 1, "angle": 350}, {"time": 0, "angle": 10}
+            ]}}}}),
+            SpineFamily::V3,
+        );
+        assert_eq!(rotate_values(&anim), vec![10.0, -10.0]);
+    }
+
+    #[test]
+    fn v4_rotate_keys_are_used_as_written() {
+        let (anim, _) = decode(
+            json!({"idle": {"bones": {"torso": {"rotate": [{"time": 0, "value": 10}, {"time": 1, "value": 350}]}}}}),
+            SpineFamily::V4,
+        );
+        assert_eq!(rotate_values(&anim), vec![10.0, 350.0]);
+    }
+
+    #[test]
+    fn v2_rotate_keys_are_left_unchanged_because_2x_is_unverified() {
+        let (anim, _) = decode(
+            json!({"idle": {"bones": {"torso": {"rotate": [{"time": 0, "angle": 10}, {"time": 1, "angle": 350}]}}}}),
+            SpineFamily::V2,
+        );
+        assert_eq!(rotate_values(&anim), vec![10.0, 350.0]);
     }
 
     #[test]

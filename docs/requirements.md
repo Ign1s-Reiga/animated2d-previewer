@@ -578,6 +578,13 @@ recorded, notes about dropped data included, fails it. A package older than form
 the two apart, so `validate` treats its recorded entries as problems and says that a re-import
 would separate them.
 
+A Spine package older than format 10 may hold rotate keys that were not unwrapped to the shortest arc
+(`model.bin` keeps its layout, but the values changed). When such a package has a rotate key pair
+more than 180 degrees apart, `validate` adds a note saying some bones may spin the long way and that
+a re-import fixes it. The note fails `validate`, and the package model cannot tell which source it
+came from, so it can be a false positive for a package whose source never wrapped rotations;
+re-importing clears it.
+
 ### preview
 
 ```bash
