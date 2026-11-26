@@ -238,6 +238,13 @@ fn to_group(g: usize, raw: &RawGroup, report: &mut LoadReport) -> Option<Physics
         // particles 1.. can drive an output. The SDK generation these rigs come
         // from stops at the first output it cannot use, so the ones after it
         // never ran either; they are dropped with it.
+        //
+        // That entry is information, not a note: in every SDK revision whose
+        // layout `decode` accepts, an output whose particle index is past the
+        // end of its chain ends that group's output loop and leaves other
+        // groups alone, which is exactly what is done here, so nothing the
+        // source ran is lost. Established by reading those revisions' behaviour
+        // (no source is reproduced here). Every other drop stays a note.
         let particle = u32::try_from(o.particle).unwrap_or(0);
         let candidate = PhysicsOutput {
             destination: o.destination.clone(),
@@ -249,7 +256,7 @@ fn to_group(g: usize, raw: &RawGroup, report: &mut LoadReport) -> Option<Physics
         };
         if !candidate.reads_particle_in(raw.particles.len()) {
             let dropped = raw.outputs.len() - index;
-            report.note(format!(
+            report.info(format!(
                 "source physics group {g}: output {:?} reads particle {} of a chain of {}; it and the {} output(s) \
                  after it are dropped, as the source stops at the first unusable output",
                 o.destination,
@@ -514,6 +521,8 @@ pub(super) mod tests {
             let text = report.to_string();
             assert!(text.contains("ParamHairA") && text.contains("it and the 1 output(s) after it"), "{text}");
             assert_eq!(report.len(), 1);
+            // Information: the source stops there too, so nothing it ran is lost.
+            assert!(matches!(report.warnings()[0], a2d_core::Degradation::Info(_)), "{report}");
         }
         // A bad output after good ones keeps the good ones.
         rig.groups[0].outputs[0].particle = 1;
@@ -564,6 +573,23 @@ pub(super) mod tests {
             assert!(text.contains("physics group 0") && text.contains(what) && text.contains("dropped"), "{text}");
             assert!(physics.problem().is_none());
         }
+    }
+
+    #[test]
+    fn other_physics_drops_stay_notes() {
+        use a2d_core::Degradation;
+        let mut rig = sample();
+        rig.groups[0].outputs[0].component = 3;
+        let mut report = LoadReport::new();
+        to_physics(&rig, &mut report).unwrap();
+        assert!(matches!(report.warnings(), [Degradation::Note(_)]), "{report}");
+
+        let mut rig = sample();
+        rig.groups[0].particles[1].radius = f32::NAN;
+        let mut report = LoadReport::new();
+        to_physics(&rig, &mut report).unwrap();
+        assert!(report.warnings().iter().all(|w| matches!(w, Degradation::Note(_))), "{report}");
+        assert!(!report.is_empty());
     }
 
     #[test]
