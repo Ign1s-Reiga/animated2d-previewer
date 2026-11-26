@@ -18,7 +18,7 @@
 //! A `PPtr` is a file index (`i32`) plus a path id (`i64`); index 0 means "this
 //! file", anything else indexes the externals table.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use a2d_core::DecodeError;
 
@@ -255,6 +255,162 @@ fn read_behaviour_script(file: &SerializedFile, object: &Object) -> Result<Optio
     Ok(script.is_local().then_some(script.path_id))
 }
 
+/// `RectTransform`'s class id; its body begins with a `Transform`'s.
+const RECT_TRANSFORM: ClassId = ClassId(224);
+
+/// Most nodes a hierarchy walk visits before giving up as corrupt.
+const MAX_HIERARCHY_NODES: usize = 1_000_000;
+
+/// A `GameObject`'s `Transform`, as its path id; `None` when it has not
+/// exactly one.
+fn transform_of(file: &SerializedFile, game_object: &Object) -> Result<Option<i64>, DecodeError> {
+    let mut r = reader(file, game_object)?;
+    let count = r.count(12, "GameObject components")?;
+    let mut found = None;
+    for _ in 0..count {
+        let component = PPtr::read(&mut r)?;
+        let Some(object) = component.is_local().then(|| file.find_object(component.path_id)).flatten() else {
+            continue;
+        };
+        if object.class_id == ClassId::TRANSFORM || object.class_id == RECT_TRANSFORM {
+            if found.is_some() {
+                return Ok(None);
+            }
+            found = Some(object.path_id);
+        }
+    }
+    Ok(found)
+}
+
+/// A `Transform`'s owner, children and parent: `PPtr m_GameObject`, rotation,
+/// position and scale (40 bytes), `m_Children`, then `PPtr m_Father`.
+fn read_transform(file: &SerializedFile, object: &Object) -> Result<(PPtr, Vec<PPtr>, PPtr), DecodeError> {
+    let mut r = reader(file, object)?;
+    let owner = PPtr::read(&mut r)?;
+    for _ in 0..10 {
+        if !r.f32()?.is_finite() {
+            return Err(DecodeError::corrupt(format!("Transform {} holds a non-finite value", object.path_id)));
+        }
+    }
+    let count = r.count(12, "Transform children")?;
+    let mut children = Vec::with_capacity(count);
+    for _ in 0..count {
+        children.push(PPtr::read(&mut r)?);
+    }
+    let father = PPtr::read(&mut r)?;
+    // A plain Transform ends here; a RectTransform carries more after it.
+    if object.class_id == ClassId::TRANSFORM && r.remaining() != 0 {
+        return Err(DecodeError::corrupt(format!(
+            "Transform {} has {} unread byte(s) after its parent",
+            object.path_id,
+            r.remaining()
+        )));
+    }
+    Ok((owner, children, father))
+}
+
+/// The subtree an `Animator` binds clips against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnimatorHierarchy {
+    /// Path id of the `GameObject` the `Animator` sits on.
+    pub game_object: i64,
+    /// Paths of every `Transform` under it, relative to it (`""` for itself).
+    pub paths: HashSet<String>,
+}
+
+/// The path id of the `GameObject` a `MonoBehaviour` is attached to; `None`
+/// when detached or the owner is in another file.
+pub fn behaviour_owner_id(file: &SerializedFile, object: &Object) -> Result<Option<i64>, DecodeError> {
+    if object.class_id != ClassId::MONO_BEHAVIOUR {
+        return Err(DecodeError::corrupt(format!("object {} is not a MonoBehaviour", object.path_id)));
+    }
+    let mut r = reader(file, object)?;
+    let (owner, _) = read_behaviour_header(&mut r)?;
+    Ok(owner.is_local().then_some(owner.path_id))
+}
+
+/// Every path an `Animator`'s generic bindings could resolve to: the paths of
+/// all `Transform`s under the `GameObject` the `Animator` sits on, relative to
+/// it (`""` for that object, then `"Child"`, `"Child/Grandchild"`).
+///
+/// Unity binds a clip's curves to this subtree when the `Animator`
+/// initialises, so a binding whose path hash is none of these drives nothing.
+/// That only holds when the answer is complete, so this is strict: it errors
+/// unless the file holds exactly one enabled `Animator`, sitting on a root
+/// `Transform` (no parent), and every object of the subtree is local, present
+/// and consistent (each child names the parent that lists it; no cycle).
+/// Positions and rotations must be finite, the root `Transform` must belong to
+/// the `Animator`'s `GameObject`, and a plain `Transform` must end exactly
+/// where its parent pointer does. Anything unreadable is an error and never a
+/// partial set.
+pub fn animator_hierarchy_paths(file: &SerializedFile) -> Result<AnimatorHierarchy, DecodeError> {
+    let animators: Vec<&Object> = file.objects.iter().filter(|o| o.class_id == ClassId::ANIMATOR).collect();
+    let [animator] = animators.as_slice() else {
+        return Err(DecodeError::corrupt(format!("the file holds {} Animators, not exactly one", animators.len())));
+    };
+    let mut r = reader(file, animator)?;
+    let owner = PPtr::read(&mut r)?;
+    let at = r.position() as u64;
+    match r.u8()? {
+        1 => {}
+        0 => return Err(DecodeError::corrupt("the Animator is disabled".to_string())),
+        other => return Err(DecodeError::corrupt_at(format!("the Animator's m_Enabled is {other}, not 0/1"), at)),
+    }
+    let game_object = owner.path_id;
+    let owner = owner
+        .is_local()
+        .then(|| file.find_object(owner.path_id))
+        .flatten()
+        .filter(|o| o.class_id == ClassId::GAME_OBJECT)
+        .ok_or_else(|| DecodeError::corrupt("the Animator's GameObject is not in this file".to_string()))?;
+    let root = transform_of(file, owner)?
+        .ok_or_else(|| DecodeError::corrupt("the Animator's GameObject has no single Transform".to_string()))?;
+
+    let mut paths = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![(root, String::new(), true)];
+    while let Some((id, path, is_root)) = stack.pop() {
+        if !seen.insert(id) || seen.len() > MAX_HIERARCHY_NODES {
+            return Err(DecodeError::corrupt("the Transform hierarchy has a cycle or is too large".to_string()));
+        }
+        let object =
+            file.find_object(id).ok_or_else(|| DecodeError::corrupt(format!("Transform {id} is not in this file")))?;
+        let (transform_owner, children, father) = read_transform(file, object)?;
+        if is_root && (!father.is_null() || !transform_owner.is_local() || transform_owner.path_id != game_object) {
+            return Err(DecodeError::corrupt(
+                "the Animator is not on a root Transform of its own GameObject".to_string(),
+            ));
+        }
+        paths.insert(path.clone());
+        for child in children {
+            let child_object = child
+                .is_local()
+                .then(|| file.find_object(child.path_id))
+                .flatten()
+                .filter(|o| o.class_id == ClassId::TRANSFORM || o.class_id == RECT_TRANSFORM)
+                .ok_or_else(|| DecodeError::corrupt(format!("a child of Transform {id} is not a local Transform")))?;
+            let (child_owner, _, child_father) = read_transform(file, child_object)?;
+            if !(child_father.is_local() && child_father.path_id == id) {
+                return Err(DecodeError::corrupt(format!(
+                    "Transform {} is listed under {id} but names another parent",
+                    child.path_id
+                )));
+            }
+            let name = child_owner
+                .is_local()
+                .then(|| file.find_object(child_owner.path_id))
+                .flatten()
+                .filter(|o| o.class_id == ClassId::GAME_OBJECT)
+                .ok_or_else(|| DecodeError::corrupt(format!("Transform {} has no GameObject here", child.path_id)))
+                .and_then(|o| read_name(file, o))?
+                .ok_or_else(|| DecodeError::corrupt("a GameObject has no name".to_string()))?;
+            let child_path = if path.is_empty() { name } else { format!("{path}/{name}") };
+            stack.push((child.path_id, child_path, false));
+        }
+    }
+    Ok(AnimatorHierarchy { game_object, paths })
+}
+
 /// A `MonoScript`'s C# identity.
 ///
 /// The fields between the name and the class name vary by Unity version, so
@@ -367,7 +523,7 @@ mod tests {
     }
 
     /// `(path_id, type_index, bytes)` objects into a version-17 file with no
-    /// type tree. Type 0 is GameObject, 1 MonoScript, 2 MonoBehaviour.
+    /// type tree. Type 0 is GameObject, 1 MonoScript, 2 MonoBehaviour, 3 Transform, 4 Animator, 5 RectTransform.
     fn build(objects: &[(i64, usize, Vec<u8>)]) -> SerializedFile {
         // The 20-byte header is a multiple of four, so alignment inside the
         // metadata is the same as alignment from the start of the file.
@@ -375,8 +531,8 @@ mod tests {
         meta.extend_from_slice(b"2022.3.0f1\0");
         put_i32(&mut meta, 5); // target platform
         meta.push(0); // no type tree
-        put_i32(&mut meta, 3);
-        for class in [1i32, 115, 114] {
+        put_i32(&mut meta, 6);
+        for class in [1i32, 115, 114, 4, 95, 224] {
             put_i32(&mut meta, class);
             meta.push(0); // not stripped
             meta.extend_from_slice(&(-1i16).to_le_bytes());
@@ -481,5 +637,119 @@ mod tests {
         assert_eq!(inventory.by_script("Thing").count(), 4);
         let names: Vec<_> = inventory.by_script("Thing").filter_map(|o| o.name.clone()).collect();
         assert_eq!(names, ["b1", "detached", "elsewhere", "dangling"]);
+    }
+
+    // --- The Animator's hierarchy. ---
+
+    fn go(components: &[i64], name: &str) -> Vec<u8> {
+        let mut o = Vec::new();
+        put_i32(&mut o, components.len() as i32);
+        for c in components {
+            put_pptr(&mut o, 0, *c);
+        }
+        put_i32(&mut o, 0);
+        put_string(&mut o, name);
+        o
+    }
+
+    fn transform(owner: i64, children: &[i64], father: i64) -> Vec<u8> {
+        let mut o = Vec::new();
+        put_pptr(&mut o, 0, owner);
+        o.extend_from_slice(&[0; 40]);
+        put_i32(&mut o, children.len() as i32);
+        for c in children {
+            put_pptr(&mut o, 0, *c);
+        }
+        put_pptr(&mut o, 0, father);
+        o
+    }
+
+    /// A `RectTransform`: a transform body plus fields this reader does not use.
+    fn rect_transform(owner: i64, children: &[i64], father: i64) -> Vec<u8> {
+        let mut o = transform(owner, children, father);
+        o.extend_from_slice(&[0; 40]);
+        o
+    }
+
+    fn animator(owner: i64, enabled: u8) -> Vec<u8> {
+        let mut o = Vec::new();
+        put_pptr(&mut o, 0, owner);
+        o.extend_from_slice(&[enabled, 0, 0, 0]);
+        put_pptr(&mut o, 0, 0);
+        put_pptr(&mut o, 0, 0);
+        o
+    }
+
+    /// Root > Parameters > P1, and Root > Parts.
+    fn model(extra: &[(i64, usize, Vec<u8>)]) -> SerializedFile {
+        let mut objects = vec![
+            (10, 0, go(&[11, 99], "Root")),
+            (11, 3, transform(10, &[21, 31], 0)),
+            (20, 0, go(&[21], "Parameters")),
+            (21, 3, transform(20, &[41], 11)),
+            (30, 0, go(&[31], "Parts")),
+            (31, 3, transform(30, &[], 11)),
+            (40, 0, go(&[41], "P1")),
+            (41, 5, rect_transform(40, &[], 21)),
+            (99, 4, animator(10, 1)),
+        ];
+        objects.extend_from_slice(extra);
+        build(&objects)
+    }
+
+    #[test]
+    fn the_animators_hierarchy_lists_every_path_below_the_root_without_its_name() {
+        let found = animator_hierarchy_paths(&model(&[])).unwrap();
+        assert_eq!(found.game_object, 10);
+        let paths = found.paths;
+        let mut sorted: Vec<_> = paths.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["", "Parameters", "Parameters/P1", "Parts"]);
+    }
+
+    #[test]
+    fn a_hierarchy_that_cannot_be_trusted_is_an_error_and_never_a_partial_set() {
+        // A second Animator.
+        assert!(animator_hierarchy_paths(&model(&[(98, 4, animator(20, 1))])).is_err());
+        // No Animator at all.
+        let none = build(&[(10, 0, go(&[11], "Root")), (11, 3, transform(10, &[], 0))]);
+        assert!(animator_hierarchy_paths(&none).is_err());
+        let one = |root_children: &[i64], root_father: i64, enabled: u8, extra: Vec<(i64, usize, Vec<u8>)>| {
+            let mut objects = vec![
+                (10, 0, go(&[11], "Root")),
+                (11, 3, transform(10, root_children, root_father)),
+                (99, 4, animator(10, enabled)),
+            ];
+            objects.extend(extra);
+            build(&objects)
+        };
+        assert!(animator_hierarchy_paths(&one(&[], 0, 1, vec![])).is_ok());
+        // Disabled.
+        assert!(animator_hierarchy_paths(&one(&[], 0, 0, vec![])).is_err());
+        // A child that is not in the file.
+        assert!(animator_hierarchy_paths(&one(&[77], 0, 1, vec![])).is_err());
+        // A child that names another parent.
+        let kid = vec![(20, 0, go(&[21], "Kid")), (21, 3, transform(20, &[], 55))];
+        assert!(animator_hierarchy_paths(&one(&[21], 0, 1, kid)).is_err());
+        // The Animator is not on a root.
+        assert!(animator_hierarchy_paths(&one(&[], 5, 1, vec![])).is_err());
+        // A child listed twice: the second visit hits the seen-set guard (its
+        // parent pointer is right, so nothing else would catch it).
+        let kid = vec![(20, 0, go(&[21], "Kid")), (21, 3, transform(20, &[], 11))];
+        let err = animator_hierarchy_paths(&one(&[21, 21], 0, 1, kid)).unwrap_err().to_string();
+        assert!(err.contains("cycle"), "{err}");
+        // A root whose Transform belongs to another GameObject.
+        let other = build(&[(10, 0, go(&[11], "Root")), (11, 3, transform(55, &[], 0)), (99, 4, animator(10, 1))]);
+        assert!(animator_hierarchy_paths(&other).is_err());
+        // A non-finite component, trailing bytes on a plain Transform, a bad flag.
+        let mut nan = transform(10, &[], 0);
+        nan[12..16].copy_from_slice(&f32::NAN.to_le_bytes());
+        let bad = build(&[(10, 0, go(&[11], "Root")), (11, 3, nan), (99, 4, animator(10, 1))]);
+        assert!(animator_hierarchy_paths(&bad).is_err());
+        let mut long = transform(10, &[], 0);
+        long.extend_from_slice(&[0; 4]);
+        let bad = build(&[(10, 0, go(&[11], "Root")), (11, 3, long), (99, 4, animator(10, 1))]);
+        assert!(animator_hierarchy_paths(&bad).is_err());
+        assert!(animator_hierarchy_paths(&one(&[], 0, 2, vec![])).is_err());
     }
 }
