@@ -96,6 +96,17 @@ fn import_warnings_recorded_in_the_manifest_are_printed() {
 }
 
 #[test]
+fn import_notes_recorded_in_the_manifest_are_printed_by_preview_too() {
+    let mut package = cubism_package(true);
+    package.manifest.import_warnings.push("a curve was dropped".into());
+    package.manifest.import_notes.push("motions were recovered from clips".into());
+    let Some((_dir, text)) = export_package(package, "notes") else { return };
+    assert_eq!(text.matches("motions were recovered from clips").count(), 1, "{text}");
+    assert!(text.contains("recorded at import: motions were recovered from clips"), "{text}");
+    assert!(text.contains("recorded at import: a curve was dropped"), "{text}");
+}
+
+#[test]
 fn a_missing_first_page_previews_with_a_placeholder_and_says_so() {
     let mut package = cubism_package(true);
     // Page zero is listed but its file is gone; a second page exists.

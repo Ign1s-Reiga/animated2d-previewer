@@ -590,8 +590,9 @@ pub fn cubism_deformation_package() -> a2d_pack::Package {
 
 /// `validate` warnings that are not expected on an imported real model.
 ///
-/// Expected: notes recorded at import, and exactly the per-parameter
-/// "treated as repeating" notes the model itself derives (a MOC3 v2 stores no
+/// Expected: entries recorded at import (`validate` repeats them as `recorded at
+/// import: ...`), and exactly the per-parameter "treated as repeating" notes the
+/// model itself derives (a MOC3 v2 stores no
 /// repeat flag, so `validate` re-derives them via `repeat_degradations`).
 /// Anything else is returned.
 pub fn unexpected_validate_warnings(package: &a2d_pack::Package) -> Vec<String> {

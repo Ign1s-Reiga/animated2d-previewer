@@ -210,8 +210,31 @@ pub fn import(set: &SpineSourceSet, source_game: &str) -> Result<(Package, LoadR
         }
     }
 
-    package.manifest.import_warnings = report.warnings().iter().map(|w| w.to_string()).collect();
+    record_report(&mut package, report.warnings());
     Ok((package, report))
+}
+
+/// Copies degradations into the manifest, sorted by what they mean for the
+/// package: a [`Degradation::Info`] (the package plays as the source would;
+/// nothing dropped or approximated) goes to `import_notes`, and every other
+/// variant, [`Degradation::Note`] included, goes to `import_warnings` and fails
+/// `validate`.
+///
+/// Information is opt-in: a `Note` may describe real data loss, and many
+/// degradations leave no trace in the IR, so `validate` could not find them
+/// again. Keeping the two apart is what lets it fail on losses while letting
+/// the informational entries pass.
+pub(crate) fn record_report<'a>(package: &mut Package, degradations: impl IntoIterator<Item = &'a Degradation>) {
+    let mut warnings = Vec::new();
+    let mut notes = Vec::new();
+    for degradation in degradations {
+        match degradation {
+            Degradation::Info(_) => notes.push(degradation.to_string()),
+            _ => warnings.push(degradation.to_string()),
+        }
+    }
+    package.manifest.import_warnings = warnings;
+    package.manifest.import_notes = notes;
 }
 
 /// Decodes just the IR, without reading texture bytes. Used by `inspect`.
@@ -272,6 +295,28 @@ pub fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_report_keeps_only_information_as_a_note() {
+        let mut report = LoadReport::new();
+        report.info("how it was reconstructed");
+        report.note("a note, which may be a loss");
+        report.warn(Degradation::MissingReference { kind: "texture page".into(), name: "hero.png".into() });
+        report.warn(Degradation::UnsupportedConstraint { name: "reach".into(), kind: "ik".into() });
+        report.warn(Degradation::ClampedValue { context: "motion".into(), field: "f".into(), detail: "d".into() });
+        let mut package = Package::from_spine(SpineIr::default(), "hero");
+        record_report(&mut package, report.warnings());
+        assert_eq!(package.manifest.import_notes, vec!["how it was reconstructed".to_string()]);
+        assert_eq!(
+            package.manifest.import_warnings,
+            vec![
+                "a note, which may be a loss".to_string(),
+                "missing texture page: hero.png".to_string(),
+                "ik constraint \"reach\" unsupported".to_string(),
+                "clamped f in motion: d".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn compound_suffixes_normalise_to_the_character_name() {

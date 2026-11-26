@@ -24,10 +24,11 @@ use std::collections::BTreeMap;
 
 use a2d_core::ir::cubism::{LookBlend, LookRig, Parameter};
 use a2d_core::LoadReport;
-use a2d_unity::{behaviour_body, behaviour_owner_name, Inventory, SerializedFile};
+use a2d_unity::{behaviour_body, behaviour_owner_name, ClassId, Inventory, SerializedFile};
 
 use super::look::{self, LOOK_CONTROLLER, LOOK_PARAMETER};
 const EXPRESSION_CONTROLLER: &str = "CubismExpressionController";
+const FADE_CONTROLLER: &str = "CubismFadeController";
 
 /// A driver kind reported only when present, with the classes that mark it.
 const KINDS: &[(&str, &[&str])] = &[
@@ -68,11 +69,47 @@ impl Scan {
     }
 }
 
-/// Notes the components found and not applied, one per kind.
+/// Notes the components found, one per kind. Every entry is a note, a recovered
+/// look-at rig included: whether its rest target matches the source depends on
+/// the target's script and active state, which is not verified.
 pub(super) fn note_scan(scan: &Scan, report: &mut LoadReport) {
     for note in notes(scan) {
         report.note(note);
     }
+}
+
+/// Whether the source may fade its motions with authored times that this
+/// bundle's clips do not carry: a `CubismFadeController` points at a fade-motion
+/// list (the data lives in other objects, possibly of another bundle), or one
+/// cannot be read to tell. `false` only when there is no such controller and
+/// every one there is has a null list.
+///
+/// Every doubt fails toward `true` (authored fades possible):
+///
+/// * the list is taken to be the controller's first serialized field, after the
+///   behaviour header, and the body must hold that one `PPtr` and nothing else.
+///   Nothing in this repository records the controller's layout, so a body with
+///   anything left over is not a layout this knows and counts as unreadable;
+/// * a `MonoBehaviour` whose script did not resolve (an external or unreadable
+///   `MonoScript`, so invisible to a search by class name) may be a fade
+///   controller, so one existing at all counts.
+pub(super) fn fades_may_be_authored(file: &SerializedFile, inventory: &Inventory) -> bool {
+    if inventory.by_class(ClassId::MONO_BEHAVIOUR).any(|info| info.script.is_none()) {
+        return true;
+    }
+    inventory.by_script(FADE_CONTROLLER).any(|info| {
+        let list = file.find_object(info.path_id).ok_or(()).and_then(|object| {
+            behaviour_body(file, object)
+                .and_then(|(mut r, _)| {
+                    let file_index = r.i32()?;
+                    let path = r.i64()?;
+                    Ok((file_index, path, r.remaining()))
+                })
+                .map_err(|_| ())
+        });
+        // Only a null PPtr (file 0, path 0) with nothing after it is "no list".
+        !matches!(list, Ok((0, 0, 0)))
+    })
 }
 
 pub(super) fn scan(file: &SerializedFile, inventory: &Inventory) -> Scan {
@@ -378,6 +415,64 @@ pub(in crate::unity_cubism) mod tests {
         put_string(&mut o, "");
         o.extend_from_slice(body);
         o
+    }
+
+    #[test]
+    fn authored_fades_are_possible_only_with_a_fade_controller_that_names_a_list_or_cannot_be_read() {
+        let state = |body: Option<Vec<u8>>| {
+            let mut objects = vec![(10, 1, mono_script(FADE_CONTROLLER))];
+            if let Some(body) = body {
+                objects.push((20, 2, behaviour(0, 10, &body)));
+            }
+            let file = build(&objects);
+            fades_may_be_authored(&file, &Inventory::build(&file))
+        };
+        let pptr = |path: i64| {
+            let mut o = Vec::new();
+            put_pptr(&mut o, 0, path);
+            o
+        };
+        assert!(!state(None), "no controller: nothing authored");
+        assert!(!state(Some(pptr(0))), "a null list: nothing authored");
+        assert!(state(Some(pptr(7))), "a list is named: its times may be authored");
+        assert!(state(Some(Vec::new())), "unreadable: cannot be shown to hold no list");
+        // A null list followed by more serialized data is not the layout known.
+        let mut longer = pptr(0);
+        longer.extend_from_slice(&[0; 4]);
+        assert!(state(Some(longer)), "bytes left after the one field: cannot be trusted");
+
+        // A behaviour whose script did not resolve may be a fade controller.
+        let file = build(&[(20, 2, behaviour(0, 99, &pptr(0)))]);
+        assert!(fades_may_be_authored(&file, &Inventory::build(&file)));
+        // ... even beside a fade controller that names no list.
+        let file = build(&[
+            (10, 1, mono_script(FADE_CONTROLLER)),
+            (20, 2, behaviour(0, 10, &pptr(0))),
+            (21, 2, behaviour(0, 98, &[])),
+        ]);
+        assert!(fades_may_be_authored(&file, &Inventory::build(&file)));
+        // No fade controller class at all.
+        let file = build(&[(10, 1, mono_script(EXPRESSION_CONTROLLER))]);
+        assert!(!fades_may_be_authored(&file, &Inventory::build(&file)));
+    }
+
+    #[test]
+    fn a_recovered_look_rig_is_reported_as_a_note_never_as_information() {
+        use a2d_core::Degradation;
+        let rig = LookRig {
+            blend: LookBlend::Additive,
+            damping: 0.15,
+            rest_target: (0.0, 0.0, 0.0),
+            center: (0.0, 0.0, 0.0),
+            parameters: Vec::new(),
+        };
+        let mut scan = scan_of(&[(LOOK_CONTROLLER, 1)], &[Some("ParamAngleX")], (false, false));
+        scan.look = Some(rig);
+        let mut report = LoadReport::new();
+        note_scan(&scan, &mut report);
+        assert_eq!(report.len(), 1, "{report}");
+        assert!(report.to_string().contains("look-at rig (CubismLookController) recovered"), "{report}");
+        assert!(matches!(report.warnings()[0], Degradation::Note(_)), "{report}");
     }
 
     #[test]

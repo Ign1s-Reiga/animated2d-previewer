@@ -1527,21 +1527,22 @@ mod tests {
     }
 
     #[test]
-    fn a_package_without_warp_opacities_says_to_re_import() {
-        let notes = |ir: CubismIr| {
-            Package::from_cubism(ir, "test", "x")
-                .validate()
-                .warnings()
-                .iter()
-                .map(|w| w.to_string())
-                .collect::<Vec<_>>()
-                .join(
-                    "
+    fn a_package_without_warp_opacities_says_to_re_import_only_before_format_4() {
+        let notes = |ir: CubismIr, format_version: u32| {
+            let mut package = Package::from_cubism(ir, "test", "x");
+            package.manifest.format_version = format_version;
+            package.validate().warnings().iter().map(|w| w.to_string()).collect::<Vec<_>>().join(
+                "
 ",
-                )
+            )
         };
-        assert!(notes(with_glue_v3()).contains("warp opacity"));
-        assert!(!notes(with_glue()).contains("warp opacity"));
+        // Written before format 4: the track may simply not have been stored.
+        assert!(notes(with_glue_v3(), 3).contains("warp opacities"));
+        // A current package with an empty track came from a source with none,
+        // which the import already reported; validate says nothing more.
+        assert!(!notes(with_glue_v3(), crate::FORMAT_VERSION).contains("warp opacities"));
+        assert!(!notes(with_glue(), 3).contains("warp opacities"));
+        assert!(!notes(with_glue(), crate::FORMAT_VERSION).contains("warp opacities"));
     }
 
     #[test]
@@ -2117,9 +2118,9 @@ mod tests {
     }
 
     #[test]
-    fn a_version_9_header_is_refused_rather_than_misread() {
+    fn a_header_newer_than_the_current_version_is_refused_rather_than_misread() {
         let mut bytes = encode(&with_handovers());
-        bytes[4..8].copy_from_slice(&9u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&(crate::FORMAT_VERSION + 1).to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("too new");
         assert!(err.to_string().contains("newer"), "{err}");
     }

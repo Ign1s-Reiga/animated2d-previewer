@@ -54,7 +54,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use a2d_core::ir::cubism::{CurveKey, Motion, MotionCurve};
-use a2d_core::{DecodeError, LoadReport};
+use a2d_core::{DecodeError, Degradation, LoadReport};
 use a2d_unity::{crc32_str, AnimationClip, GenericBinding, PPtr, StreamedKey};
 
 use super::fade_motion::DEFAULT_FADE;
@@ -177,7 +177,9 @@ fn classify(
 #[derive(Default)]
 struct Tally {
     unresolved: usize,
-    opacity: usize,
+    /// Indices of the clip's model-opacity bindings, kept to tell a curve that
+    /// is constant at the default from one that animates.
+    opacity: Vec<usize>,
     parts: Vec<Option<String>>,
     eye_blink: usize,
     lip_sync: usize,
@@ -324,12 +326,17 @@ fn dense_keys(clip: &AnimationClip, curve: usize) -> Option<Vec<CurveKey>> {
 /// not worth listing.
 ///
 /// `script_class` resolves a binding's script reference to a C# class name.
+/// `fades_may_be_authored` is whether the bundle has a `CubismFadeController`
+/// with a fade-motion list (or one that could not be read); the fade line is
+/// information only when it is `false`.
 /// Never produces anything the package writer would refuse; everything dropped
-/// or altered is summarised in one note on `report`.
+/// or altered is its own failing entry on `report`, and the fade line is the one
+/// [`Degradation::Info`].
 pub(super) fn to_motion(
     clip: &AnimationClip,
     names: &NameTable,
     script_class: &dyn Fn(PPtr) -> Option<String>,
+    fades_may_be_authored: bool,
     report: &mut LoadReport,
 ) -> Option<Motion> {
     let hashes = Hashes {
@@ -345,7 +352,7 @@ pub(super) fn to_motion(
     for (index, binding) in clip.bindings.iter().enumerate() {
         match classify(binding, names, script_class, &hashes) {
             Target::Unresolved => tally.unresolved += 1,
-            Target::ModelOpacity => tally.opacity += 1,
+            Target::ModelOpacity => tally.opacity.push(index),
             Target::PartOpacity(id) => tally.parts.push(id),
             Target::EyeBlink => tally.eye_blink += 1,
             Target::LipSync => tally.lip_sync += 1,
@@ -362,21 +369,63 @@ pub(super) fn to_motion(
         }
     }
 
-    let mut notes: Vec<String> = Vec::new();
-    let mut count = |n: usize, text: &str| {
+    // Everything below that loses or approximates source data is its own
+    // report entry, so `validate` can fail on it. Only the fade line, which says
+    // nothing was lost, is information.
+    let motion_label = format!("motion {:?}", clip.name);
+    let mut losses: Vec<Degradation> = Vec::new();
+    let mut info: Vec<String> = Vec::new();
+    let lost = |losses: &mut Vec<Degradation>, n: usize, text: &str| {
         if n > 0 {
-            notes.push(format!("{n} {text}"));
+            losses.push(Degradation::Note(format!("{motion_label}: {n} {text}")));
         }
     };
-    count(tally.unresolved, "binding(s) match no parameter in this model and were dropped");
-    count(tally.opacity, "model-opacity curve(s) ignored (no counterpart in the model)");
-    count(tally.eye_blink, "eye-blink curve(s) ignored (model-level eye opening is not applied)");
-    count(tally.lip_sync, "lip-sync curve(s) ignored (model-level mouth opening is not applied)");
-    count(tally.dense_unusable, "dense curve(s) did not fit the assumed layout and were dropped");
-    count(tally.non_finite, "curve(s) held a non-finite value and were dropped");
-    count(tally.no_keys, "curve(s) had no keys and were dropped");
-    count(tally.duplicates, "extra curve(s) on an already-driven parameter were dropped");
-    count(tally.off_segments, "segment(s) are not exactly representable as Hermite keys (cubic misses the next key)");
+    lost(&mut losses, tally.eye_blink, "eye-blink curve(s) ignored (model-level eye opening is not applied)");
+    lost(&mut losses, tally.lip_sync, "lip-sync curve(s) ignored (model-level mouth opening is not applied)");
+    lost(&mut losses, tally.dense_unusable, "dense curve(s) did not fit the assumed layout and were dropped");
+    lost(&mut losses, tally.non_finite, "curve(s) held a non-finite value and were dropped");
+    lost(&mut losses, tally.no_keys, "curve(s) had no keys and were dropped");
+    lost(&mut losses, tally.duplicates, "extra curve(s) on an already-driven parameter were dropped");
+    if tally.unresolved > 0 {
+        losses.push(Degradation::MissingReference {
+            kind: "parameter".into(),
+            name: format!(
+                "{} binding(s) of {motion_label} match no parameter in this model and were dropped",
+                tally.unresolved
+            ),
+        });
+    }
+    if tally.off_segments > 0 {
+        // An approximation, not a clamp: the segment is kept, but not exactly.
+        losses.push(Degradation::Note(format!(
+            "{motion_label}: {} segment(s) are not exactly representable as Hermite keys (cubic misses the next key)",
+            tally.off_segments
+        )));
+    }
+    // A model-opacity curve has no counterpart in the model. One that never
+    // leaves the default opacity of 1 changes nothing, so ignoring it is not a
+    // loss; one that animates would have faded the model.
+    //
+    // Strict: a dense curve (read on an unverified layout) never counts, nor does
+    // a streamed curve with a segment that is not exactly representable, whose
+    // value between keys is then not known to be 1. Every key must sit at 1 with
+    // zero slopes.
+    let constant_at_default = |index: usize| {
+        let mut own = Tally::default();
+        let dense = index >= clip.dense_curve_start() && index < clip.constant_curve_start();
+        let keys = curve_keys(clip, index, offset, &mut own);
+        !dense
+            && own.off_segments == 0
+            && keys.is_some_and(|keys| {
+                keys.iter()
+                    .all(|k| (k.value - 1.0).abs() <= 1e-6 && k.in_slope.abs() <= 1e-6 && k.out_slope.abs() <= 1e-6)
+            })
+    };
+    let constant = tally.opacity.iter().filter(|&&i| constant_at_default(i)).count();
+    if constant > 0 {
+        info.push(format!("{constant} model-opacity curve(s) constant at 1, no effect"));
+    }
+    lost(&mut losses, tally.opacity.len() - constant, "model-opacity curve(s) ignored (no counterpart in the model)");
     if !tally.parts.is_empty() {
         let mut ids: Vec<&str> = tally.parts.iter().flatten().map(String::as_str).collect();
         ids.sort_unstable();
@@ -390,13 +439,15 @@ pub(super) fn to_motion(
             let sep = if ids.is_empty() { " on " } else { ", " };
             text.push_str(&format!("{sep}{unnamed} on a part not named in this bundle"));
         }
-        notes.push(text);
+        losses.push(Degradation::Note(format!("{motion_label}: {text}")));
     }
     for (what, n) in &tally.other {
-        notes.push(format!("{n} binding(s) on {what} ignored"));
+        losses.push(Degradation::Note(format!("{motion_label}: {n} binding(s) on {what} ignored")));
     }
     if tally.dense_used {
-        notes.push("dense curves were read on an unverified layout (linear between samples)".to_string());
+        losses.push(Degradation::Note(format!(
+            "{motion_label}: dense curves were read on an unverified layout (linear between samples)"
+        )));
     }
 
     let last_key = curves.iter().flat_map(|c| c.keys.iter()).map(|k| k.time).fold(0.0f32, f32::max).max(0.0);
@@ -404,26 +455,34 @@ pub(super) fn to_motion(
     let duration = if length.is_finite() && length >= 0.0 {
         length
     } else {
-        notes.push(format!("clip length {length} is not usable; the last key time {last_key} is used instead"));
+        losses.push(Degradation::Note(format!(
+            "{motion_label}: clip length {length} is not usable; the last key time {last_key} is used instead"
+        )));
         last_key
     };
-    notes.push(format!(
-        "fade times are unavailable; the stored default {DEFAULT_FADE} is not applied, crossfades use the viewer's mix duration"
-    ));
+    for loss in losses {
+        report.warn(loss);
+    }
 
     if curves.is_empty() {
         report.note(format!(
-            "motion {:?} was not recovered from its AnimationClip: no curve drives a parameter of this model ({})",
-            clip.name,
-            notes.join("; ")
+            "{motion_label} was not recovered from its AnimationClip: no curve drives a parameter of this model"
         ));
         return None;
     }
-    report.note(format!(
-        "motion {:?} recovered from its AnimationClip (no matching fade motion data): {}",
-        clip.name,
-        notes.join("; ")
-    ));
+    // The fade part loses nothing only when the source has no authored fade
+    // times to apply: no `CubismFadeController`, or one whose fade-motion list is
+    // null. Otherwise the source may fade with times kept in data this bundle
+    // does not hold, so it is not claimed to play as the source does.
+    info.insert(
+        0,
+        format!(
+            "fade times are unavailable; the stored default {DEFAULT_FADE} is not applied, crossfades use the viewer's mix duration"
+        ),
+    );
+    let line =
+        format!("{motion_label} recovered from its AnimationClip (no matching fade motion data): {}", info.join("; "));
+    report.warn(if fades_may_be_authored { Degradation::Note(line) } else { Degradation::Info(line) });
 
     Some(Motion { name: clip.name.clone(), duration, fade_in: DEFAULT_FADE, fade_out: DEFAULT_FADE, curves })
 }
@@ -498,7 +557,7 @@ mod tests {
 
     fn convert_opt(clip: &AnimationClip) -> (Option<Motion>, LoadReport) {
         let mut report = LoadReport::new();
-        let motion = to_motion(clip, &table(), &resolver, &mut report);
+        let motion = to_motion(clip, &table(), &resolver, false, &mut report);
         (motion, report)
     }
 
@@ -512,8 +571,10 @@ mod tests {
         let c = clip(vec![vec![sk(0.0, [0.0; 3], 0.0)]], vec![], vec![param("ParamNotInThisModel")]);
         let (m, report) = convert_opt(&c);
         assert!(m.is_none());
-        assert_eq!(report.len(), 1);
+        // The dropped binding and the dropped motion are each their own entry.
+        assert_eq!(report.len(), 2, "{report}");
         assert!(report.to_string().contains("no curve drives a parameter"), "{report}");
+        assert!(report.warnings().iter().all(|w| !matches!(w, Degradation::Info(_))), "{report}");
     }
 
     #[test]
@@ -564,8 +625,9 @@ mod tests {
             m.curves[1].keys,
             vec![CurveKey { time: 0.0, value: 0.5, in_slope: 0.0, out_slope: 0.0, stepped: false }]
         );
-        assert_eq!(report.len(), 1, "one aggregated note per clip");
+        assert_eq!(report.len(), 1, "one line per clip, and it is information: nothing was lost");
         assert!(report.to_string().contains("fade times are unavailable"), "{report}");
+        assert!(matches!(report.warnings()[0], Degradation::Info(_)), "{report}");
 
         // And it is a motion the package accepts.
         let ir = a2d_core::ir::cubism::CubismIr { motions: vec![m], ..Default::default() };
@@ -653,10 +715,61 @@ mod tests {
         let (m, report) = convert(&c);
         assert_eq!(m.curves.len(), 1, "the curve is kept");
         assert!(report.to_string().contains("1 segment(s) are not exactly representable"), "{report}");
+        // An approximation, reported as a failing Note (not a clamp).
+        let approx = report.warnings().iter().find(|w| w.to_string().contains("not exactly representable"));
+        assert!(matches!(approx, Some(Degradation::Note(_))), "{report}");
     }
 
     #[test]
-    fn unresolved_hashes_and_model_opacity_make_notes_and_no_curves() {
+    fn the_fade_line_is_information_only_when_no_authored_fades_are_possible() {
+        let c = clip(vec![vec![sk(0.0, [0.0; 3], 0.0)]], vec![], vec![param("ParamA")]);
+        let fade_line = |may_be_authored: bool| {
+            let mut report = LoadReport::new();
+            to_motion(&c, &table(), &resolver, may_be_authored, &mut report).expect("a motion");
+            assert_eq!(report.len(), 1, "{report}");
+            report.warnings()[0].clone()
+        };
+        assert!(matches!(fade_line(false), Degradation::Info(_)));
+        let with_controller = fade_line(true);
+        assert!(matches!(with_controller, Degradation::Note(_)), "{with_controller:?}");
+        assert!(with_controller.to_string().contains("fade times are unavailable"), "{with_controller:?}");
+    }
+
+    #[test]
+    fn an_opacity_curve_that_dips_between_keys_or_is_dense_is_not_constant_at_the_default() {
+        let opacity = || binding("", SCRIPT_RENDER, "Opacity");
+        let opacity_entry =
+            |report: &LoadReport| report.warnings().iter().find(|w| w.to_string().contains("model-opacity")).cloned();
+
+        // Both keys sit at 1, but the first segment's cubic (2x^3 - 3x^2 + 1) falls
+        // to 0 at the next key, so the value in between is not 1 and the segment
+        // is not exactly representable.
+        let dipping = clip(
+            vec![vec![sk(0.0, [2.0, -3.0, 0.0], 1.0), sk(1.0, [0.0; 3], 1.0)], vec![sk(0.0, [0.0; 3], 0.0)]],
+            vec![],
+            vec![opacity(), param("ParamA")],
+        );
+        let (_, report) = convert(&dipping);
+        let entry = opacity_entry(&report).expect("the curve is reported");
+        assert!(matches!(entry, Degradation::Note(_)), "{report}");
+        assert!(entry.to_string().contains("1 model-opacity curve(s) ignored"), "{report}");
+        assert!(!report.to_string().contains("constant at 1"), "{report}");
+
+        // A dense curve is read on an unverified layout, so it is never claimed constant.
+        let mut dense = clip(vec![vec![sk(0.0, [0.0; 3], 0.0)]], vec![], vec![param("ParamA"), opacity()]);
+        dense.dense =
+            DenseClip { frame_count: 2, curve_count: 1, sample_rate: 10.0, begin_time: 0.0, samples: vec![1.0, 1.0] };
+        let (_, report) = convert(&dense);
+        let entry = opacity_entry(&report).expect("the curve is reported");
+        assert!(matches!(entry, Degradation::Note(_)), "{report}");
+        assert!(!report.to_string().contains("constant at 1"), "{report}");
+        assert!(matches!(report.warnings().last(), Some(Degradation::Info(_))), "the fade line stays information");
+    }
+
+    #[test]
+    fn unresolved_hashes_and_animated_model_opacity_are_failing_entries_and_make_no_curves() {
+        // The opacity curve rests at 0, not at the default of 1, so ignoring it
+        // changes what the model shows.
         let c = clip(
             vec![vec![sk(0.0, [0.0; 3], 0.0)], vec![sk(0.0, [0.0; 3], 0.0)], vec![sk(0.0, [0.0; 3], 0.0)]],
             vec![],
@@ -666,9 +779,84 @@ mod tests {
         assert_eq!(m.curves.len(), 1);
         assert_eq!(m.curves[0].target, "ParamA");
         let text = report.to_string();
-        assert_eq!(report.len(), 1, "{text}");
-        assert!(text.contains("1 binding(s) match no parameter in this model"), "{text}");
+        assert_eq!(report.len(), 3, "{text}");
+        assert!(text.contains("1 binding(s) of motion \"Idle\" match no parameter in this model"), "{text}");
+        assert!(report.warnings().iter().any(|w| matches!(w, Degradation::MissingReference { .. })), "{text}");
         assert!(text.contains("1 model-opacity curve(s) ignored"), "{text}");
+        // Only the fade line is information, and it does not mention opacity.
+        let info: Vec<_> = report.warnings().iter().filter(|w| matches!(w, Degradation::Info(_))).collect();
+        assert_eq!(info.len(), 1, "{text}");
+        assert!(!info[0].to_string().contains("opacity"), "{text}");
+    }
+
+    /// What `validate` would say about the package an import of `clip` makes.
+    fn validate_after_import(clip: &AnimationClip) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let (motion, report) = convert_opt(clip);
+        let ir = a2d_core::ir::cubism::CubismIr { motions: motion.into_iter().collect(), ..Default::default() };
+        let mut package = a2d_pack::Package::from_cubism(ir, "m", "cubism-moc3-v3");
+        crate::generic::record_report(&mut package, report.warnings());
+        let recorded: Vec<String> = package
+            .validate()
+            .warnings()
+            .iter()
+            .map(|w| w.to_string())
+            .filter(|w| w.starts_with("recorded at import:"))
+            .collect();
+        (package.manifest.import_warnings.clone(), package.manifest.import_notes.clone(), recorded)
+    }
+
+    #[test]
+    fn a_binding_matching_no_parameter_fails_validate_but_constant_opacity_alone_does_not() {
+        // Dropped data: the package cannot show it, so it must fail.
+        let lossy = clip(
+            vec![vec![sk(0.0, [0.0; 3], 0.0)], vec![sk(0.0, [0.0; 3], 0.0)]],
+            vec![],
+            vec![param("ParamNotInThisModel"), param("ParamA")],
+        );
+        let (warnings, notes, recorded) = validate_after_import(&lossy);
+        assert_eq!(notes.len(), 1, "only the fade line is information: {notes:?}");
+        assert!(warnings.iter().any(|w| w.contains("match no parameter")), "{warnings:?}");
+        assert!(recorded.iter().any(|w| w.contains("match no parameter")), "validate must report it: {recorded:?}");
+
+        // A model-opacity curve held at 1 changes nothing: nothing to fail on.
+        let harmless = clip(
+            vec![vec![sk(0.0, [0.0; 3], 1.0)], vec![sk(0.0, [0.0; 3], 0.0)]],
+            vec![],
+            vec![binding("", SCRIPT_RENDER, "Opacity"), param("ParamA")],
+        );
+        let (warnings, notes, recorded) = validate_after_import(&harmless);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(notes.iter().any(|n| n.contains("constant at 1, no effect")), "{notes:?}");
+        assert!(recorded.is_empty(), "{recorded:?}");
+    }
+
+    #[test]
+    fn a_model_opacity_curve_held_at_the_default_is_information_and_one_that_moves_is_not() {
+        // Constant at 1 (a streamed curve flat at 1, and a constant curve): no effect.
+        let flat = clip(
+            vec![vec![sk(0.0, [0.0; 3], 1.0), sk(1.0, [0.0; 3], 1.0)], vec![sk(0.0, [0.0; 3], 0.0)]],
+            vec![1.0],
+            vec![binding("", SCRIPT_RENDER, "Opacity"), param("ParamA"), binding("", SCRIPT_RENDER, "Opacity")],
+        );
+        let (_, report) = convert(&flat);
+        let text = report.to_string();
+        assert_eq!(report.len(), 1, "everything is one information line: {text}");
+        assert!(matches!(report.warnings()[0], Degradation::Info(_)), "{text}");
+        assert!(text.contains("2 model-opacity curve(s) constant at 1, no effect"), "{text}");
+
+        // One that fades to 0.5 would have dimmed the model.
+        let fading = clip(
+            vec![vec![sk(0.0, [0.0; 3], 1.0), sk(1.0, [0.0; 3], 0.5)], vec![sk(0.0, [0.0; 3], 0.0)]],
+            vec![],
+            vec![binding("", SCRIPT_RENDER, "Opacity"), param("ParamA")],
+        );
+        let (_, report) = convert(&fading);
+        let note = report
+            .warnings()
+            .iter()
+            .find(|w| w.to_string().contains("model-opacity"))
+            .expect("the moving curve is reported");
+        assert!(matches!(note, Degradation::Note(_)), "{report}");
     }
 
     #[test]
@@ -689,7 +877,7 @@ mod tests {
         assert_eq!(m.curves.len(), 1);
         assert_eq!(m.curves[0].target, "ParamA");
         let text = report.to_string();
-        assert_eq!(report.len(), 1, "{text}");
+        assert_eq!(report.len(), 4, "{text}");
         assert!(text.contains("3 part-opacity curve(s) ignored"), "{text}");
         assert!(text.contains("on PartArm, PartHead, 1 on a part not named in this bundle"), "{text}");
         assert!(text.contains("1 eye-blink curve(s) ignored"), "{text}");

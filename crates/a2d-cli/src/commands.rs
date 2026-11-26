@@ -301,9 +301,28 @@ pub fn validate(out: &mut dyn std::io::Write, package_dir: &Path) -> Result<bool
         }
     }
 
-    // Every report entry is a degradation, notes included, so any entry fails.
+    // `manifest.import_notes` holds only the entries the importer marked as
+    // information (the package plays as the source would). They were shown at
+    // import and never fail the check.
+    if !package.manifest.import_notes.is_empty() {
+        writeln!(out, "\nRecorded at import (information, does not fail validation):")?;
+        for note in &package.manifest.import_notes {
+            writeln!(out, "- {note}")?;
+        }
+    }
+
+    // The checks' findings decide pass or fail. They include every entry the
+    // importer recorded except information, as `recorded at import:` lines, so a
+    // dropped or approximated piece of data fails here whatever its kind.
     let report = package.validate();
-    print_report(out, &report)?;
+    if report.is_empty() {
+        writeln!(out, "\nNo problems found.")?;
+    } else {
+        writeln!(out, "\nProblems:")?;
+        for finding in report.warnings() {
+            writeln!(out, "- {finding}")?;
+        }
+    }
     Ok(report.is_empty())
 }
 
@@ -536,7 +555,7 @@ fn preview_cubism(
     frames_dir: Option<&Path>,
     flags: ViewerFlags,
 ) -> Result<(), CliError> {
-    seed_report(&package.manifest.import_warnings, &mut report, is_read_back(path));
+    seed_report(&package.manifest.recorded_at_import(), &mut report, is_read_back(path));
     if let Some(dir) = frames_dir {
         return render_cubism_frames(out, path, package, dir, report);
     }

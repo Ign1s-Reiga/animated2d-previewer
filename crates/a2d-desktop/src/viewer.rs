@@ -120,7 +120,7 @@ impl LoadedModel {
     /// Reads and decodes a package.
     pub fn load(path: &Path, report: &mut LoadReport) -> Result<LoadedModel, ViewerError> {
         let package = Package::read_from(path)?;
-        for warning in &package.manifest.import_warnings {
+        for warning in &package.manifest.recorded_at_import() {
             report.note(format!("recorded at import: {warning}"));
         }
         let ir = package

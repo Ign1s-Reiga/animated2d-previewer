@@ -409,10 +409,10 @@ pub fn validate_cubism(ir: &CubismIr, format_version: u32, textures: &[TextureFi
     // which deformers the artist faded; a fresh import reads them. An empty
     // track in a current package means the source had none, which the import
     // already reported, so only the old format is told to re-import.
-    if ir.warp_keyform_opacities.is_empty() && !ir.keyforms.warp_offsets.is_empty() {
+    if format_version < 4 && ir.warp_keyform_opacities.is_empty() && !ir.keyforms.warp_offsets.is_empty() {
         report.warn(Degradation::Note(
-            "no warp opacity track: pieces hidden by fading a warp deformer are drawn. If this package was \
-             written before format 4, re-import the source to include it"
+            "this package predates stored warp opacities (format 4): pieces hidden by fading a warp deformer are \
+             drawn; re-import the source to include them"
                 .into(),
         ));
     }

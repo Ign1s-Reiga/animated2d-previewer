@@ -102,9 +102,10 @@ fn clips_become_motions_that_target_real_parameters_and_survive_a_package() {
     }
 
     // Through the filesystem and back, then the package validation the
-    // `validate` command runs. Notes recorded at import and the repeat notes for
-    // inferred looping parameters are expected; anything else would be a real
-    // problem with the package.
+    // `validate` command runs. Entries recorded at import (repeated as
+    // `recorded at import:`; the informational notes are kept apart and never
+    // reach `validate`) and the repeat notes for inferred looping parameters are
+    // expected; anything else would be a real problem with the package.
     let dir = std::env::temp_dir().join(format!("a2d-clip-motions-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     package.write_to(&dir).expect("the package should write");
