@@ -230,8 +230,9 @@ impl GenericCubismModel {
         {
             model.start_motion(index, true, 1.0, 0.0);
         } else if model.look.is_some() {
-            // Show the rig's rest offset from the first frame, as the first
-            // update would, rather than the bare defaults until then.
+            // Apply the rig at its starting (zero) position, as the first update
+            // would, so the blend (an override of zero, say) is the same from
+            // frame 0 rather than bare defaults until then.
             model.step_physics(0.0);
             model.repose();
         }
@@ -590,8 +591,11 @@ impl AnimatedModel for GenericCubismModel {
     /// asking for the end shows the final frame. Afterwards the motion is the
     /// current one, looping, with its playhead at `time`; anything queued is
     /// dropped, as is any crossfade: the pose is the motion alone at full weight.
-    /// The synthetic idle is not applied. A look rig is posed at its rest target;
-    /// the host's driven target and the rig's smoothing are left as they were.
+    /// The synthetic idle is not applied. A look rig is posed at its settled rest
+    /// target, not at its load-time zero: playback eases in from zero, but a still
+    /// pose must depend on the timestamp alone, not on how long the model has run.
+    /// The host's driven target and the rig's smoothing in flight are left as
+    /// they were.
     fn pose_at(&mut self, animation: &str, time: f32) -> Result<(), RuntimeError> {
         let index = self
             .animations
@@ -2339,20 +2343,107 @@ mod tests {
         m.update(Duration::from_millis(16)).expect("update");
     }
 
+    /// Runs long enough (6 s) for the look rig's ease-in to have settled.
+    fn settle(m: &mut GenericCubismModel) {
+        frames(m, 375);
+    }
+
     #[test]
     fn the_rest_offset_applies_by_default_in_each_blend() {
         // Position x 0.4 * factor 10 = 4 against a keyed 5.
         for (blend, want) in [(LookBlend::Additive, 9.0), (LookBlend::Multiply, 20.0), (LookBlend::Override, 4.0)] {
             let mut m = with_look(vec![hold("Idle", "ParamAngleX", 5.0)], angle_rig(blend, (0.4, 0.0, 0.0)));
-            tick(&mut m);
+            settle(&mut m);
             assert!((value(&m, "ParamAngleX") - want).abs() < 1e-4, "{blend:?}: {}", value(&m, "ParamAngleX"));
         }
     }
 
     #[test]
+    fn playback_eases_the_look_in_from_zero() {
+        // Rest goal x 0.4, factor 10 -> +4 on a keyed 5 once settled. The first
+        // 16 ms step is compared with the SmoothDamp formula (hand-computed
+        // in look.rs's tests); at t = 0 there is no contribution.
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 5.0)], angle_rig(LookBlend::Additive, (0.4, 0.0, 0.0)));
+        // t = 0: no contribution at all.
+        assert_eq!(value(&m, "ParamAngleX"), 5.0);
+        tick(&mut m);
+        let mut v = [0.0; 3];
+        let want = crate::look::smooth_damp([0.0; 3], [0.4, 0.0, 0.0], &mut v, 0.15, 0.016)[0] * 10.0;
+        assert!(want > 0.0 && want < 0.2, "{want}");
+        assert!((value(&m, "ParamAngleX") - (5.0 + want)).abs() < 1e-5, "{}", value(&m, "ParamAngleX"));
+        // Half a second in it is most of the way, and it never overshoots.
+        let mut max = value(&m, "ParamAngleX");
+        for _ in 0..30 {
+            tick(&mut m);
+            max = max.max(value(&m, "ParamAngleX"));
+        }
+        let mid = value(&m, "ParamAngleX");
+        assert!(mid > 8.0 && mid < 9.0, "{mid}");
+        for _ in 0..345 {
+            tick(&mut m);
+            max = max.max(value(&m, "ParamAngleX"));
+        }
+        assert!(max <= 9.0 + 1e-5, "overshot: {max}");
+        assert!((value(&m, "ParamAngleX") - 9.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn pose_at_shows_the_settled_rest_whatever_the_playback_age() {
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 5.0)], angle_rig(LookBlend::Additive, (0.4, 0.0, 0.0)));
+        m.pose_at("Idle", 0.0).expect("pose");
+        assert!((value(&m, "ParamAngleX") - 9.0).abs() < 1e-5, "fresh model: {}", value(&m, "ParamAngleX"));
+        let fresh = m.pose().clone();
+        tick(&mut m);
+        let easing = value(&m, "ParamAngleX");
+        assert!(easing < 9.0);
+        m.pose_at("Idle", 0.0).expect("pose");
+        assert!((value(&m, "ParamAngleX") - 9.0).abs() < 1e-5);
+        assert_eq!(*m.pose(), fresh);
+        // The ease-in in flight is put back: playback continues from where it was.
+        tick(&mut m);
+        assert!(value(&m, "ParamAngleX") > easing && value(&m, "ParamAngleX") < 9.0);
+    }
+
+    #[test]
+    fn replaying_a_motion_does_not_restart_the_ease_in() {
+        // The SDK's controller lives beside the animator: a new clip does not reset it.
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 5.0)], angle_rig(LookBlend::Additive, (0.4, 0.0, 0.0)));
+        settle(&mut m);
+        m.play_animation("Idle", PlayOptions::default()).expect("play");
+        tick(&mut m);
+        assert!((value(&m, "ParamAngleX") - 9.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn releasing_the_target_eases_back_to_rest_not_to_zero() {
+        let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], angle_rig(LookBlend::Additive, (0.2, 0.0, 0.0)));
+        m.set_look_target(Some(a2d_core::Vec2::new(1.0, 0.0)));
+        settle(&mut m);
+        m.set_look_target(None);
+        settle(&mut m);
+        assert!((value(&m, "ParamAngleX") - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_model_loaded_from_the_same_ir_eases_in_afresh() {
+        let bytes = crate::moc3::tests::Builder::new().build();
+        let mut ir: CubismIr = Moc3::parse(&bytes).expect("should parse").into();
+        ir.parameter_repeats = None;
+        ir.motions = vec![hold("Idle", "ParamAngleX", 0.0)];
+        ir.look = Some(angle_rig(LookBlend::Additive, (0.4, 0.0, 0.0)));
+        let mut first = GenericCubismModel::load(ir.clone(), "test");
+        settle(&mut first);
+        assert!((value(&first, "ParamAngleX") - 4.0).abs() < 1e-3);
+        let mut second = GenericCubismModel::load(ir, "test");
+        assert_eq!(value(&second, "ParamAngleX"), 0.0);
+        tick(&mut second);
+        assert!(value(&second, "ParamAngleX") < 0.2);
+    }
+
+    #[test]
     fn the_result_is_clamped_to_the_parameters_range() {
         let mut m = with_look(vec![hold("Idle", "ParamAngleX", 5.0)], angle_rig(LookBlend::Additive, (10.0, 0.0, 0.0)));
-        tick(&mut m);
+        settle(&mut m);
         assert_eq!(value(&m, "ParamAngleX"), 30.0);
     }
 
@@ -2361,7 +2452,7 @@ mod tests {
         let rig =
             look_rig(LookBlend::Additive, (0.5, 0.0, 0.0), (0.1, 0.0, 0.0), &[("ParamAngleX", LookAxis::X, 10.0)]);
         let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], rig);
-        tick(&mut m);
+        settle(&mut m);
         assert!((value(&m, "ParamAngleX") - 4.0).abs() < 1e-4, "{}", value(&m, "ParamAngleX"));
     }
 
@@ -2378,7 +2469,7 @@ mod tests {
     #[test]
     fn a_driven_target_is_followed_and_released_back_to_rest() {
         let mut m = with_look(vec![hold("Idle", "ParamAngleX", 0.0)], angle_rig(LookBlend::Additive, (0.2, 0.0, 0.0)));
-        tick(&mut m);
+        settle(&mut m);
         assert!((value(&m, "ParamAngleX") - 2.0).abs() < 1e-4);
         m.set_look_target(Some(a2d_core::Vec2::new(1.0, 0.0)));
         tick(&mut m);
@@ -2452,10 +2543,13 @@ mod tests {
         let mut m = with_look(Vec::new(), rig);
         let at_load = m.values.clone();
         let pose_at_load = m.pose().clone();
-        assert!((value(&m, "ParamEyeLOpen") - 0.5).abs() < 1e-6);
+        // The rig starts at zero like the SDK's: an override of zero, not the rest offset yet.
+        assert!(value(&m, "ParamEyeLOpen").abs() < 1e-6);
         m.update(Duration::ZERO).expect("update");
         assert_eq!(m.values, at_load);
         assert_eq!(*m.pose(), pose_at_load);
+        settle(&mut m);
+        assert!((value(&m, "ParamEyeLOpen") - 0.5).abs() < 1e-4);
     }
 
     #[test]
@@ -2467,6 +2561,9 @@ mod tests {
         let mut m = queued_ramp(Some(0.5), 1.0);
         let rig = look_rig(LookBlend::Additive, (1.0, 0.0, 0.0), (0.0, 0.0, 0.0), &[("ParamExtra", LookAxis::X, 0.5)]);
         m.look = LookState::new(&rig, &m.moc.parameters);
+        if let Some(look) = &mut m.look {
+            look.rest(); // settled, so the expected values are the handover test's plus 0.5
+        }
         steps(&mut m, 6, STEP);
         assert_eq!(m.current_animation(), Some("A"));
         assert!((value(&m, "ParamExtra") - 4.25).abs() < 1e-5, "{}", value(&m, "ParamExtra"));
@@ -2488,8 +2585,8 @@ mod tests {
             look_rig(LookBlend::Override, (0.0, 0.0, 0.5), (0.0, 0.0, 0.0), &[("ParamEyeLOpen", LookAxis::Z, 1.0)]);
         let mut m = with_look(Vec::new(), rig);
         m.idle.clear();
-        tick(&mut m);
-        assert!((value(&m, "ParamEyeLOpen") - 0.5).abs() < 1e-5);
+        settle(&mut m);
+        assert!((value(&m, "ParamEyeLOpen") - 0.5).abs() < 1e-4);
     }
 
     #[test]
