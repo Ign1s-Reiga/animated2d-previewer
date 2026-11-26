@@ -60,5 +60,15 @@ fn a_real_bundle_gives_a_default_motion_and_a_handover_back_to_it_for_every_othe
         !package.manifest.recorded_at_import().iter().any(|w| w.contains("does not apply them yet")),
         "the stale note must not appear in the manifest"
     );
+    // A state with no motion that nothing reaches is information; one that may
+    // be reached stays a note. Either way the controller's report is printed.
+    let (infos, notes): (Vec<_>, Vec<_>) =
+        report.warnings().iter().partition(|d| matches!(d, a2d_core::Degradation::Info(_)));
+    let unreachable: Vec<String> =
+        infos.iter().map(|d| d.to_string()).filter(|t| t.contains("no transition reaches")).collect();
+    let reachable: Vec<String> =
+        notes.iter().map(|d| d.to_string()).filter(|t| t.contains("state(s) with no clip and no transition")).collect();
+    println!("unreachable motionless states (information): {unreachable:?}");
+    println!("possibly reachable motionless states (note): {reachable:?}");
     println!("import notes:\n{report}\nload notes:\n{text}");
 }

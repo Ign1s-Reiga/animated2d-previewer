@@ -151,14 +151,14 @@ pub(super) fn recover(
     }
 
     let mut issues: Vec<String> = Vec::new();
-    let mut motionless: Vec<String> = Vec::new();
+    let mut motionless: Vec<(usize, String)> = Vec::new();
     let mut outcomes: Vec<Outcome> = Vec::new();
     for (i, state) in states.iter().enumerate() {
         let name = state_label(i);
         let source = match motion_of(i) {
             Ok(m) => m,
             Err(NoMotion::NoClip) if state.transitions.is_empty() => {
-                motionless.push(name);
+                motionless.push((i, name));
                 continue;
             }
             Err(NoMotion::NoClip) => {
@@ -240,16 +240,57 @@ pub(super) fn recover(
         report.note(format!("controller {label:?}: {}", issues.join("; ")));
     }
     if !motionless.is_empty() {
-        // A note: such a state may still be reached (by another state's transition
-        // or an any-state transition), where the source would then play nothing,
-        // and nothing here shows it is unreachable.
-        report.note(format!(
-            "controller {label:?} has {} state(s) with no clip and no transition: {}",
-            motionless.len(),
-            motionless.join(", ")
-        ));
+        // Information only for a state nothing in the controller can enter. Any
+        // other motionless state may still be reached, where the source would
+        // play nothing, so it stays a note.
+        let (unreachable, maybe): (Vec<_>, Vec<_>) = motionless
+            .into_iter()
+            .partition(|(i, _)| unreachable_in_controller(controller, machine_index, *i, default_state));
+        if !unreachable.is_empty() {
+            let names: Vec<String> = unreachable.into_iter().map(|(_, n)| n).collect();
+            report.info(format!(
+                "controller {label:?} has {} state(s) with no motion that no transition reaches: {}; the source \
+                 enters them only when its host calls them directly, so playback is unaffected",
+                names.len(),
+                names.join(", ")
+            ));
+        }
+        if !maybe.is_empty() {
+            let names: Vec<String> = maybe.into_iter().map(|(_, n)| n).collect();
+            report.note(format!(
+                "controller {label:?} has {} state(s) with no clip and no transition: {}",
+                names.len(),
+                names.join(", ")
+            ));
+        }
     }
     out
+}
+
+/// Whether nothing in the controller can enter state `i` of machine
+/// `machine_index`: it is not the default state, and no state transition,
+/// any-state transition or selector (entry, exit or sub-state machine)
+/// transition names it. `false` whenever that cannot be told: more than one
+/// layer (the others are not read), state-machine behaviours (scripts that may
+/// drive the machine), or a machine or state that does not resolve.
+fn unreachable_in_controller(
+    controller: &AnimatorController,
+    machine_index: usize,
+    i: usize,
+    default_state: usize,
+) -> bool {
+    let Some(machine) = controller.state_machines.get(machine_index) else { return false };
+    if controller.layers.len() != 1 || i == default_state || i >= machine.states.len() {
+        return false;
+    }
+    if controller.behaviour_ranges.iter().any(|r| r.count > 0) || !controller.state_machine_behaviours.is_empty() {
+        return false;
+    }
+    let target = i as u32;
+    let by_state = machine.states.iter().flat_map(|s| s.transitions.iter()).any(|t| t.destination == target);
+    let by_any = machine.any_state_transitions.iter().any(|t| t.destination == target);
+    let by_selector = machine.selectors.iter().flat_map(|s| s.transitions.iter()).any(|t| t.destination == target);
+    !(by_state || by_any || by_selector)
 }
 
 /// The handover a single-clip state gives, `Ok(None)` when it has no
@@ -357,7 +398,8 @@ mod tests {
     use super::*;
     use a2d_core::Degradation;
     use a2d_unity::animator_controller::{
-        BlendTree, BlendTreeNode, Condition, Layer, Selector, StateMachine, Transition,
+        BehaviourRange, BlendTree, BlendTreeNode, Condition, Layer, Selector, SelectorTransition, StateMachine,
+        Transition,
     };
     use a2d_unity::PPtr;
 
@@ -669,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn motionless_states_are_summarised_in_one_note_and_those_with_transitions_are_named() {
+    fn unreachable_motionless_states_are_summarised_in_one_entry_and_those_with_transitions_are_named() {
         let c = controller(
             vec![
                 state(100, &[0], vec![]),
@@ -681,7 +723,7 @@ mod tests {
         );
         let (r, text) = run(&c, &motions(&[("Idle", 4.0)]));
         assert!(r.handovers.is_empty());
-        assert!(text.contains("2 state(s) with no clip and no transition: \"s1\", \"s3\""), "{text}");
+        assert!(text.contains("2 state(s) with no motion that no transition reaches: \"s1\", \"s3\""), "{text}");
         assert!(text.contains("\"s2\" plays no clip but has 1 transition(s)"), "{text}");
     }
 
@@ -730,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn no_controller_entry_is_information_because_the_viewer_falls_back_to_a_motion_by_name() {
+    fn no_controller_entry_is_information_except_an_unreachable_motionless_state() {
         let two = motions(&[("Idle", 4.0), ("Wave", 2.0)]);
         let one = motions(&[("Wave", 2.0)]);
         let mut all: Vec<(bool, String)> = Vec::new();
@@ -755,14 +797,12 @@ mod tests {
         let c = controller(vec![], 0);
         all.push(entry(&entries(&c, &[]), "no default state"));
 
-        // States with no clip and no transition, which another state may reach.
-        let c = controller(
-            vec![state(100, &[0], vec![]), state(101, &[], vec![]), state(102, &[], vec![transition(0, 0.75, 0.25)])],
-            1,
-        );
-        let got = entries(&c, &motions(&[("Idle", 4.0)]));
-        all.push(entry(&got, "no clip and no transition"));
-        all.push(entry(&got, "plays no clip but has 1 transition"));
+        // A motionless state with a transition of its own, and one a transition
+        // reaches.
+        let c = controller(vec![state(100, &[0], vec![]), state(101, &[], vec![transition(0, 0.75, 0.25)])], 1);
+        all.push(entry(&entries(&c, &motions(&[("Idle", 4.0)])), "plays no clip but has 1 transition"));
+        let c = controller(vec![state(100, &[0], vec![transition(1, 0.5, 0.1)]), state(101, &[], vec![])], 1);
+        all.push(entry(&entries(&c, &motions(&[("Idle", 4.0)])), "no clip and no transition"));
 
         let mut c = pair(transition(0, 0.9, 0.25));
         let layer = c.layers[0].clone();
@@ -775,6 +815,96 @@ mod tests {
         for (is_info, text) in &all {
             assert!(!is_info, "must be a failing Note: {text}");
         }
+    }
+
+    fn idle_and_empty() -> AnimatorController {
+        controller(vec![state(100, &[0], vec![]), state(101, &[], vec![])], 1)
+    }
+
+    /// The entry naming state `s1` of an `idle_and_empty`-shaped controller.
+    fn empty_state_entry(c: &AnimatorController) -> (bool, String) {
+        entry(&entries(c, &motions(&[("Idle", 4.0)])), "state(s) with no")
+    }
+
+    #[test]
+    fn a_motionless_state_nothing_reaches_is_information_and_claims_only_that() {
+        let (is_info, text) = empty_state_entry(&idle_and_empty());
+        assert!(is_info, "{text}");
+        assert!(
+            text.contains("no motion that no transition reaches") && text.contains("only when its host calls"),
+            "{text}"
+        );
+
+        // Split by reachability: s1 unreachable (information), s2 reached (note).
+        let mut c = controller(vec![state(100, &[0], vec![]), state(101, &[], vec![]), state(102, &[], vec![])], 1);
+        c.state_machines[0].states[0].transitions.push(transition(2, 0.5, 0.1));
+        let got = entries(&c, &motions(&[("Idle", 4.0)]));
+        let (info, text) = entry(&got, "no motion that no transition reaches");
+        assert!(info && text.contains("\"s1\"") && !text.contains("\"s2\""), "{text}");
+        let (note, text) = entry(&got, "no clip and no transition");
+        assert!(!note && text.contains("\"s2\"") && !text.contains("\"s1\""), "{text}");
+    }
+
+    #[test]
+    fn a_motionless_state_a_transition_reaches_stays_a_note() {
+        let mut c = idle_and_empty();
+        c.state_machines[0].states[0].transitions.push(transition(1, 0.5, 0.1));
+        let (is_info, text) = empty_state_entry(&c);
+        assert!(!is_info, "{text}");
+    }
+
+    #[test]
+    fn a_motionless_state_an_any_state_transition_reaches_stays_a_note() {
+        let mut c = idle_and_empty();
+        c.state_machines[0].any_state_transitions.push(transition(1, 0.0, 0.1));
+        let (is_info, text) = empty_state_entry(&c);
+        assert!(!is_info, "{text}");
+    }
+
+    #[test]
+    fn a_motionless_state_a_selector_reaches_stays_a_note() {
+        let mut c = idle_and_empty();
+        c.state_machines[0].selectors.push(Selector {
+            transitions: vec![SelectorTransition { destination: 1, conditions: vec![] }],
+            full_path_id: 0,
+            is_entry: true,
+        });
+        let (is_info, text) = empty_state_entry(&c);
+        assert!(!is_info, "{text}");
+    }
+
+    #[test]
+    fn a_motionless_default_state_stays_a_note() {
+        let c = controller(vec![state(100, &[], vec![]), state(101, &[0], vec![])], 1);
+        let got = entries(&c, &motions(&[("Idle", 4.0)]));
+        let (is_info, text) = entry(&got, "no clip and no transition");
+        assert!(!is_info && text.contains("\"s0\""), "{text}");
+        assert!(got.iter().all(|(info, _)| !info), "{got:?}");
+    }
+
+    #[test]
+    fn when_reachability_cannot_be_told_the_motionless_state_stays_a_note() {
+        // A second layer is not read.
+        let mut c = idle_and_empty();
+        let layer = c.layers[0].clone();
+        c.layers.push(layer);
+        let (is_info, text) = empty_state_entry(&c);
+        assert!(!is_info, "{text}");
+        // State-machine behaviours may drive the machine.
+        let mut c = idle_and_empty();
+        c.behaviour_ranges.push(BehaviourRange { state_id: 0, layer: 0, start: 0, count: 1 });
+        c.behaviour_indices.push(0);
+        c.state_machine_behaviours.push(PPtr { file_index: 0, path_id: 77 });
+        let (is_info, text) = empty_state_entry(&c);
+        assert!(!is_info, "{text}");
+        // A transition whose destination does not resolve makes the graph unreadable: the
+        // controller is reported as unresolved and no motionless state is classified at all.
+        let mut c = idle_and_empty();
+        c.state_machines[0].states[0].transitions.push(transition(9, 0.5, 0.1));
+        let got = entries(&c, &motions(&[("Idle", 4.0)]));
+        assert!(got.iter().all(|(info, _)| !info), "{got:?}");
+        assert!(got.iter().any(|(_, text)| text.contains("unresolved")), "{got:?}");
+        assert!(!got.iter().any(|(_, text)| text.contains("state(s) with no")), "{got:?}");
     }
 
     #[test]
