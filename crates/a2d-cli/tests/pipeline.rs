@@ -95,7 +95,7 @@ fn the_manifest_matches_its_committed_golden() {
     let actual = std::fs::read_to_string(package_dir.join("manifest.json")).unwrap();
     let expected = "\
 {
-  \"formatVersion\": 9,
+  \"formatVersion\": 10,
   \"modelType\": \"spine\",
   \"sourceGame\": \"generic\",
   \"sourceFormat\": \"spine-3.8\",

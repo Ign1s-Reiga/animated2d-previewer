@@ -235,6 +235,9 @@ pub struct EventData {
 /// One animated channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Timeline {
+    /// Rotation in degrees. The IR interpolates key values directly, with no
+    /// shortest-arc wrap between keys; decoders for sources that wrap between
+    /// keys must unwrap the keys before emitting this timeline.
     BoneRotate {
         bone: BoneId,
         keys: Vec<ScalarKey>,

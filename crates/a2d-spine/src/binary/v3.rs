@@ -746,6 +746,9 @@ fn read_animation(
                         let interp = if i < frames - 1 { read_curve(r)? } else { Interpolation::Linear };
                         keys.push(ScalarKey { time, value, interp });
                     }
+                    // Spine 3.x interpolates rotation along the shortest arc;
+                    // the IR (4.x shape) interpolates key values directly.
+                    crate::normalize::unwrap_rotate_keys(&mut keys);
                     anim.timelines.push(Timeline::BoneRotate { bone, keys });
                 }
                 1..=3 => {

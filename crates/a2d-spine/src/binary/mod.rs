@@ -347,8 +347,9 @@ mod tests {
         w.f32(0.0).u32(0xffff_ffff).u8(2).f32(0.25).f32(0.0).f32(0.75).f32(1.0); // bezier
         w.f32(1.0).u32(0x0000_00ff);
 
-        // Bone timelines: rotate and translate on torso.
-        w.varint(1);
+        // Bone timelines: rotate and translate on torso, then a rotate pair
+        // that crosses the 360 seam on bone 0.
+        w.varint(2);
         w.varint(1); // bone 1
         w.varint(2);
         w.u8(0); // rotate
@@ -359,6 +360,18 @@ mod tests {
         w.varint(2);
         w.f32(0.0).f32(0.0).f32(0.0).u8(1); // stepped
         w.f32(1.0).f32(5.0).f32(-5.0);
+        w.varint(0); // bone 0
+        w.varint(2);
+        w.u8(0); // rotate
+        w.varint(2);
+        w.f32(0.0).f32(10.0).u8(0); // linear
+        w.f32(0.5).f32(350.0);
+        w.u8(0); // a second rotate channel: whole turns accumulate
+        w.varint(4);
+        w.f32(0.0).f32(0.0).u8(0);
+        w.f32(0.1).f32(120.0).u8(0);
+        w.f32(0.2).f32(240.0).u8(0);
+        w.f32(0.3).f32(0.0);
 
         // IK timeline.
         w.varint(1);
@@ -606,6 +619,27 @@ mod tests {
                 assert_eq!(*bone, BoneId(1));
                 assert_eq!(keys[1].value, 90.0);
                 assert_eq!(keys[0].interp, Interpolation::Linear);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match timeline(&ir, |t| matches!(t, Timeline::BoneRotate { bone, .. } if *bone == BoneId(0))) {
+            Timeline::BoneRotate { keys, .. } => {
+                assert_eq!(keys[0].value, 10.0);
+                // 3.x interpolates the shortest arc: 10 -> 350 is a 20 degree
+                // swing back, which the IR expresses as 10 -> -10.
+                assert_eq!(keys[1].value, -10.0);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let turns: Vec<&Timeline> = ir.animations[0]
+            .timelines
+            .iter()
+            .filter(|t| matches!(t, Timeline::BoneRotate { bone, .. } if *bone == BoneId(0)))
+            .collect();
+        match turns[1] {
+            Timeline::BoneRotate { keys, .. } => {
+                let v: Vec<f32> = keys.iter().map(|k| k.value).collect();
+                assert_eq!(v, vec![0.0, 120.0, 240.0, 360.0]);
             }
             other => panic!("unexpected {other:?}"),
         }
