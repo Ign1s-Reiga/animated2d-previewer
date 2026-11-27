@@ -407,6 +407,34 @@ pub struct CubismIr {
     /// stored is read. `GenericCubismModel` applies it: at its rest target by
     /// default, following a point when the host drives it.
     pub look: Option<LookRig>,
+    /// The regions a click can land on, in the order the source lists them. An
+    /// empty list means the source declared none (or a package written before
+    /// they were stored is read).
+    pub hit_areas: Vec<HitArea>,
+}
+
+/// How a [`HitArea`]'s drawable is tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HitPrecision {
+    /// The axis-aligned rectangle around the drawable's current vertices.
+    #[default]
+    BoundingBox,
+    /// The drawable's mesh triangles.
+    Triangles,
+}
+
+/// A named, clickable region.
+///
+/// A hit area is a named drawable -- the Cubism Editor's collision ArtMesh --
+/// tested in model space against its *current deformed* vertices, so it follows
+/// the pose. The drawable is often fully transparent and must still be hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitArea {
+    /// The area's name; when empty, the drawable's ID stands in for it.
+    pub name: String,
+    /// Index into [`CubismIr::drawables`].
+    pub drawable: u32,
+    pub precision: HitPrecision,
 }
 
 /// A [`Handover`] and the motion it belongs to.

@@ -54,6 +54,11 @@ by hand-computed tests and by checks against three real models (`docs/cubism-moc
 records what established each claim and what is still unverified); there is no comparison
 against the official runtime yet (§11 cross-impl).
 
+Cubism hit areas are recovered from `CubismHitDrawable` / `CubismRaycastable` components (or, with
+none in the bundle, from a drawable whose ID is exactly `HitArea`, reported as inferred), stored in the
+package from format 11, and answered by the model's `hit_test` against the posed mesh; not checked
+against the SDK's own hit testing.
+
 Known gaps, all reported rather than silently ignored: the Spine 2.x and 4.2 binary layouts;
 for Cubism, expressions, pose and part opacity (not applied; none of the target bundles carries any, and part-opacity curves in a clip are reported by name), authored motion fades (crossfades use the host's mix duration, except hand-backs between motions that the source's animator controller states: the desktop viewer plays such an emotion once and crossfades to the default at the source's time and duration),
 multiple texture pages, and the model-level curves (opacity, eye blink,

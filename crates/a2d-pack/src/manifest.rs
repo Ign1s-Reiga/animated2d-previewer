@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 ///   them directly takes the shortest arc. `model.bin` is unchanged in layout,
 ///   but a package from before 10 may hold raw angles that play as a long
 ///   spin; `validate` notes that case. Cubism is unchanged.
-pub const FORMAT_VERSION: u32 = 10;
+/// * 11 -- Cubism `model.bin` gains its hit areas. Spine is unchanged.
+pub const FORMAT_VERSION: u32 = 11;
 
 /// Which runtime family loads this package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

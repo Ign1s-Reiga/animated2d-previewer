@@ -105,24 +105,81 @@ fn the_verified_look_rig_is_information_with_its_parameters_and_absent_drivers_a
         assert!(!notes.iter().any(|n| n.starts_with(absent)), "unexpected {absent:?} note in {notes:?}");
     }
 
-    // Hit areas are reported exactly when the bundle carries hit drawables.
-    let hit: Vec<&String> = notes.iter().filter(|n| n.starts_with("hit area components")).collect();
+    // Hit areas are recovered, not merely noted: the old "not applied" line is gone.
+    assert!(!notes.iter().any(|n| n.starts_with("hit area components")), "{notes:?}");
     let bundle = a2d_unity::Bundle::parse(&bytes).expect("the bundle should parse");
     let node = bundle.nodes.iter().find(|n| n.is_serialized()).expect("a serialized file");
     let file = a2d_unity::SerializedFile::parse(bundle.node_data(node).expect("node data")).expect("serialized file");
     let carried = a2d_unity::Inventory::build(&file).by_script("CubismHitDrawable").count();
-    match hit.as_slice() {
-        [] => assert_eq!(carried, 0, "hit drawables carried but not reported"),
-        [note] => {
-            println!("{note}");
-            assert!(carried > 0 && note.contains(&format!("CubismHitDrawable x{carried}")), "{note}");
-        }
-        _ => panic!("more than one hit area note: {notes:?}"),
+    let inferred: Vec<&a2d_core::Degradation> = report
+        .warnings()
+        .iter()
+        .filter(|w| matches!(w, a2d_core::Degradation::Info(n) if n.starts_with("hit area inferred")))
+        .collect();
+    let editor_mesh = model.drawable_ids.iter().any(|id| id == "HitArea");
+    if carried > 0 {
+        assert!(inferred.is_empty(), "components present, nothing is inferred: {notes:?}");
+        // Only real binding failures: an owner matching no drawable, or none readable.
+        let unbound = report
+            .warnings()
+            .iter()
+            .filter(|w| match w {
+                a2d_core::Degradation::MissingReference { kind, .. } => kind == "hit area drawable",
+                a2d_core::Degradation::Note(n) => n.contains("no readable owner"),
+                _ => false,
+            })
+            .count();
+        assert_eq!(model.hit_areas.len() + unbound, carried, "{notes:?}");
+    } else if editor_mesh {
+        assert_eq!(inferred.len(), 1, "{notes:?}");
+        assert_eq!(model.hit_areas.len(), 1);
+    } else {
+        assert!(inferred.is_empty() && model.hit_areas.is_empty(), "{notes:?}");
     }
+    println!("{carried} CubismHitDrawable, hit areas: {:?}", model.hit_areas);
     // The line is persisted so `validate` and `preview` show it after the bundle is gone: once, in the
     // notes when it is information, in the warnings when it is a failing note.
     let in_notes = package.manifest.import_notes.iter().filter(|w| w.starts_with("look-at rig")).count();
     let in_warnings = package.manifest.import_warnings.iter().filter(|w| w.starts_with("look-at rig")).count();
     let want = if zero_at_rest { (1, 0) } else { (0, 1) };
     assert_eq!((in_notes, in_warnings), want, "{:?}", package.manifest.recorded_at_import());
+}
+
+#[test]
+#[ignore = "needs a real asset; set A2D_FIXTURE_CUBISM to a Cubism Unity AssetBundle"]
+fn an_imported_real_bundle_has_at_least_one_hit_area_that_survives_the_package() {
+    let Some(bytes) = bundle_bytes() else { return };
+    let mut report = LoadReport::default();
+    let package = a2d_import::import_bundle(&bytes, &mut report).expect("the bundle should import");
+    let model = package.model.as_cubism().expect("a Cubism package");
+    println!("hit areas: {:?}", model.hit_areas);
+    assert!(!model.hit_areas.is_empty(), "no hit area recovered: {report}");
+    for area in &model.hit_areas {
+        assert!((area.drawable as usize) < model.drawables.len(), "{area:?}");
+    }
+    // Nothing about hit areas fails the import's own report.
+    let failing: Vec<String> = report
+        .warnings()
+        .iter()
+        .filter(|w| !matches!(w, a2d_core::Degradation::Info(_)) && w.to_string().contains("hit area"))
+        .map(|w| w.to_string())
+        .collect();
+    assert!(failing.is_empty(), "{failing:?}");
+
+    let mut inspected = LoadReport::default();
+    let inventory = a2d_import::inspect_bundle(&bytes, &mut inspected).expect("the bundle should inspect");
+    assert_eq!(inventory.hit_areas, model.hit_areas);
+
+    let dir = std::env::temp_dir().join(format!("a2d-real-hit-areas-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let package_dir = dir.join("hit.a2dpack");
+    package.write_to(&package_dir).expect("the package should write");
+    let back = a2d_pack::Package::read_from(&package_dir).expect("the package should read back");
+    assert_eq!(back.model.as_cubism().map(|m| &m.hit_areas), Some(&model.hit_areas));
+    let mut out = Vec::new();
+    a2d_cli::validate(&mut out, &package_dir).expect("validate should run");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    println!("{text}");
+    assert!(text.contains("hit areas:"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

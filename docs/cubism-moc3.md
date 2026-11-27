@@ -888,9 +888,20 @@ keeps a single rest-pose frame. Only texture page zero is sampled.
   shape and the 150/300 ms lengths are the Cubism-family convention and the
   host's choice, not read from the assets (their Unity controllers specify 0.25 s
   linear transitions back to a default state); no reference runtime was compared.
-- **Pose files, expressions, hit areas.** All live outside the MOC3 and are not
+- **Pose files and expressions.** Both live outside the MOC3 and are not
   read. (Physics is read: the rig is recovered from the bundle's physics
   controller and simulated during playback.)
+- **Hit areas: recovered from the bundle, tested against the posed mesh.** A
+  `CubismHitDrawable` on a drawable's own object marks it (bound by the object's
+  name equalling the drawable ID, as the SDK does); a `CubismRaycastable` beside
+  it gives the precision (0 bounding box, 1 triangles, per the SDK's public
+  documentation). Both bodies were read on real bundles: the hit drawable holds
+  one empty string (the field name `Name` is a guess), the raycastable one
+  `i32`. A bundle with no `CubismHitDrawable` but a drawable whose ID is exactly
+  `HitArea` (the editor's automatic collision mesh ID) gets that drawable as a
+  bounding-box area, reported as inferred. The model tests the current deformed
+  vertices and ignores opacity, since collision meshes are usually transparent.
+  Not checked against the SDK's own hit testing.
 - **Look-at rig: applied, driven only when the host asks.** Every model seen carries the
   SDK's look-at controller (additive blend, damping 0.15, a target child object)
   and four or five look parameters, each an axis and a factor on a model
