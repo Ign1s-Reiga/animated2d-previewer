@@ -14,8 +14,9 @@ use a2d_pack::Package;
 use a2d_render::{
     Camera, FrameSettings, FrameStats, GpuContext, RenderError, Renderer, Rgba8Image, SamplerConfig, Viewport,
 };
-use a2d_runtime::{GenericSpineModel, IdleDirector};
+use a2d_runtime::{pick_reaction, reaction_candidates, GenericSpineModel, IdleDirector, Rng};
 
+use crate::click::point_on_character;
 use crate::config::absolute_path;
 use crate::state::ModelEntry;
 
@@ -58,6 +59,22 @@ pub struct LoadedModel {
     pages: Vec<(String, Option<Rgba8Image>, bool, SamplerConfig)>,
     idle: IdleDirector,
     follow: Follow,
+    /// Chooses which reaction a click plays.
+    reaction_rng: Rng,
+    /// The reaction a click played last, so the next one differs.
+    last_reaction: Option<String>,
+    /// Whether the user's pick hands back in a cycle and so never settles; a
+    /// reaction would break it, so a click then does nothing.
+    cyclic_pick: bool,
+}
+
+/// The seed for the reaction choice: the name's hash mixed with the clock, so
+/// each launch plays a different order. Tests set theirs with
+/// [`LoadedModel::with_reaction_seed`].
+fn reaction_seed(name_seed: u64) -> u64 {
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    name_seed ^ nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(std::process::id()).rotate_left(32)
 }
 
 /// The box to frame a model in, from the animation it opens with.
@@ -177,6 +194,9 @@ impl LoadedModel {
             pages,
             idle,
             follow: Follow::default(),
+            reaction_rng: Rng::new(reaction_seed(seed)),
+            last_reaction: None,
+            cyclic_pick: false,
             reopenable: true,
         })
     }
@@ -207,6 +227,9 @@ impl LoadedModel {
             pages,
             idle,
             follow: Follow::default(),
+            reaction_rng: Rng::new(reaction_seed(seed)),
+            last_reaction: None,
+            cyclic_pick: false,
             reopenable: false,
         }
     }
@@ -232,10 +255,16 @@ impl LoadedModel {
         let queued = play_picked(self.model.as_mut(), name, mix)?;
         // Where the character rests: the pick, or where the pick hands back to.
         // A cycle never settles; the model's default is the best guess then.
-        let standing =
-            resting_place(self.model.as_ref(), name).or_else(|| self.model.default_animation().map(str::to_string));
-        self.follow =
-            Follow { seen: self.model.current_animation().map(str::to_string), queued, standing, held: false };
+        let resting = resting_place(self.model.as_ref(), name);
+        self.cyclic_pick = resting.is_none();
+        let standing = resting.or_else(|| self.model.default_animation().map(str::to_string));
+        self.follow = Follow {
+            seen: self.model.current_animation().map(str::to_string),
+            queued,
+            standing,
+            held: false,
+            reacting: false,
+        };
         Ok(())
     }
 
@@ -268,6 +297,79 @@ impl LoadedModel {
         Ok(())
     }
 
+    /// Replaces the seed of the reaction choice, for a reproducible order.
+    pub fn with_reaction_seed(mut self, seed: u64) -> LoadedModel {
+        self.reaction_rng = Rng::new(seed);
+        self
+    }
+
+    /// Reacts to a click at `point` (model space, as `hit_test` takes it).
+    ///
+    /// Who reacts: a model with hit areas only when the click hits one; a
+    /// model without any, when the point lies inside a triangle of the meshes
+    /// it emits now. The reaction is a random one of
+    /// [`reaction_candidates`], never the one played last, played once and then
+    /// followed by the resting animation. An animation that hands back to the
+    /// resting one by the source's own word goes through that hand-back (its
+    /// time and crossfade); any other plays once and has the resting animation
+    /// queued behind it, like an idle variation. The user's pick is untouched.
+    ///
+    /// A click while a reaction is still playing is ignored, and so is one
+    /// while `paused` (a reaction could not advance, and would play on resume).
+    /// A reaction may interrupt an idle variation or a picked one-shot: the
+    /// user's pick and the resting animation stay as they were, and the
+    /// character returns to the resting one afterwards. Returns the reaction
+    /// started, or `None` when nothing was.
+    /// Fails without touching playback when an animation cannot be started.
+    pub fn react(&mut self, point: Vec2, mix: Duration, paused: bool) -> Result<Option<String>, ViewerError> {
+        // A cyclic pick never settles, so a reaction could not hand back to
+        // it; the cycle is left to run rather than replaced by the default.
+        if paused || self.follow.reacting || self.cyclic_pick {
+            return Ok(None);
+        }
+        let hit = self.model.hit_test(point.x, point.y).map(|h| h.0);
+        if self.model.has_hit_areas() {
+            if hit.is_none() {
+                return Ok(None);
+            }
+        } else {
+            let mut list = RenderList::new();
+            self.model.emit(&mut list);
+            if !point_on_character(&list, point) {
+                return Ok(None);
+            }
+        }
+        let standing = self.follow.standing.clone().or_else(|| self.model.default_animation().map(str::to_string));
+        let Some(standing) = standing else { return Ok(None) };
+
+        let candidates = reaction_candidates(hit.as_deref(), self.model.animations(), &standing);
+        let rng = &mut self.reaction_rng;
+        let Some(pick) =
+            pick_reaction(&candidates, self.last_reaction.as_deref(), |n| rng.below(n)).map(str::to_string)
+        else {
+            return Ok(None);
+        };
+
+        // The source's hand-back is used when it ends where the character
+        // rests; one that ends elsewhere would leave it there instead.
+        let hands_back = resting_place(self.model.as_ref(), &pick).as_deref() == Some(standing.as_str())
+            && handover_of(self.model.as_ref(), &pick).is_some();
+        self.follow.queued = if hands_back {
+            play_picked(self.model.as_mut(), &pick, mix)?
+        } else {
+            start_idle_variation(self.model.as_mut(), &pick, Some(&standing), mix)?;
+            None
+        };
+        self.follow.seen = self.model.current_animation().map(str::to_string);
+        self.follow.standing = Some(standing);
+        self.follow.reacting = true;
+        // Whatever was playing is gone; the idle timer starts over once the
+        // character is back at rest.
+        self.follow.held = true;
+        self.last_reaction = Some(pick.clone());
+        Ok(Some(pick))
+    }
+
     /// Advances the model, and returns an idle variation when one is due.
     ///
     /// The caller decides what to do with it; the viewer does not queue it
@@ -279,10 +381,12 @@ impl LoadedModel {
             // model switch or a resize while paused.
             step_model(self.model.as_mut(), self.inputs.as_ref(), Duration::ZERO)?;
             self.follow.observe(self.model.as_mut());
+            self.follow.settle();
             return Ok(None);
         }
         step_model(self.model.as_mut(), self.inputs.as_ref(), dt)?;
         self.follow.observe(self.model.as_mut());
+        self.follow.settle();
         // No variation while a picked animation is still playing its pass or
         // one is under way; the timer starts over when the character is back.
         if !self.follow.at_rest() {
@@ -450,6 +554,21 @@ impl Viewer {
         mix: Duration,
     ) -> Result<(), ViewerError> {
         self.models[self.active].start_idle_variation(variation, selected, mix)
+    }
+
+    /// Reacts to a click at `cursor` (physical pixels from the client origin)
+    /// on the active model; see [`LoadedModel::react`]. A cursor that cannot
+    /// be converted to model space reacts to nothing.
+    pub fn react_to_click(
+        &mut self,
+        camera: &Camera,
+        viewport: Viewport,
+        cursor: Vec2,
+        mix: Duration,
+        paused: bool,
+    ) -> Result<Option<String>, ViewerError> {
+        let Some(point) = cursor_to_model(camera, viewport, Some(cursor)) else { return Ok(None) };
+        self.models[self.active].react(point, mix, paused)
     }
 
     /// Restarts the active model's idle timer, so a variation does not fire
@@ -669,6 +788,9 @@ struct Follow {
     standing: Option<String>,
     /// Whether the idle timer is held because something else is playing.
     held: bool,
+    /// Whether a click's reaction is still playing, from the click until the
+    /// character is back on `standing`.
+    reacting: bool,
 }
 
 impl Follow {
@@ -692,6 +814,13 @@ impl Follow {
             }
         }
         true
+    }
+
+    /// Ends the reaction once the character is back at rest.
+    fn settle(&mut self) {
+        if self.reacting && self.at_rest() {
+            self.reacting = false;
+        }
     }
 
     /// Whether the idle logic may run: nothing but the standing animation (or
@@ -943,6 +1072,16 @@ mod tests {
         /// What the model will report after its next update: the test's way of
         /// saying a takeover happened.
         next: Option<String>,
+        /// The hit area `hit_test` reports, whatever the point.
+        hit: Option<String>,
+        /// Whether the model declares hit areas.
+        areas: bool,
+        /// Whether the model emits a square body from (0,0) to (10,10).
+        body: bool,
+        /// An animation `play_animation` refuses.
+        fail: Option<String>,
+        /// The scale the model was given, which mirrors its body.
+        mirrored: bool,
     }
 
     /// A model that records what it is told and reports the animation a test
@@ -985,8 +1124,22 @@ mod tests {
             }
             Ok(())
         }
-        fn emit(&self, _out: &mut RenderList) {}
+        fn emit(&self, out: &mut RenderList) {
+            if self.log.borrow().body {
+                let (a, b) = if self.log.borrow().mirrored { (-10.0, 0.0) } else { (0.0, 10.0) };
+                let v = vec![Vec2::new(a, 0.0), Vec2::new(b, 0.0), Vec2::new(b, 10.0), Vec2::new(a, 10.0)];
+                out.push_mesh(a2d_core::RenderMesh {
+                    uvs: vec![Vec2::ZERO; 4],
+                    vertices: v,
+                    indices: vec![0, 1, 2, 2, 3, 0],
+                    ..Default::default()
+                });
+            }
+        }
         fn play_animation(&mut self, n: &str, o: PlayOptions) -> Result<(), a2d_core::RuntimeError> {
+            if self.log.borrow().fail.as_deref() == Some(n) {
+                return Err(a2d_core::RuntimeError::UnknownAnimation(n.to_string()));
+            }
             // Like a real model, a call that is not queued starts at once.
             if !o.queued {
                 self.current = Some(n.to_string());
@@ -1008,7 +1161,13 @@ mod tests {
             Aabb::EMPTY
         }
         fn hit_test(&self, _x: f32, _y: f32) -> Option<a2d_core::HitAreaId> {
-            None
+            self.log.borrow().hit.clone().map(a2d_core::HitAreaId)
+        }
+        fn has_hit_areas(&self) -> bool {
+            self.log.borrow().areas
+        }
+        fn set_scale(&mut self, scale: Vec2) {
+            self.log.borrow_mut().mirrored = scale.x < 0.0;
         }
         fn dispose(&mut self) {}
         fn display_name(&self) -> &str {
@@ -1100,7 +1259,8 @@ mod tests {
                 .with_handover_at(Duration::from_secs_f32(1.5))
                 .queued()
         );
-        let mut follow = Follow { seen: Some("bow".into()), queued, standing: Some("idle".into()), held: false };
+        let mut follow =
+            Follow { seen: Some("bow".into()), queued, standing: Some("idle".into()), held: false, reacting: false };
 
         assert!(!follow.observe(&mut model), "nothing changed yet");
         assert_eq!(log.borrow().played.len(), 2);
@@ -1125,7 +1285,8 @@ mod tests {
     fn something_other_than_the_queued_handover_taking_over_does_not_continue_a_chain() {
         let (mut model, log) = emotions();
         let queued = play_picked(&mut model, "smile", MIX).unwrap();
-        let mut follow = Follow { seen: Some("smile".into()), queued, standing: Some("idle".into()), held: false };
+        let mut follow =
+            Follow { seen: Some("smile".into()), queued, standing: Some("idle".into()), held: false, reacting: false };
         // `bow` is not what was queued.
         log.borrow_mut().next = Some("bow".into());
         model.update(FRAME).unwrap();
@@ -1214,7 +1375,7 @@ mod tests {
         assert_eq!(queued.as_deref(), Some("b"));
         let played = log.borrow().played.clone();
         assert!(played[1].1.looping, "b has no usable handover, so it loops");
-        let mut follow = Follow { seen: Some("a".into()), queued, standing: None, held: false };
+        let mut follow = Follow { seen: Some("a".into()), queued, standing: None, held: false, reacting: false };
         log.borrow_mut().next = Some("b".into());
         model.update(FRAME).unwrap();
         assert!(follow.observe(&mut model));
@@ -1453,5 +1614,257 @@ mod tests {
     fn viewer_errors_carry_their_cause() {
         let e = ViewerError::Render(RenderError::NoAdapter("headless".into()));
         assert!(e.to_string().contains("no suitable GPU adapter"), "{e}");
+    }
+
+    // ------------------------------------------------------------ click reactions
+
+    const INSIDE: Vec2 = Vec2::new(5.0, 5.0);
+    const OUTSIDE: Vec2 = Vec2::new(50.0, 50.0);
+
+    /// A loaded model at rest on `idle`, with the given mock settings.
+    fn resting(model: Scripted, log: &Rc<RefCell<Log>>, areas: bool, hit: Option<&str>, body: bool) -> LoadedModel {
+        {
+            let mut l = log.borrow_mut();
+            l.areas = areas;
+            l.hit = hit.map(str::to_string);
+            l.body = body;
+        }
+        let mut lm = loaded(model);
+        lm.play("idle", MIX).unwrap();
+        log.borrow_mut().played.clear();
+        lm
+    }
+
+    /// The model reports `name` after its next update, as a takeover would.
+    fn take_over(lm: &mut LoadedModel, log: &Rc<RefCell<Log>>, name: &str) {
+        log.borrow_mut().next = Some(name.to_string());
+        lm.update(FRAME, false).unwrap();
+    }
+
+    fn tappable() -> (Scripted, Rc<RefCell<Log>>) {
+        scripted(vec![info("idle", None), info("tap_a", None), info("tap_b", None), info("tap_c", None)])
+    }
+
+    #[test]
+    fn a_model_with_hit_areas_reacts_only_when_a_click_hits_one() {
+        let (model, log) = emotions();
+        let mut lm = resting(model, &log, true, None, true);
+        // On the body but on no hit area: nothing, even though a body is there.
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap(), None);
+        assert!(log.borrow().played.is_empty());
+
+        let (model, log) = emotions();
+        let mut lm = resting(model, &log, true, Some("Head"), false);
+        // A hit area is hit; no mesh is needed.
+        let reaction = lm.react(OUTSIDE, MIX, false).unwrap();
+        assert!(matches!(reaction.as_deref(), Some("smile" | "bow")), "{reaction:?}");
+    }
+
+    #[test]
+    fn a_hit_area_picks_the_motion_named_for_it() {
+        let (model, log) = scripted(vec![info("idle", None), info("touch_head", None), info("touch_body", None)]);
+        let mut lm = resting(model, &log, true, Some("Head"), false);
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap().as_deref(), Some("touch_head"));
+    }
+
+    #[test]
+    fn a_model_without_hit_areas_reacts_on_the_mesh_and_not_off_it() {
+        let (model, log) = tappable();
+        let mut lm = resting(model, &log, false, None, true);
+        assert_eq!(lm.react(OUTSIDE, MIX, false).unwrap(), None);
+        assert!(log.borrow().played.is_empty(), "off the character nothing starts");
+        assert!(lm.react(INSIDE, MIX, false).unwrap().is_some());
+        assert!(!log.borrow().played.is_empty());
+    }
+
+    #[test]
+    fn no_candidates_means_nothing_happens() {
+        let (model, log) = scripted(vec![info("idle", None), info("idle_b", None)]);
+        let mut lm = resting(model, &log, false, None, true);
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap(), None);
+        assert!(log.borrow().played.is_empty());
+        assert!(!lm.follow.reacting);
+    }
+
+    #[test]
+    fn a_click_during_a_reaction_is_ignored() {
+        let (model, log) = tappable();
+        let mut lm = resting(model, &log, false, None, true);
+        assert!(lm.react(INSIDE, MIX, false).unwrap().is_some());
+        let started = log.borrow().played.len();
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap(), None);
+        // Still ignored while the reaction is on screen and updates go by.
+        lm.update(FRAME, false).unwrap();
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap(), None);
+        assert_eq!(log.borrow().played.len(), started);
+    }
+
+    #[test]
+    fn a_click_during_a_picked_one_shot_reacts_and_leaves_the_pick_alone() {
+        let (model, log) = emotions();
+        let mut lm = resting(model, &log, false, None, true).with_reaction_seed(7);
+        // The user picked an emotion: it is still playing its pass.
+        lm.play("smile", MIX).unwrap();
+        log.borrow_mut().played.clear();
+        let reaction = lm.react(INSIDE, MIX, false).unwrap();
+        assert!(reaction.is_some(), "a picked one-shot may be interrupted");
+        // The resting animation is where the pick hands back to, unchanged.
+        assert_eq!(lm.follow.standing.as_deref(), Some("idle"));
+        take_over(&mut lm, &log, "idle");
+        assert_eq!(lm.shown_animation(), Some("idle"));
+        assert!(!lm.follow.reacting);
+    }
+
+    #[test]
+    fn a_click_during_an_idle_variation_reacts_and_returns_to_rest() {
+        let (model, log) = scripted(vec![info("idle", None), info("idle_b", None), info("tap", None)]);
+        let mut lm = resting(model, &log, false, None, true).with_reaction_seed(7);
+        lm.start_idle_variation("idle_b", Some("idle"), MIX).unwrap();
+        assert_eq!(lm.shown_animation(), Some("idle_b"));
+        log.borrow_mut().played.clear();
+
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap().as_deref(), Some("tap"));
+        let played = log.borrow().played.clone();
+        assert_eq!(played[0].0, "tap");
+        assert!(!played[0].1.looping && !played[0].1.queued);
+        assert_eq!(played[1].0, "idle");
+        assert!(played[1].1.looping && played[1].1.queued);
+        assert_eq!(lm.follow.standing.as_deref(), Some("idle"));
+
+        take_over(&mut lm, &log, "idle");
+        assert_eq!(lm.shown_animation(), Some("idle"));
+        assert!(!lm.follow.reacting);
+        assert!(lm.follow.at_rest());
+    }
+
+    #[test]
+    fn a_click_during_a_cyclic_pick_does_nothing_and_the_cycle_continues() {
+        let (model, log) = scripted(vec![
+            info("idle", None),
+            info("tap", None),
+            info("a", Some(("b", 1.0, 0.1))),
+            info("b", Some(("a", 1.0, 0.1))),
+        ]);
+        let mut lm = resting(model, &log, false, None, true);
+        lm.play("a", MIX).unwrap();
+        log.borrow_mut().played.clear();
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap(), None);
+        assert!(log.borrow().played.is_empty(), "the cycle is not replaced");
+        assert!(!lm.follow.reacting);
+        // Picking something that settles makes clicks work again.
+        lm.play("idle", MIX).unwrap();
+        assert!(lm.react(INSIDE, MIX, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_click_while_paused_does_nothing() {
+        let (model, log) = tappable();
+        let mut lm = resting(model, &log, false, None, true);
+        assert_eq!(lm.react(INSIDE, MIX, true).unwrap(), None);
+        assert!(log.borrow().played.is_empty());
+        assert!(!lm.follow.reacting);
+        assert!(lm.react(INSIDE, MIX, false).unwrap().is_some(), "resumed, it reacts");
+    }
+
+    #[test]
+    fn a_mirrored_model_reacts_on_the_mirrored_body_only() {
+        let (model, log) = tappable();
+        let mut lm = resting(model, &log, false, None, true);
+        lm.model.set_scale(Vec2::new(-1.0, 1.0));
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap(), None, "the un-mirrored spot is empty now");
+        assert!(lm.react(Vec2::new(-5.0, 5.0), MIX, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_failing_reaction_leaves_the_follow_state_and_last_reaction_untouched() {
+        let (model, log) = scripted(vec![info("idle", None), info("tap", None)]);
+        let mut lm = resting(model, &log, false, None, true);
+        log.borrow_mut().fail = Some("tap".into());
+        let before = format!("{:?}", lm.follow);
+        assert!(lm.react(INSIDE, MIX, false).is_err());
+        assert_eq!(format!("{:?}", lm.follow), before);
+        assert_eq!(lm.last_reaction, None);
+        assert!(!lm.follow.reacting);
+    }
+
+    #[test]
+    fn a_plain_reaction_plays_once_then_queues_the_resting_animation_and_returns_to_it() {
+        let (model, log) = tappable();
+        let mut lm = resting(model, &log, false, None, true);
+        let reaction = lm.react(INSIDE, MIX, false).unwrap().unwrap();
+        {
+            let played = log.borrow().played.clone();
+            assert_eq!(played.len(), 2);
+            assert_eq!(played[0].0, reaction);
+            assert!(!played[0].1.looping && !played[0].1.queued);
+            assert_eq!(played[1].0, "idle");
+            assert!(played[1].1.looping && played[1].1.queued);
+        }
+        assert_eq!(lm.shown_animation(), Some(reaction.as_str()));
+
+        take_over(&mut lm, &log, "idle");
+        assert_eq!(lm.shown_animation(), Some("idle"), "back on the resting animation");
+        assert!(!lm.follow.reacting);
+        assert!(lm.react(INSIDE, MIX, false).unwrap().is_some(), "and a click reacts again");
+    }
+
+    #[test]
+    fn a_hand_back_chain_reaction_follows_the_chain_back_to_rest() {
+        // The hit area's name picks `bow` alone, whatever the seed.
+        let (model, log) = emotions();
+        let mut lm = resting(model, &log, true, Some("Bow"), false);
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap().as_deref(), Some("bow"));
+        let played = log.borrow().played.clone();
+        assert_eq!(played[0].0, "bow");
+        assert!(!played[0].1.looping);
+        // The source's own hand-back: its time, its crossfade.
+        assert_eq!(played[1].0, "smile");
+        assert!(played[1].1.queued && played[1].1.handover_at.is_some());
+
+        take_over(&mut lm, &log, "smile");
+        assert!(lm.follow.reacting, "still mid-chain");
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap(), None);
+        take_over(&mut lm, &log, "idle");
+        assert_eq!(lm.shown_animation(), Some("idle"));
+        assert!(!lm.follow.reacting);
+    }
+
+    #[test]
+    fn a_direct_hand_back_reaction_returns_to_rest_at_the_sources_time() {
+        let (model, log) = emotions();
+        let mut lm = resting(model, &log, true, Some("Smile"), false);
+        assert_eq!(lm.react(INSIDE, MIX, false).unwrap().as_deref(), Some("smile"));
+        let played = log.borrow().played.clone();
+        assert_eq!(played[1].0, "idle");
+        assert_eq!(played[1].1.handover_at, Some(Duration::from_secs_f32(1.75)));
+        take_over(&mut lm, &log, "idle");
+        assert_eq!(lm.shown_animation(), Some("idle"));
+        assert!(!lm.follow.reacting);
+    }
+
+    #[test]
+    fn a_reaction_leaves_the_users_pick_and_resting_place_alone() {
+        let (model, log) = tappable();
+        let mut lm = resting(model, &log, false, None, true);
+        lm.react(INSIDE, MIX, false).unwrap();
+        assert_eq!(lm.follow.standing.as_deref(), Some("idle"));
+        take_over(&mut lm, &log, "idle");
+        assert_eq!(lm.follow.standing.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn the_random_pick_never_repeats() {
+        let (model, log) = tappable();
+        let mut lm = resting(model, &log, false, None, true);
+        let mut previous: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..60 {
+            let reaction = lm.react(INSIDE, MIX, false).unwrap().expect("reacts");
+            assert_ne!(Some(&reaction), previous.as_ref());
+            seen.insert(reaction.clone());
+            previous = Some(reaction);
+            take_over(&mut lm, &log, "idle");
+        }
+        assert_eq!(seen.len(), 3, "all of them come up");
     }
 }

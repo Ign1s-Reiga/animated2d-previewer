@@ -762,6 +762,10 @@ impl AnimatedModel for GenericCubismModel {
         out
     }
 
+    fn has_hit_areas(&self) -> bool {
+        !self.moc.hit_areas.is_empty()
+    }
+
     /// The topmost hit area under a point, in the same space as [`bounds`].
     ///
     /// The point is divided by the presentation scale back into the model's own
@@ -2922,6 +2926,14 @@ mod hit_tests {
     fn an_empty_name_falls_back_to_the_drawable_id() {
         let m = rig(&[quad(0.0, 0.0, 1.0, 1.0)], vec![area("", 0, HitPrecision::BoundingBox)]);
         assert_eq!(m.hit_test(0.5, 0.5), hit("D0"));
+    }
+
+    #[test]
+    fn has_hit_areas_follows_the_declared_areas() {
+        let with = rig(&[quad(0.0, 0.0, 1.0, 1.0)], vec![area("Head", 0, HitPrecision::BoundingBox)]);
+        assert!(with.has_hit_areas());
+        let without = rig(&[quad(0.0, 0.0, 1.0, 1.0)], Vec::new());
+        assert!(!without.has_hit_areas());
     }
 
     #[test]

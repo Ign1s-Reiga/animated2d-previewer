@@ -7,7 +7,9 @@
 #![forbid(unsafe_code)]
 
 pub mod idle;
+pub mod reaction;
 pub mod spine;
 
 pub use idle::{IdleDirector, Rng};
+pub use reaction::{pick_reaction, reaction_candidates};
 pub use spine::{AnimationState, FiredEvent, GenericSpineModel, MixBlend, SkeletonPose};

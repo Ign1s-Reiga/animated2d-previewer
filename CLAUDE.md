@@ -33,7 +33,7 @@ modes, path constraints, mixing,
 idle), `a2d-pack`, `a2d-import` (generic + spine_bytes + unity_spine; `import` turns a Unity-packaged Spine bundle into a package), `a2d-render` (wgpu, batching, blend
 modes, stencil clipping, offscreen render + read-back), `a2d-desktop` (transparent frameless
 window — on Windows through a DirectComposition surface — drag, scale, click-through,
-always-on-top, tray, config persistence, frame pacing), `a2d-cli`.
+always-on-top, tray, config persistence, frame pacing, click-to-react), `a2d-cli`.
 
 **The Spine binary 3.8 decoder is now validated against real exports.** 24 Unity-packaged
 rigs from one source decode without a single failure, and the rigs come out coherent — one
@@ -182,6 +182,7 @@ pub trait AnimatedModel {
     fn expressions(&self) -> &[ExpressionInfo];
     fn bounds(&self) -> Aabb;
     fn hit_test(&self, x: f32, y: f32) -> Option<HitAreaId>;
+    fn has_hit_areas(&self) -> bool { false }   // true when hit_test can return named areas
     fn dispose(&mut self);
 }
 ```
