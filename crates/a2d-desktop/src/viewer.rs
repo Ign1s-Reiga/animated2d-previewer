@@ -505,6 +505,20 @@ impl Viewer {
         camera: Camera,
         flip_x: bool,
     ) -> Result<FrameStats, RenderError> {
+        self.render_with_clear(view, format, viewport, camera, flip_x, Rgba::TRANSPARENT)
+    }
+
+    /// As [`render`](Viewer::render), clearing to `clear` (premultiplied)
+    /// instead of fully transparent. The window uses it for its hover tint.
+    pub fn render_with_clear(
+        &mut self,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        viewport: Viewport,
+        camera: Camera,
+        flip_x: bool,
+        clear: Rgba,
+    ) -> Result<FrameStats, RenderError> {
         let model = &mut self.models[self.active].model;
         // Idempotent with `set_frame_inputs`; kept so callers that never call it
         // (the CLI) still get the mirroring.
@@ -512,9 +526,9 @@ impl Viewer {
 
         let mut list = RenderList::new();
         model.emit(&mut list);
-        // Transparent, so the desktop shows through wherever the character does
-        // not cover.
-        let settings = FrameSettings::new(viewport, camera).with_clear_color(Rgba::TRANSPARENT);
+        // Normally transparent, so the desktop shows through wherever the
+        // character does not cover.
+        let settings = FrameSettings::new(viewport, camera).with_clear_color(clear);
         self.renderer.render(view, format, settings, &list)
     }
 }

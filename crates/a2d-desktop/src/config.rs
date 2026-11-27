@@ -12,7 +12,9 @@ use a2d_core::{DecodeError, LoadReport};
 use serde::{Deserialize, Serialize};
 
 /// Current config layout version. Bump when a field changes meaning.
-pub const CONFIG_VERSION: u32 = 1;
+///
+/// 2: `window.size` is in logical pixels (version 1 stored physical ones).
+pub const CONFIG_VERSION: u32 = 2;
 
 /// Scale limits. Below the minimum a character is invisible; above the maximum
 /// the window would exceed any real display.
@@ -38,6 +40,11 @@ pub struct WindowConfig {
     /// and absent from configs written before the option existed.
     #[serde(default)]
     pub follow_cursor: bool,
+    /// Set on load when the file is version 1, whose `size` is physical. The
+    /// window opens with it as such and writes a logical size back (version
+    /// 2). Never serialised.
+    #[serde(skip)]
+    pub size_is_physical: bool,
 }
 
 impl Default for WindowConfig {
@@ -48,6 +55,7 @@ impl Default for WindowConfig {
             always_on_top: true,
             click_through: false,
             follow_cursor: false,
+            size_is_physical: false,
         }
     }
 }
@@ -264,6 +272,9 @@ impl Config {
                 config.version
             )));
         }
+        // Version 1 stored the physical size. It stays labelled version 1 until
+        // a window has converted it, so an early save cannot mislabel it.
+        config.window.size_is_physical = config.version < 2;
         let mut report = LoadReport::new();
         config.sanitize(&mut report);
         Ok((config, report))
@@ -445,6 +456,7 @@ mod tests {
                 always_on_top: true,
                 click_through: false,
                 follow_cursor: true,
+                size_is_physical: false,
             },
             models: vec![
                 ModelConfig {
@@ -830,6 +842,36 @@ mod tests {
         assert!(!config.window.follow_cursor, "a config from before the option existed loads as off");
         assert_eq!(config.window.position, None);
         assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn a_version_1_size_is_read_as_physical_and_a_version_2_size_as_logical() {
+        let v1 = r#"{"version":1,"window":{"size":[720,960],"alwaysOnTop":true,"clickThrough":false}}"#;
+        let (old, report) = Config::from_json(v1).unwrap();
+        assert!(report.is_empty(), "{report}");
+        assert!(old.window.size_is_physical, "version 1 holds physical pixels");
+        assert_eq!(old.window.size, (720, 960));
+        assert_eq!(old.version, 1, "stays version 1 until a window converts it");
+
+        let v2 = r#"{"version":2,"window":{"size":[480,640],"alwaysOnTop":true,"clickThrough":false}}"#;
+        let (new, _) = Config::from_json(v2).unwrap();
+        assert!(!new.window.size_is_physical);
+    }
+
+    #[test]
+    fn the_migration_flag_is_never_written_and_the_current_version_is_two() {
+        assert_eq!(CONFIG_VERSION, 2);
+        let mut config = sample();
+        config.window.size_is_physical = true;
+        let json = config.to_json().unwrap();
+        assert!(!json.contains("sizeIsPhysical") && !json.contains("size_is_physical"));
+        assert!(json.contains("\"version\": 2"));
+        // Converted by the window (logical 480x640 at 1.5), saved, reloaded.
+        config.window.size = crate::edge::logical_size((720, 960), 1.5);
+        config.window.size_is_physical = false;
+        let (back, _) = Config::from_json(&config.to_json().unwrap()).unwrap();
+        assert_eq!(back.window.size, (480, 640));
+        assert!(!back.window.size_is_physical);
     }
 
     #[test]
