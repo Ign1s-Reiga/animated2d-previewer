@@ -13,13 +13,14 @@ use std::time::{Duration, Instant};
 use a2d_core::{LoadReport, Vec2};
 use a2d_render::{GpuContext, RenderError, Viewport};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId, WindowLevel};
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowId, WindowLevel};
 
-use crate::config::{absolute_path, has_manifest, is_dead_entry, Config};
+use crate::config::{absolute_path, has_manifest, is_dead_entry, Config, CONFIG_VERSION, MAX_WINDOW, MIN_WINDOW};
+use crate::edge::{self, EdgeZone};
 use crate::pacing::{FrameClock, PacingStats};
 use crate::state::{Action, ViewerState};
 use crate::tray::{Tray, TrayCommand};
@@ -177,6 +178,10 @@ pub fn run_with(
         last_present: None,
         refresh_period: None,
         cursor: None,
+        hovered: false,
+        edge_cursor: None,
+        resizing: false,
+        resize_unsupported: false,
         report: std::mem::take(report),
         exit_after: options.exit_after,
         hidden: options.hidden,
@@ -272,11 +277,13 @@ fn configure_first(target: &Target) -> Result<(wgpu::TextureFormat, wgpu::Surfac
         .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
 
     let size = target.window.inner_size();
+    let limit = target.gpu.device.limits().max_texture_dimension_2d.max(1);
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
-        width: size.width.max(1),
-        height: size.height.max(1),
+        // Never past what the device can make: wgpu would panic.
+        width: size.width.clamp(1, limit),
+        height: size.height.clamp(1, limit),
         present_mode: wgpu::PresentMode::AutoVsync,
         // Two frames in flight, kept after measuring three on a 60 Hz DX12
         // composition swapchain: 60 s runs of 3592 frames showed 2 late
@@ -341,6 +348,28 @@ fn global_cursor() -> Option<(i32, i32)> {
     None
 }
 
+fn resize_direction(zone: EdgeZone) -> ResizeDirection {
+    match zone {
+        EdgeZone::North => ResizeDirection::North,
+        EdgeZone::South => ResizeDirection::South,
+        EdgeZone::East => ResizeDirection::East,
+        EdgeZone::West => ResizeDirection::West,
+        EdgeZone::NorthEast => ResizeDirection::NorthEast,
+        EdgeZone::NorthWest => ResizeDirection::NorthWest,
+        EdgeZone::SouthEast => ResizeDirection::SouthEast,
+        EdgeZone::SouthWest => ResizeDirection::SouthWest,
+    }
+}
+
+fn cursor_icon(zone: EdgeZone) -> CursorIcon {
+    match zone {
+        EdgeZone::East | EdgeZone::West => CursorIcon::EwResize,
+        EdgeZone::North | EdgeZone::South => CursorIcon::NsResize,
+        EdgeZone::NorthEast | EdgeZone::SouthWest => CursorIcon::NeswResize,
+        EdgeZone::NorthWest | EdgeZone::SouthEast => CursorIcon::NwseResize,
+    }
+}
+
 struct App {
     /// Decoded models, moved into the viewer once a device exists.
     models: Vec<LoadedModel>,
@@ -359,6 +388,15 @@ struct App {
     /// Cursor position in physical pixels. Tracked because a drag needs it and
     /// button events do not carry it.
     cursor: Option<Vec2>,
+    /// Whether the pointer is over the window, for the hover tint.
+    hovered: bool,
+    /// The resize cursor currently set, so it is only changed on a transition.
+    edge_cursor: Option<EdgeZone>,
+    /// A native resize is in progress: no `CursorMoved` arrives meanwhile, so
+    /// the cursor icon must be left alone.
+    resizing: bool,
+    /// The platform refused a native resize; zones are off for the run.
+    resize_unsupported: bool,
     report: LoadReport,
     /// How long to run for, when a run is time-limited.
     ///
@@ -416,17 +454,26 @@ impl App {
         no_redirection_bitmap: bool,
     ) -> Result<Arc<Window>, ViewerError> {
         let (w, h) = self.config.window.size;
+        // A version-1 config holds a physical size; later ones a logical one.
+        let inner_size: winit::dpi::Size = if self.config.window.size_is_physical {
+            PhysicalSize::new(w, h).into()
+        } else {
+            LogicalSize::new(w, h).into()
+        };
         let attributes = Window::default_attributes()
             .with_title("animated2d")
             // Frameless and transparent: the character *is* the window.
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(true)
+            // A drag can then never leave what the config would clamp to.
+            .with_min_inner_size(LogicalSize::new(MIN_WINDOW, MIN_WINDOW))
+            .with_max_inner_size(LogicalSize::new(MAX_WINDOW, MAX_WINDOW))
             // Neither shown nor focused when hidden: `with_active(false)` alone
             // still shows the window, it just declines to take the focus.
             .with_visible(!self.hidden)
             .with_active(!self.hidden)
-            .with_inner_size(LogicalSize::new(w, h));
+            .with_inner_size(inner_size);
         #[cfg(windows)]
         let attributes = {
             use winit::platform::windows::WindowAttributesExtWindows;
@@ -440,6 +487,12 @@ impl App {
         );
         if let Some((x, y)) = self.config.window.position {
             window.set_outer_position(PhysicalPosition::new(x, y));
+            // The window was created on the primary monitor; moving it to one
+            // with another scale factor makes Windows rescale it. A physical
+            // size from a version-1 config is asked for again, now it is there.
+            if self.config.window.size_is_physical {
+                let _ = window.request_inner_size(PhysicalSize::new(w, h));
+            }
         }
         Ok(window)
     }
@@ -569,8 +622,10 @@ impl App {
             return;
         }
         let Some(active) = &mut self.active else { return };
-        active.surface_config.width = width;
-        active.surface_config.height = height;
+        // Never configure past what the device can make: wgpu would panic.
+        let limit = active.viewer.gpu().device.limits().max_texture_dimension_2d.max(1);
+        active.surface_config.width = width.min(limit);
+        active.surface_config.height = height.min(limit);
         active.surface.configure(&active.viewer.gpu().device, &active.surface_config);
         commit(&active.composition, &mut self.report);
     }
@@ -606,6 +661,7 @@ impl App {
         let (scale, offset, flip) = (self.state.scale(), self.state.offset(), self.state.flip_x());
         let pointer = self.pointer_in_window();
         let follow = self.state.follow_cursor();
+        let (hovered, click_through) = (self.hovered, self.state.click_through());
         let Some(active) = &mut self.active else { return };
 
         // The viewer applies these in `update` through `viewer::step_model`
@@ -652,7 +708,8 @@ impl App {
 
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let Some(active) = &mut self.active else { return };
-        if let Err(e) = active.viewer.render(&view, active.format, viewport, camera, flip) {
+        let clear = edge::clear_color(hovered, click_through, self.hidden, active.surface_config.alpha_mode);
+        if let Err(e) = active.viewer.render_with_clear(&view, active.format, viewport, camera, flip, clear) {
             self.report.note(format!("render failed: {e}"));
             return;
         }
@@ -675,6 +732,83 @@ impl App {
         // Ignored where the platform cannot do it. The state still records the
         // user's choice, so it persists and can be turned back off.
         let _ = active.window.set_cursor_hittest(!self.state.click_through());
+    }
+
+    /// The pointer in physical pixels from the client area's origin, as fresh
+    /// as the platform allows. On Windows it is read from the system now,
+    /// because no `CursorMoved` arrives during a native resize, while a stale
+    /// position would pick the wrong zone. Elsewhere it is the last event.
+    fn window_cursor(&self) -> Option<Vec2> {
+        let active = self.active.as_ref()?;
+        if let (Some(global), Ok(origin)) = (global_cursor(), active.window.inner_position()) {
+            return Some(crate::viewer::client_pointer(global, (origin.x, origin.y)));
+        }
+        self.cursor
+    }
+
+    /// The border zone under the pointer, if any.
+    fn zone_at_cursor(&self) -> Option<EdgeZone> {
+        let active = self.active.as_ref()?;
+        let cursor = self.window_cursor()?;
+        let size = active.window.inner_size();
+        edge::edge_zone(
+            (f64::from(cursor.x), f64::from(cursor.y)),
+            (size.width, size.height),
+            active.window.scale_factor(),
+            self.state.click_through() || self.resize_unsupported,
+        )
+    }
+
+    /// Applies the size limits: the configured bounds, and a maximum that the
+    /// device's largest texture caps (the surface is as big as the window).
+    fn apply_size_limits(&self) {
+        let Some(active) = &self.active else { return };
+        let scale = active.window.scale_factor();
+        let texture = active.viewer.gpu().device.limits().max_texture_dimension_2d;
+        let max = edge::max_physical_size(MAX_WINDOW, MIN_WINDOW, scale, texture);
+        active.window.set_max_inner_size(Some(PhysicalSize::new(max, max)));
+    }
+
+    /// Shows the resize cursor for the zone under the pointer, or the default
+    /// one. Only touches the window when the zone changes, and not at all during
+    /// a native resize, which owns the cursor.
+    fn update_cursor_icon(&mut self) {
+        if self.resizing {
+            return;
+        }
+        let zone = self.zone_at_cursor();
+        if zone == self.edge_cursor {
+            return;
+        }
+        self.edge_cursor = zone;
+        if let Some(active) = &self.active {
+            active.window.set_cursor(zone.map_or(CursorIcon::Default, cursor_icon));
+        }
+    }
+
+    /// Whether the pointer is over the window, requesting a redraw when that
+    /// changes so the tint appears and disappears at once.
+    ///
+    /// On Windows the pointer is polled with `GetCursorPos` against the
+    /// window's client rectangle, the same source follow-cursor uses. The
+    /// enter/leave events are not trusted there: `CursorLeft` is not sent while
+    /// a native resize or move loop owns the mouse, which would leave the tint
+    /// stuck on, and a click-through window gets none at all. Elsewhere the
+    /// last `CursorMoved` / `CursorLeft` is all there is.
+    fn update_hover(&mut self) {
+        let Some(active) = &self.active else { return };
+        let polled = match (global_cursor(), active.window.inner_position()) {
+            (Some(global), Ok(origin)) if active.window.is_minimized() != Some(true) => {
+                let size = active.window.inner_size();
+                Some(edge::point_in_rect(global, (origin.x, origin.y), (size.width, size.height)))
+            }
+            _ => None,
+        };
+        let hovered = polled.unwrap_or(self.cursor.is_some());
+        if hovered != self.hovered {
+            self.hovered = hovered;
+            active.window.request_redraw();
+        }
     }
 
     fn apply(&mut self, action: Action) {
@@ -706,6 +840,11 @@ impl App {
             TrayCommand::ToggleClickThrough => {
                 self.state.toggle_click_through();
                 self.sync_window();
+                if self.state.click_through() {
+                    // The pointer position is no longer known to be current.
+                    self.cursor = None;
+                }
+                self.update_cursor_icon();
             }
             TrayCommand::ToggleFollowCursor => {
                 self.state.toggle_follow_cursor();
@@ -767,11 +906,20 @@ impl App {
         }
         self.saved = true;
         if let Some(active) = &self.active {
-            if let Ok(position) = active.window.outer_position() {
-                self.config.window.position = Some((position.x, position.y));
-            }
+            // A minimized window reports a parked position and a 0x0 size;
+            // saving them would reopen it off-screen at the minimum size.
             let size = active.window.inner_size();
-            self.config.window.size = (size.width, size.height);
+            let usable = active.window.is_minimized() != Some(true) && size.width > 0 && size.height > 0;
+            if usable {
+                if let Ok(position) = active.window.outer_position() {
+                    self.config.window.position = Some((position.x, position.y));
+                }
+                // Logical, as `open_window` reads it back: the physical size
+                // would grow by the scale factor on every restart.
+                self.config.window.size = edge::logical_size((size.width, size.height), active.window.scale_factor());
+                self.config.window.size_is_physical = false;
+                self.config.version = CONFIG_VERSION;
+            }
         }
         self.state.write_into(&mut self.config);
         if let Err(e) = self.config.save() {
@@ -789,6 +937,7 @@ impl ApplicationHandler for App {
             Ok(active) => {
                 self.active = Some(active);
                 self.sync_window();
+                self.apply_size_limits();
             }
             Err(e) => {
                 self.failure = Some(e);
@@ -819,24 +968,69 @@ impl ApplicationHandler for App {
                 self.report.absorb(report);
                 event_loop.exit();
             }
-            WindowEvent::Resized(size) => self.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                self.resize(size.width, size.height);
+                self.update_cursor_icon();
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             // The window may now be on a display with another refresh rate.
-            WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Moved(_) => self.update_refresh(),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.update_refresh();
+                self.apply_size_limits();
+            }
+            WindowEvent::Moved(_) => self.update_refresh(),
 
             WindowEvent::CursorMoved { position, .. } => {
                 let at = Vec2::new(position.x as f32, position.y as f32);
                 self.cursor = Some(at);
+                // Moves arrive again only once the native resize has ended, so
+                // this also clears a flag whose release was never seen.
+                self.resizing = false;
                 let action = self.state.drag_to(at);
                 self.apply(action);
+                self.update_cursor_icon();
             }
             // Off Windows the last position is the only pointer source, so a
             // position from before the pointer left must not be used forever.
-            WindowEvent::CursorLeft { .. } => self.cursor = None,
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                self.update_cursor_icon();
+            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                self.state.begin_drag(self.cursor.unwrap_or(Vec2::ZERO));
+                // A press in a border zone resizes natively and never drags;
+                // anywhere else (or in click-through, which has no zones) it
+                // is the character drag, as before.
+                let mut resized = false;
+                if let (Some(zone), Some(active)) = (self.zone_at_cursor(), &self.active) {
+                    match active.window.drag_resize_window(resize_direction(zone)) {
+                        Ok(()) => resized = true,
+                        Err(e) => {
+                            // Not supported here (macOS, say): stop offering
+                            // zones and let this very press drag instead.
+                            self.resize_unsupported = true;
+                            self.report.note(format!("resizing by dragging an edge is unavailable: {e}"));
+                        }
+                    }
+                }
+                if resized {
+                    self.resizing = true;
+                } else {
+                    if self.resize_unsupported {
+                        self.update_cursor_icon();
+                    }
+                    // A fresh position, and no drag at all without one: a guess
+                    // of the origin would make the window jump by its offset.
+                    if let Some(at) = self.window_cursor() {
+                        self.state.begin_drag(at);
+                    }
+                }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                // winit posts this when the native resize loop exits.
+                if self.resizing {
+                    self.resizing = false;
+                    self.update_cursor_icon();
+                }
                 self.state.end_drag();
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -887,6 +1081,7 @@ impl ApplicationHandler for App {
             self.handle_command(TrayCommand::Quit, event_loop);
             return;
         }
+        self.update_hover();
         if self.hidden {
             // Windows delivers no `RedrawRequested` to an invisible window
             // (there is nothing to paint), so asking would leave a scripted run
@@ -895,6 +1090,46 @@ impl ApplicationHandler for App {
             self.redraw();
         } else if let Some(active) = &self.active {
             active.window.request_redraw();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_zone_resizes_in_its_own_direction() {
+        let pairs = [
+            (EdgeZone::North, ResizeDirection::North),
+            (EdgeZone::South, ResizeDirection::South),
+            (EdgeZone::East, ResizeDirection::East),
+            (EdgeZone::West, ResizeDirection::West),
+            (EdgeZone::NorthEast, ResizeDirection::NorthEast),
+            (EdgeZone::NorthWest, ResizeDirection::NorthWest),
+            (EdgeZone::SouthEast, ResizeDirection::SouthEast),
+            (EdgeZone::SouthWest, ResizeDirection::SouthWest),
+        ];
+        for (zone, direction) in pairs {
+            assert_eq!(resize_direction(zone), direction, "{zone:?}");
+        }
+    }
+
+    #[test]
+    fn every_zone_shows_the_cursor_along_its_axis() {
+        let pairs = [
+            (EdgeZone::East, CursorIcon::EwResize),
+            (EdgeZone::West, CursorIcon::EwResize),
+            (EdgeZone::North, CursorIcon::NsResize),
+            (EdgeZone::South, CursorIcon::NsResize),
+            // NE and SW lie on the "/" diagonal; NW and SE on the "\" one.
+            (EdgeZone::NorthEast, CursorIcon::NeswResize),
+            (EdgeZone::SouthWest, CursorIcon::NeswResize),
+            (EdgeZone::NorthWest, CursorIcon::NwseResize),
+            (EdgeZone::SouthEast, CursorIcon::NwseResize),
+        ];
+        for (zone, icon) in pairs {
+            assert_eq!(cursor_icon(zone), icon, "{zone:?}");
         }
     }
 }

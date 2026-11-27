@@ -16,6 +16,7 @@
 //! | --- | --- |
 //! | drag | move the character |
 //! | scroll | scale |
+//! | drag a window edge or corner | resize the window |
 //! | `Space` | pause / resume |
 //! | `Tab` | next animation |
 //! | `M` | next model |
@@ -27,6 +28,11 @@
 //!
 //! Everything above is also in the tray menu, which stays reachable when
 //! click-through is on and the window receives no mouse events.
+//!
+//! Resizing: within about 8 logical pixels of an edge (16 at a corner) the
+//! pointer becomes a resize cursor and a left press starts a native resize
+//! instead of moving the character; a faint tint shows the window's bounds
+//! while the pointer is over it. Click-through switches all of that off.
 //!
 //! # Transparency on Windows
 //!
@@ -49,6 +55,7 @@ pub mod app;
 #[cfg(windows)]
 mod composition;
 pub mod config;
+pub mod edge;
 pub mod pacing;
 pub mod state;
 pub mod tray;
