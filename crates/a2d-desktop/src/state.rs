@@ -34,10 +34,19 @@ pub struct ModelEntry {
 /// A drag in progress.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Drag {
-    /// Cursor position within the window when the drag began, in physical
+    /// Cursor position within the window when the press began, in physical
     /// pixels. The window moves so that the cursor stays over this same point.
     grab: Vec2,
+    /// How far the cursor must travel from `grab` before the press is a drag
+    /// and not a click, in physical pixels.
+    slop: f32,
+    /// Whether the cursor has travelled past `slop`. Once it has, the press is
+    /// a drag for good: coming back inside the slop does not make it a click.
+    moved: bool,
 }
+
+/// How far a press may wander and still be a click, in logical pixels.
+pub const CLICK_SLOP: f32 = 4.0;
 
 /// What the viewer should do next, decided by the state and carried out by the
 /// platform layer.
@@ -404,37 +413,57 @@ impl ViewerState {
 
     // ------------------------------------------------------------ dragging
 
-    /// Begins dragging the window from a cursor position inside it.
+    /// Arms a press at a cursor position inside the window.
+    ///
+    /// The press becomes a drag only once the cursor has moved more than
+    /// [`CLICK_SLOP`] logical pixels (`scale_factor` converts to physical)
+    /// from where it began; released before that it is a click, see
+    /// [`end_press`](ViewerState::end_press).
     ///
     /// Ignored while click-through is on, since the window receives no clicks.
-    pub fn begin_drag(&mut self, cursor: Vec2) -> bool {
+    /// The caller does not call this for a press in a resize zone, which is
+    /// never a click or a drag of the character.
+    pub fn begin_press(&mut self, cursor: Vec2, scale_factor: f32) -> bool {
         if self.click_through || !cursor.is_finite() {
             return false;
         }
-        self.drag = Some(Drag { grab: cursor });
+        let factor = if scale_factor.is_finite() && scale_factor > 0.0 { scale_factor } else { 1.0 };
+        self.drag = Some(Drag { grab: cursor, slop: CLICK_SLOP * factor, moved: false });
         true
     }
 
-    /// Continues a drag.
+    /// Continues a press.
     ///
-    /// The window moves by the cursor's displacement from where it was grabbed.
-    /// Once the window has moved, the cursor sits back over the grab point, so
-    /// the grab does not need updating — which is what keeps the character from
-    /// sliding out from under the pointer.
+    /// Nothing moves until the cursor is past the slop. From then on the
+    /// window moves by the cursor's displacement from where it was pressed (not
+    /// from where the slop was crossed). Once the window has moved, the cursor
+    /// sits back over the grab point, so the grab does not need updating --
+    /// which is what keeps the character from sliding out from under the
+    /// pointer, and from jumping when the slop is crossed.
     pub fn drag_to(&mut self, cursor: Vec2) -> Action {
-        let Some(drag) = self.drag else { return Action::None };
+        let Some(drag) = &mut self.drag else { return Action::None };
         if !cursor.is_finite() {
             return Action::None;
         }
         let delta = cursor - drag.grab;
+        if !drag.moved {
+            if delta.x.hypot(delta.y) <= drag.slop {
+                return Action::None;
+            }
+            drag.moved = true;
+        }
         if delta == Vec2::ZERO {
             return Action::None;
         }
         Action::MoveWindow(delta)
     }
 
-    pub fn end_drag(&mut self) -> bool {
-        self.drag.take().is_some()
+    /// Ends a press. Returns where it began when it was a click: the cursor
+    /// never went past the slop. `None` for a drag, and for a release with no
+    /// press behind it (a resize, click-through, a press that never armed).
+    pub fn end_press(&mut self) -> Option<Vec2> {
+        let drag = self.drag.take()?;
+        (!drag.moved).then_some(drag.grab)
     }
 }
 
@@ -683,10 +712,10 @@ mod tests {
     #[test]
     fn dragging_moves_the_window_by_the_cursor_displacement() {
         let mut s = state();
-        assert!(s.begin_drag(Vec2::new(100.0, 50.0)));
+        assert!(s.begin_press(Vec2::new(100.0, 50.0), 1.0));
         assert!(s.is_dragging());
         assert_eq!(s.drag_to(Vec2::new(110.0, 70.0)), Action::MoveWindow(Vec2::new(10.0, 20.0)));
-        assert!(s.end_drag());
+        assert_eq!(s.end_press(), None, "a drag is not a click");
         assert!(!s.is_dragging());
     }
 
@@ -695,30 +724,95 @@ mod tests {
         // The window moves under the cursor, so the cursor returns to the grab
         // point. Advancing the grab would make the character accelerate away.
         let mut s = state();
-        s.begin_drag(Vec2::new(100.0, 100.0));
+        s.begin_press(Vec2::new(100.0, 100.0), 1.0);
         assert_eq!(s.drag_to(Vec2::new(105.0, 100.0)), Action::MoveWindow(Vec2::new(5.0, 0.0)));
         assert_eq!(s.drag_to(Vec2::new(105.0, 100.0)), Action::MoveWindow(Vec2::new(5.0, 0.0)));
+    }
+
+    #[test]
+    fn a_release_under_the_slop_is_a_click_at_the_press_position() {
+        let mut s = state();
+        s.begin_press(Vec2::new(100.0, 100.0), 1.0);
+        assert_eq!(s.drag_to(Vec2::new(102.0, 101.0)), Action::None, "inside the slop the window stays put");
+        assert_eq!(s.end_press(), Some(Vec2::new(100.0, 100.0)));
+        assert!(!s.is_dragging());
+    }
+
+    #[test]
+    fn a_drag_past_the_slop_moves_from_the_press_point_without_a_jump() {
+        let mut s = state();
+        s.begin_press(Vec2::new(100.0, 100.0), 1.0);
+        assert_eq!(s.drag_to(Vec2::new(103.0, 100.0)), Action::None);
+        // Crossing the slop moves by the whole displacement from the press, so
+        // the character stays under the pointer.
+        assert_eq!(s.drag_to(Vec2::new(106.0, 100.0)), Action::MoveWindow(Vec2::new(6.0, 0.0)));
+        assert_eq!(s.drag_to(Vec2::new(130.0, 90.0)), Action::MoveWindow(Vec2::new(30.0, -10.0)));
+        assert_eq!(s.end_press(), None, "a drag is not a click");
+    }
+
+    #[test]
+    fn coming_back_inside_the_slop_after_a_drag_is_still_a_drag() {
+        let mut s = state();
+        s.begin_press(Vec2::new(100.0, 100.0), 1.0);
+        s.drag_to(Vec2::new(120.0, 100.0));
+        assert_eq!(s.drag_to(Vec2::new(101.0, 100.0)), Action::MoveWindow(Vec2::new(1.0, 0.0)));
+        assert_eq!(s.end_press(), None);
+    }
+
+    #[test]
+    fn the_slop_scales_with_the_scale_factor() {
+        let mut s = state();
+        s.begin_press(Vec2::new(0.0, 0.0), 1.5);
+        // 4 logical px at 1.5 is 6 physical: 5 is still a click, 7 is a drag.
+        assert_eq!(s.drag_to(Vec2::new(5.0, 0.0)), Action::None);
+        assert_eq!(s.end_press(), Some(Vec2::new(0.0, 0.0)));
+        s.begin_press(Vec2::new(0.0, 0.0), 1.5);
+        assert_eq!(s.drag_to(Vec2::new(7.0, 0.0)), Action::MoveWindow(Vec2::new(7.0, 0.0)));
+        // At 1.0 the same 5 px is already a drag.
+        s.begin_press(Vec2::new(0.0, 0.0), 1.0);
+        assert_eq!(s.drag_to(Vec2::new(5.0, 0.0)), Action::MoveWindow(Vec2::new(5.0, 0.0)));
+    }
+
+    #[test]
+    fn a_press_that_never_armed_is_not_a_click() {
+        // A press in a resize zone never calls `begin_press`; its release must
+        // not read as a click.
+        let mut s = state();
+        assert_eq!(s.end_press(), None);
+    }
+
+    #[test]
+    fn click_through_gives_no_click() {
+        let mut s = state();
+        s.toggle_click_through();
+        assert!(!s.begin_press(Vec2::new(10.0, 10.0), 1.0));
+        assert_eq!(s.end_press(), None);
+        // And turning it on mid-press drops the press, so no click follows.
+        let mut s = state();
+        s.begin_press(Vec2::new(10.0, 10.0), 1.0);
+        s.toggle_click_through();
+        assert_eq!(s.end_press(), None);
     }
 
     #[test]
     fn moving_without_a_drag_does_nothing() {
         let mut s = state();
         assert_eq!(s.drag_to(Vec2::new(10.0, 10.0)), Action::None);
-        assert!(!s.end_drag(), "ending a drag that never began is a no-op");
+        assert_eq!(s.end_press(), None, "ending a press that never began is a no-op");
     }
 
     #[test]
     fn a_zero_displacement_produces_no_action() {
         let mut s = state();
-        s.begin_drag(Vec2::new(10.0, 10.0));
+        s.begin_press(Vec2::new(10.0, 10.0), 1.0);
         assert_eq!(s.drag_to(Vec2::new(10.0, 10.0)), Action::None);
     }
 
     #[test]
     fn a_non_finite_cursor_is_ignored() {
         let mut s = state();
-        assert!(!s.begin_drag(Vec2::new(f32::NAN, 0.0)));
-        s.begin_drag(Vec2::new(10.0, 10.0));
+        assert!(!s.begin_press(Vec2::new(f32::NAN, 0.0), 1.0));
+        s.begin_press(Vec2::new(10.0, 10.0), 1.0);
         assert_eq!(s.drag_to(Vec2::new(f32::NAN, 10.0)), Action::None);
     }
 
@@ -738,7 +832,7 @@ mod tests {
     fn click_through_prevents_dragging() {
         let mut s = state();
         s.toggle_click_through();
-        assert!(!s.begin_drag(Vec2::new(10.0, 10.0)));
+        assert!(!s.begin_press(Vec2::new(10.0, 10.0), 1.0));
         assert!(!s.is_dragging());
     }
 
@@ -746,7 +840,7 @@ mod tests {
     fn enabling_click_through_cancels_a_drag_in_progress() {
         // Otherwise the drag could never end: no further clicks would arrive.
         let mut s = state();
-        s.begin_drag(Vec2::new(10.0, 10.0));
+        s.begin_press(Vec2::new(10.0, 10.0), 1.0);
         s.toggle_click_through();
         assert!(!s.is_dragging());
     }

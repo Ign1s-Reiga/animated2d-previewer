@@ -15,6 +15,7 @@
 //! | Input | Effect |
 //! | --- | --- |
 //! | drag | move the character |
+//! | click the character | plays a reaction motion |
 //! | scroll | scale |
 //! | drag a window edge or corner | resize the window |
 //! | `Space` | pause / resume |
@@ -28,6 +29,16 @@
 //!
 //! Everything above is also in the tray menu, which stays reachable when
 //! click-through is on and the window receives no mouse events.
+//!
+//! A click is a press released before the pointer has moved about 4 logical
+//! pixels; past that it is a drag. A model that declares hit areas reacts only
+//! when the click lands on one; a model without any reacts to a click anywhere
+//! on the visible character. The reaction is random, never the same twice in a
+//! row, ignored while one is still playing or the character is paused, and
+//! returns to the resting animation by itself. A reaction may interrupt an
+//! idle variation or a one-shot animation the user picked; the pick is kept
+//! (a pick whose hand-backs cycle is left to run instead). A model with no
+//! suitable motion does nothing.
 //!
 //! Resizing: within about 8 logical pixels of an edge (16 at a corner) the
 //! pointer becomes a resize cursor and a left press starts a native resize
@@ -52,6 +63,7 @@
 #![deny(unsafe_code)]
 
 pub mod app;
+pub mod click;
 #[cfg(windows)]
 mod composition;
 pub mod config;

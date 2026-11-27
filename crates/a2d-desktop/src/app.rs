@@ -30,6 +30,8 @@ use crate::viewer::{LoadedModel, Viewer, ViewerError};
 const MANUAL_MIX: Duration = Duration::from_millis(150);
 /// Crossfade into an idle variation.
 const IDLE_MIX: Duration = Duration::from_millis(300);
+/// The crossfade into a reaction a click starts.
+const REACTION_MIX: Duration = Duration::from_millis(200);
 /// Largest step the animation will take in one frame.
 ///
 /// Without a cap, a machine waking from sleep or a blocked event loop would
@@ -811,6 +813,19 @@ impl App {
         }
     }
 
+    /// A click on the character at `at` (physical pixels from the client
+    /// origin): plays a reaction when the model has one for it.
+    fn click(&mut self, at: Vec2) {
+        let viewport = self.viewport();
+        let (scale, offset, paused) = (self.state.scale(), self.state.offset(), self.state.is_paused());
+        let Some(active) = &mut self.active else { return };
+        let camera = active.viewer.camera(viewport, scale, offset);
+        match active.viewer.react_to_click(&camera, viewport, at, REACTION_MIX, paused) {
+            Ok(_) => {}
+            Err(e) => self.report.note(format!("reaction could not start: {e}")),
+        }
+    }
+
     fn apply(&mut self, action: Action) {
         let Action::MoveWindow(delta) = action else { return };
         let Some(active) = &self.active else { return };
@@ -1021,7 +1036,8 @@ impl ApplicationHandler for App {
                     // A fresh position, and no drag at all without one: a guess
                     // of the origin would make the window jump by its offset.
                     if let Some(at) = self.window_cursor() {
-                        self.state.begin_drag(at);
+                        let scale = self.active.as_ref().map_or(1.0, |a| a.window.scale_factor() as f32);
+                        self.state.begin_press(at, scale);
                     }
                 }
             }
@@ -1031,7 +1047,11 @@ impl ApplicationHandler for App {
                     self.resizing = false;
                     self.update_cursor_icon();
                 }
-                self.state.end_drag();
+                // A press that never went past the slop is a click; a resize
+                // press never armed one, so it cannot be.
+                if let Some(at) = self.state.end_press() {
+                    self.click(at);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let steps = match delta {

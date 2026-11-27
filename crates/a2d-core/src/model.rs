@@ -215,6 +215,16 @@ pub trait AnimatedModel {
 
     fn hit_test(&self, x: f32, y: f32) -> Option<HitAreaId>;
 
+    /// True when the model declares named hit areas that [`AnimatedModel::hit_test`]
+    /// can return.
+    ///
+    /// The viewer uses it to choose between "only a hit area reacts to a click"
+    /// (true) and "anywhere on the character reacts" (false). Default `false`,
+    /// for a model with no hit areas.
+    fn has_hit_areas(&self) -> bool {
+        false
+    }
+
     /// Releases any retained resources. Idempotent.
     fn dispose(&mut self);
 

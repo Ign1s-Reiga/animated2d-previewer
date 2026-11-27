@@ -213,6 +213,39 @@ impl AnimatedModel for GenericSpineModel {
         emit::pose_bounds(&self.pose)
     }
 
+    /// True when `hit_test` could return a bounding box in the current skin.
+    ///
+    /// `hit_test` only sees the attachment a slot shows right now, resolved
+    /// through the active skin (falling back to the default skin). So a slot
+    /// counts when its setup attachment, or a name some animation's attachment
+    /// timeline switches it to, resolves in the active skin to a bounding box
+    /// and the slot's bone exists. Boxes only in an inactive skin, or on a slot
+    /// that nothing ever shows, do not count. It is evaluated on demand, so it
+    /// follows `set_expression`.
+    ///
+    /// [`hit_test`]: AnimatedModel::hit_test
+    fn has_hit_areas(&self) -> bool {
+        use a2d_core::ir::spine::{AttachmentKind, Timeline};
+        let ir = &*self.ir;
+        let skin = self.pose.skin();
+        let is_box = |slot: SlotId, name: &str| {
+            ir.resolve_attachment(skin, slot, name)
+                .and_then(|id| ir.attachment(id))
+                .is_some_and(|a| matches!(a.kind, AttachmentKind::BoundingBox(_)))
+                && ir.slot(slot).is_some_and(|s| ir.bone(s.bone).is_some())
+        };
+        let setup = ir.slots.iter().enumerate().any(|(i, s)| {
+            SlotId::from_index(i).zip(s.setup_attachment.as_deref()).is_some_and(|(slot, name)| is_box(slot, name))
+        });
+        setup
+            || ir.animations.iter().flat_map(|a| &a.timelines).any(|t| match t {
+                Timeline::SlotAttachment { slot, keys } => {
+                    keys.iter().any(|k| k.name.as_deref().is_some_and(|n| is_box(*slot, n)))
+                }
+                _ => false,
+            })
+    }
+
     fn hit_test(&self, x: f32, y: f32) -> Option<HitAreaId> {
         let point = Vec2::new(x, y);
         // Front to back, so the topmost hit area wins.
@@ -426,6 +459,37 @@ mod tests {
         let m = model();
         assert_eq!(m.hit_test(0.0, 0.0), Some(HitAreaId("hit".into())));
         assert_eq!(m.hit_test(100.0, 100.0), None);
+    }
+
+    #[test]
+    fn has_hit_areas_agrees_with_what_hit_test_can_show() {
+        assert!(model().has_hit_areas());
+        // Box present only in the (inactive) "blue" skin: not reachable.
+        let mut ir = (*model().ir).clone();
+        ir.skins[0].entries.retain(|e| e.attachment != AttachmentId(1));
+        ir.skins[1].entries.push(SkinEntry { slot: SlotId(1), name: "hit".into(), attachment: AttachmentId(1) });
+        ir.rebuild_derived();
+        let mut m = GenericSpineModel::load(Arc::new(ir), "BlueOnly");
+        assert!(!m.has_hit_areas());
+        assert_eq!(m.hit_test(0.0, 0.0), None);
+        m.set_expression("blue").unwrap();
+        assert!(m.has_hit_areas());
+        assert_eq!(m.hit_test(0.0, 0.0), Some(HitAreaId("hit".into())));
+    }
+
+    #[test]
+    fn has_hit_areas_counts_a_box_an_animation_switches_on() {
+        let mut ir = (*model().ir).clone();
+        ir.slots[1].setup_attachment = None;
+        ir.animations[0].timelines.push(Timeline::SlotAttachment {
+            slot: SlotId(1),
+            keys: vec![a2d_core::ir::spine::AttachmentKey { time: 0.0, name: Some("hit".into()) }],
+        });
+        ir.rebuild_derived();
+        assert!(GenericSpineModel::load(Arc::new(ir.clone()), "T").has_hit_areas());
+        // Never shown at all: no setup attachment and no timeline.
+        ir.animations[0].timelines.pop();
+        assert!(!GenericSpineModel::load(Arc::new(ir), "T").has_hit_areas());
     }
 
     #[test]
