@@ -270,6 +270,9 @@ fn describe_import(
     if let Some(default) = &package.manifest.default_animation {
         writeln!(out, "  default:       {default}")?;
     }
+    if let Some(ir) = package.model.as_cubism() {
+        print_hit_areas(out, &ir.hit_areas, &ir.drawable_ids)?;
+    }
     print_report(out, report)?;
     Ok(())
 }
@@ -287,6 +290,7 @@ pub fn validate(out: &mut dyn std::io::Write, package_dir: &Path) -> Result<bool
         writeln!(out, "  physics:       {}", physics_summary(ir.physics.as_ref()))?;
         print_handovers(out, ir)?;
         print_look(out, ir.look.as_ref())?;
+        print_hit_areas(out, &ir.hit_areas, &ir.drawable_ids)?;
     }
     if let Some(ir) = package.model.as_spine() {
         // Information, not a warning: an empty animation is legitimate source
@@ -1079,6 +1083,7 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8], game: Option
 
     writeln!(out, "\n  physics:     {}", physics_summary(inventory.physics.as_ref()))?;
     print_look(out, inventory.look.as_ref())?;
+    print_hit_areas(out, &inventory.hit_areas, &inventory.drawable_ids)?;
 
     print_controllers_and_sources(out, &inventory)?;
 
@@ -1103,6 +1108,37 @@ fn inspect_unity_bundle(out: &mut dyn std::io::Write, bytes: &[u8], game: Option
         "\nThis reports what the bundle holds. `animated2d import` reconstructs a loadable \npackage from it, and `animated2d preview` opens it directly."
     )?;
     Ok(())
+}
+
+/// One line on the hit areas, shared by `import`, `inspect` and `validate`.
+/// An area with no name of its own is shown by its drawable's ID, or by the
+/// drawable's index when the caller has no IDs to look it up in (an
+/// inspected bundle whose MOC3 did not parse).
+fn print_hit_areas(
+    out: &mut dyn std::io::Write,
+    areas: &[a2d_core::ir::cubism::HitArea],
+    drawable_ids: &[String],
+) -> std::io::Result<()> {
+    use a2d_core::ir::cubism::HitPrecision;
+    if areas.is_empty() {
+        return writeln!(out, "  hit areas:   (none)");
+    }
+    let parts: Vec<String> = areas
+        .iter()
+        .map(|a| {
+            let name = if !a.name.is_empty() {
+                a.name.clone()
+            } else {
+                drawable_ids.get(a.drawable as usize).cloned().unwrap_or_else(|| format!("drawable {}", a.drawable))
+            };
+            let how = match a.precision {
+                HitPrecision::BoundingBox => "bounding box",
+                HitPrecision::Triangles => "triangles",
+            };
+            format!("{name} ({how})")
+        })
+        .collect();
+    writeln!(out, "  hit areas:   {}", parts.join(", "))
 }
 
 /// The look-at rig, shared by `inspect` and `validate`.
@@ -1223,6 +1259,38 @@ mod tests {
     use a2d_core::Degradation;
 
     #[test]
+    fn hit_areas_print_by_name_then_drawable_id_then_index() {
+        use a2d_core::ir::cubism::{HitArea, HitPrecision};
+        let area = |name: &str, drawable: u32, precision| HitArea { name: name.into(), drawable, precision };
+        let text = |areas: &[HitArea], ids: &[String]| {
+            let mut out = Vec::new();
+            print_hit_areas(&mut out, areas, ids).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            text(&[], &[]),
+            "  hit areas:   (none)
+"
+        );
+        let ids = vec!["ArtMesh1".to_string(), "HitArea".to_string()];
+        let areas = [
+            area("", 1, HitPrecision::BoundingBox),
+            area("Face", 0, HitPrecision::Triangles),
+            area("", 9, HitPrecision::BoundingBox),
+        ];
+        assert_eq!(
+            text(&areas, &ids),
+            "  hit areas:   HitArea (bounding box), Face (triangles), drawable 9 (bounding box)
+"
+        );
+        assert_eq!(
+            text(&areas[..1], &[]),
+            "  hit areas:   drawable 1 (bounding box)
+"
+        );
+    }
+
+    #[test]
     fn the_physics_summary_counts_or_says_none() {
         use a2d_core::ir::cubism::{Physics, PhysicsGroup, PhysicsInput, PhysicsOutput, PhysicsParticle};
         assert_eq!(physics_summary(None), "none");
@@ -1259,6 +1327,8 @@ mod tests {
             fade_sources: vec![],
             physics: None,
             look: None,
+            hit_areas: Vec::new(),
+            drawable_ids: Vec::new(),
         };
         let mut out = Vec::new();
         print_controllers_and_sources(&mut out, &inventory).unwrap();

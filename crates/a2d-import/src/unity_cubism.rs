@@ -32,6 +32,7 @@ mod clip_motion;
 mod drivers;
 mod fade_motion;
 mod handover;
+mod hit_area;
 mod look;
 mod physics;
 
@@ -107,6 +108,12 @@ pub struct CubismInventory {
     /// when the bundle has none or it could not be recovered; the report says
     /// which.
     pub look: Option<a2d_core::ir::cubism::LookRig>,
+    /// The hit areas bound to the model's drawables. Empty when the bundle has
+    /// none, or when the MOC3 did not parse so there was nothing to bind to.
+    pub hit_areas: Vec<a2d_core::ir::cubism::HitArea>,
+    /// The model's drawable IDs, so a hit area can be shown by the name
+    /// `hit_test` returns. Empty when the MOC3 did not parse.
+    pub drawable_ids: Vec<String>,
 }
 
 impl CubismInventory {
@@ -175,8 +182,11 @@ fn inspect_scanned(bytes: &[u8], report: &mut LoadReport) -> Result<(CubismInven
     // The same check import runs against the model, so that inspecting a bundle
     // and importing it report one outcome. A payload that does not parse is
     // import's error to report; the rig is then left as recovered.
+    let mut drawable_ids = Vec::new();
     if let Some(parsed) = moc.as_ref().and_then(|m| a2d_cubism::Moc3::parse(&m.bytes).ok()) {
         scan.validate_look(&parsed.parameters);
+        scan.resolve_hit_areas(&parsed.drawable_ids);
+        drawable_ids = parsed.drawable_ids.clone();
     }
 
     let out = CubismInventory {
@@ -193,6 +203,8 @@ fn inspect_scanned(bytes: &[u8], report: &mut LoadReport) -> Result<(CubismInven
         fade_sources,
         physics,
         look: scan.look.clone(),
+        hit_areas: scan.hit_areas.clone(),
+        drawable_ids,
     };
 
     if out.moc.is_none() {
@@ -336,6 +348,7 @@ pub fn import_bundle(bytes: &[u8], report: &mut LoadReport) -> Result<Package, D
     // naming one the model lacks would make the package writer refuse the
     // whole model); what is left is usable.
     model.look = scan.look.clone();
+    model.hit_areas = scan.hit_areas.clone();
     drivers::note_scan(&scan, report);
 
     let bundle = Bundle::parse(bytes)?;
@@ -1176,6 +1189,8 @@ mod tests {
     fn an_inventory_without_a_moc_is_not_cubism() {
         let empty = CubismInventory {
             look: None,
+            hit_areas: Vec::new(),
+            drawable_ids: Vec::new(),
             unity_revision: "2022.3".into(),
             object_count: 0,
             moc: None,

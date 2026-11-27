@@ -524,6 +524,7 @@ impl Moc3 {
                 default_motion: None,
                 handovers: Vec::new(),
                 look: None,
+                hit_areas: Vec::new(),
             },
         })
     }

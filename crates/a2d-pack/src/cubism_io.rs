@@ -49,6 +49,13 @@
 //!   its source had one, so a note would nag on every old package. Every
 //!   parameter must be one of the model's and appear once, factors and the
 //!   rest target and center are finite, and damping is finite and not negative.
+//! * Version 11: appends `hit_areas: seq`, each `name: str, drawable: u32,
+//!   precision: u8`, so a version 10 body is a prefix of a version 11 one.
+//!   Precision is 0 (bounding box) or 1 (triangles). A version 10 or older
+//!   model reads with no hit areas. No re-import note is given for an older
+//!   package: it cannot say whether its source had any, and a model without
+//!   them simply hits nothing. Every drawable index must be one of the
+//!   model's.
 //!
 //! A motion is `name: str, duration: f32, fade_in: f32, fade_out: f32,
 //! curves: seq`. A curve is `target: str, fade_in: opt f32, fade_out: opt f32,
@@ -101,6 +108,7 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     validate_repeats(ir)?;
     validate_handovers(ir)?;
     validate_look(ir)?;
+    validate_hit_areas(ir)?;
     write_canvas(w, &ir.canvas);
     w.seq(&ir.parameters, write_parameter);
     write_ids(w, &ir.part_ids);
@@ -141,6 +149,8 @@ pub fn write(w: &mut Writer, ir: &CubismIr) -> Result<(), DecodeError> {
     });
     // Added in format version 8.
     w.opt(ir.look.as_ref(), write_look);
+    // Added in format version 11.
+    w.seq(&ir.hit_areas, write_hit_area);
     Ok(())
 }
 
@@ -180,6 +190,7 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
         default_motion: None,
         handovers: Vec::new(),
         look: None,
+        hit_areas: Vec::new(),
     };
     if version >= 2 {
         ir.motions = r.seq("motion", 20, read_motion)?;
@@ -215,6 +226,9 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     if version >= 8 {
         ir.look = r.opt(read_look)?;
     }
+    if version >= 11 {
+        ir.hit_areas = r.seq("hit area", 9, read_hit_area)?;
+    }
     validate_references(&ir)?;
     validate_glues(&ir)?;
     validate_warp_opacities(&ir)?;
@@ -223,6 +237,7 @@ pub fn read(r: &mut Reader<'_>, version: u32) -> Result<CubismIr, DecodeError> {
     validate_repeats(&ir)?;
     validate_handovers(&ir)?;
     validate_look(&ir)?;
+    validate_hit_areas(&ir)?;
     Ok(ir)
 }
 
@@ -277,6 +292,42 @@ fn validate_look(ir: &CubismIr) -> Result<(), DecodeError> {
         Some(problem) => Err(DecodeError::corrupt(format!("look rig: {problem}"))),
         None => Ok(()),
     }
+}
+
+/// Every hit area must name a drawable of the model.
+fn validate_hit_areas(ir: &CubismIr) -> Result<(), DecodeError> {
+    for (i, area) in ir.hit_areas.iter().enumerate() {
+        if area.drawable as usize >= ir.drawables.len() {
+            return Err(DecodeError::corrupt(format!(
+                "hit area {i} ({:?}) names drawable {}, but the model has {}",
+                area.name,
+                area.drawable,
+                ir.drawables.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn write_hit_area(w: &mut Writer, a: &HitArea) {
+    w.str(&a.name);
+    w.u32(a.drawable);
+    w.u8(match a.precision {
+        HitPrecision::BoundingBox => 0,
+        HitPrecision::Triangles => 1,
+    });
+}
+
+fn read_hit_area(r: &mut Reader<'_>) -> Result<HitArea, DecodeError> {
+    Ok(HitArea {
+        name: r.str()?,
+        drawable: r.u32()?,
+        precision: match r.u8()? {
+            0 => HitPrecision::BoundingBox,
+            1 => HitPrecision::Triangles,
+            other => return Err(DecodeError::corrupt(format!("a hit precision is {other}, not 0 or 1"))),
+        },
+    })
 }
 
 fn write_look(w: &mut Writer, l: &LookRig) {
@@ -1025,6 +1076,7 @@ mod tests {
             default_motion: None,
             handovers: vec![],
             look: None,
+            hit_areas: Vec::new(),
             drawables: vec![
                 Drawable {
                     id: "ArtMesh1".into(),
@@ -1700,12 +1752,13 @@ mod tests {
         }
     }
 
-    /// Bytes versions 7 and 8 add after a version 6 model when it has no default
-    /// motion, no handovers and no look rig: the absent marker and an empty
-    /// count, then the absent look marker.
-    const POST_V6_TAIL: usize = 1 + 4 + 1;
+    /// Bytes versions 7, 8 and 11 add after a version 6 model when it has no
+    /// default motion, no handovers, no look rig and no hit areas: the absent
+    /// marker and an empty handover count, the absent look marker, then the
+    /// empty 4-byte hit area count.
+    const POST_V6_TAIL: usize = 1 + 4 + 1 + 4;
 
-    /// Removes the version 7 and 8 tails of a model with neither default nor handovers.
+    /// Removes the version 7, 8 and 11 tails of a model with neither default nor handovers.
     fn strip_v7_tail(bytes: &mut Vec<u8>) {
         let at = bytes.len() - POST_V6_TAIL;
         assert_eq!(&bytes[at..], &[0u8; POST_V6_TAIL], "the version 7 tail of a model with none");
@@ -2154,7 +2207,7 @@ mod tests {
         tail.f32(2.25);
         tail.f32(0.5);
         let tail = tail.into_bytes();
-        let end = bytes.len() - 1; // the absent look marker of version 8
+        let end = bytes.len() - 1 - 4; // the absent look marker of version 8 and the empty hit area count
         assert_eq!(&bytes[end - tail.len()..end], &tail[..]);
     }
 
@@ -2234,7 +2287,7 @@ mod tests {
     fn an_implausible_handover_count_is_refused_before_allocating() {
         let mut bytes = encode(&with_handovers());
         // The count precedes one handover: two 4-byte-prefixed 4-letter names, then at and mix.
-        let count_at = bytes.len() - 1 - (4 + (4 + 4) + (4 + 4) + 4 + 4);
+        let count_at = bytes.len() - 1 - 4 - (4 + (4 + 4) + (4 + 4) + 4 + 4);
         bytes[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = Package::decode_model(&bytes).expect_err("a huge count should be refused");
         assert!(err.to_string().contains("motion handover count"), "{err}");
@@ -2324,11 +2377,13 @@ mod tests {
         let mut w = Writer::new();
         write(&mut w, &with_handovers()).unwrap();
         let mut bytes = w.into_bytes();
+        assert_eq!(bytes.split_off(bytes.len() - 4), [0; 4], "the empty hit area count");
         assert_eq!(bytes.pop(), Some(0), "the absent look marker");
         let mut tail = Writer::new();
         tail.u8(1);
         look(&mut tail);
         bytes.extend(tail.into_bytes());
+        bytes.extend([0u8; 4]);
         bytes
     }
 
@@ -2365,11 +2420,11 @@ mod tests {
     }
 
     #[test]
-    fn the_current_writer_without_a_look_rig_is_the_version_7_layout_plus_one_zero_byte() {
+    fn the_current_writer_without_a_look_rig_or_hit_areas_is_the_version_7_layout_plus_five_zero_bytes() {
         let v7 = include_bytes!("../tests/fixtures/cubism_v7.model.bin");
         let now = encode(&with_handovers());
-        assert_eq!(&now[8..now.len() - 1], &v7[8..]);
-        assert_eq!(now[now.len() - 1], 0);
+        assert_eq!(&now[8..now.len() - 5], &v7[8..]);
+        assert_eq!(&now[now.len() - 5..], &[0u8; 5]);
     }
 
     #[test]
@@ -2404,7 +2459,8 @@ mod tests {
         tail.u8(1);
         raw_look(&mut tail, 0, 0.15, [0.25, -0.125, 0.5], [0.0625, 0.5, -0.75], &[(&a, 0, 0.5), (&b, 2, -2.0)]);
         let tail = tail.into_bytes();
-        assert_eq!(&bytes[bytes.len() - tail.len()..], &tail[..]);
+        let end = bytes.len() - 4; // the empty hit area count of version 11
+        assert_eq!(&bytes[end - tail.len()..end], &tail[..]);
     }
 
     #[test]
@@ -2512,10 +2568,126 @@ mod tests {
             return;
         }
         let mut bytes = encode(&with_handovers());
-        // The current writer's output minus the trailing look marker. That is what a
-        // version 7 writer wrote only while version 8 merely appends to version 7.
+        // The current writer's output minus the trailing look marker and hit area count. That is what a
+        // version 7 writer wrote only while later versions merely append to version 7.
+        assert_eq!(bytes.split_off(bytes.len() - 4), [0; 4]);
         assert_eq!(bytes.pop(), Some(0));
         bytes[4..8].copy_from_slice(&7u32.to_le_bytes());
         std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cubism_v7.model.bin"), bytes).unwrap();
+    }
+
+    // ---- Version 11: hit areas ----
+
+    fn hit_area(name: &str, drawable: u32, precision: HitPrecision) -> HitArea {
+        HitArea { name: name.into(), drawable, precision }
+    }
+
+    /// `with_look()` plus one hit area of each precision.
+    fn with_hit_areas() -> CubismIr {
+        let mut ir = with_look();
+        assert!(ir.drawables.len() >= 2, "the fixture model needs two drawables");
+        ir.hit_areas = vec![hit_area("Head", 0, HitPrecision::BoundingBox), hit_area("", 1, HitPrecision::Triangles)];
+        ir
+    }
+
+    /// The model's bytes with the (empty) hit area table replaced by `areas`
+    /// written raw, bypassing the writer's checks.
+    fn with_raw_hit_areas(areas: &[(&str, u32, u8)]) -> Vec<u8> {
+        let mut bytes = encode(&with_look());
+        assert_eq!(bytes.split_off(bytes.len() - 4), [0; 4], "the empty hit area count");
+        let mut tail = Writer::new();
+        tail.seq(areas, |w, (name, drawable, precision)| {
+            w.str(name);
+            w.u32(*drawable);
+            w.u8(*precision);
+        });
+        bytes.extend(tail.into_bytes());
+        bytes
+    }
+
+    #[test]
+    fn hit_areas_round_trip_and_re_encode_to_identical_bytes() {
+        let ir = with_hit_areas();
+        let first = encode(&ir);
+        let PackageModel::Cubism(back) = Package::decode_model(&first).expect("should decode") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert_eq!(back, ir);
+        assert_eq!(back.hit_areas.len(), 2);
+        assert_eq!(encode(&back), first);
+    }
+
+    #[test]
+    fn the_version_11_layout_is_each_hit_area_as_name_drawable_precision() {
+        let bytes = encode(&with_hit_areas());
+        let mut tail = Writer::new();
+        tail.u32(2);
+        tail.str("Head");
+        tail.u32(0);
+        tail.u8(0);
+        tail.str("");
+        tail.u32(1);
+        tail.u8(1);
+        let tail = tail.into_bytes();
+        assert_eq!(&bytes[bytes.len() - tail.len()..], &tail[..]);
+    }
+
+    #[test]
+    fn a_version_10_model_reads_with_no_hit_areas() {
+        // The version 10 layout is the current one without the hit area table.
+        let mut bytes = encode(&with_look());
+        assert_eq!(bytes.split_off(bytes.len() - 4), [0; 4]);
+        bytes[4..8].copy_from_slice(&10u32.to_le_bytes());
+        let PackageModel::Cubism(ir) = Package::decode_model(&bytes).expect("v10 must still load") else {
+            panic!("a Cubism package must decode as one")
+        };
+        assert!(ir.hit_areas.is_empty());
+        assert_eq!(ir, with_look());
+        // Version 11 over those bytes is refused: the count is missing.
+        bytes[4..8].copy_from_slice(&11u32.to_le_bytes());
+        assert!(Package::decode_model(&bytes).is_err());
+    }
+
+    #[test]
+    fn a_hit_area_naming_a_missing_drawable_is_refused_by_the_writer_and_the_reader_alike() {
+        let mut ir = with_hit_areas();
+        let count = ir.drawables.len() as u32;
+        ir.hit_areas[1].drawable = count;
+        let err = Package::from_cubism(ir, "test", "x").encode_model().expect_err("out of range");
+        assert!(matches!(err, DecodeError::Corrupt { .. }), "{err:?}");
+        assert!(err.to_string().contains("hit area"), "{err}");
+
+        let bytes = with_raw_hit_areas(&[("Head", count, 0)]);
+        let err = Package::decode_model(&bytes).expect_err("out of range");
+        assert!(matches!(err, DecodeError::Corrupt { .. }), "{err:?}");
+        assert!(err.to_string().contains("names drawable"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_hit_precision_is_refused_on_read() {
+        let bytes = with_raw_hit_areas(&[("Head", 0, 2)]);
+        let err = Package::decode_model(&bytes).expect_err("precision 2");
+        assert!(err.to_string().contains("hit precision"), "{err}");
+    }
+
+    #[test]
+    fn truncating_or_corrupting_hit_area_bytes_never_panics() {
+        let full = encode(&with_hit_areas());
+        for cut in 0..full.len() {
+            let _ = Package::decode_model(&full[..cut]);
+        }
+        for at in 8..full.len() {
+            let mut bytes = full.clone();
+            bytes[at] ^= 0xff;
+            let _ = Package::decode_model(&bytes);
+        }
+    }
+
+    #[test]
+    fn an_older_package_gets_no_note_about_missing_hit_areas() {
+        let mut old = Package::from_cubism(with_look(), "test", "x");
+        old.manifest.format_version = 10;
+        let notes: String = old.validate().warnings().iter().map(|w| w.to_string()).collect();
+        assert!(!notes.to_lowercase().contains("hit"), "{notes}");
     }
 }

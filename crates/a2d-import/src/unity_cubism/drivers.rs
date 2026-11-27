@@ -15,8 +15,8 @@
 //! package and reported as information (nothing is dropped), or, when it is not
 //! recovered, as a note that says why. Playback applies it at its rest target
 //! and follows a pointer when the host drives it.
-//! Hit areas are reported too: hit testing is not implemented, so a drawable
-//! the source marked as hittable hits nothing here.
+//! Hit areas are recovered (`hit_area.rs`) once the model's drawable ids are
+//! known, and carried into the package; what cannot be bound is reported.
 //! Components that only do bookkeeping (the parameter store, the update
 //! controller, the fade observer, render and mask controllers, a
 //! pose controller or expression controller with nothing to apply) stay
@@ -24,10 +24,11 @@
 
 use std::collections::BTreeMap;
 
-use a2d_core::ir::cubism::{LookAxis, LookBlend, LookRig, Parameter};
-use a2d_core::LoadReport;
+use a2d_core::ir::cubism::{HitArea, LookAxis, LookBlend, LookRig, Parameter};
+use a2d_core::{Degradation, LoadReport};
 use a2d_unity::{behaviour_body, behaviour_owner_name, ClassId, Inventory, SerializedFile};
 
+use super::hit_area::{self, HitScan};
 use super::look::{self, LOOK_CONTROLLER, LOOK_PARAMETER};
 const EXPRESSION_CONTROLLER: &str = "CubismExpressionController";
 const FADE_CONTROLLER: &str = "CubismFadeController";
@@ -39,7 +40,6 @@ const KINDS: &[(&str, &[&str])] = &[
     ("harmonic motion", &["CubismHarmonicMotionController", "CubismHarmonicMotionParameter"]),
     ("breath", &["CubismBreathController"]),
     ("pose part", &["CubismPosePart"]),
-    ("hit area", &["CubismHitDrawable"]),
 ];
 
 /// What a bundle's components say, apart from the bundle.
@@ -60,9 +60,25 @@ pub(super) struct Scan {
     pub look_failure: Option<String>,
     /// Reasons the recovered rig may differ from the source (see `look.rs`).
     pub look_caveats: Vec<String>,
+    /// The hit components, before they are bound to the model's drawables.
+    pub hit: HitScan,
+    /// Whether `hit` was bound (see [`Scan::resolve_hit_areas`]).
+    pub hit_resolved: bool,
+    /// The hit areas bound to the model's drawables.
+    pub hit_areas: Vec<HitArea>,
+    /// What binding reported: information, or what could not be applied.
+    pub hit_report: Vec<Degradation>,
 }
 
 impl Scan {
+    /// Binds the hit components to the model's drawable ids.
+    pub fn resolve_hit_areas(&mut self, drawable_ids: &[String]) {
+        let resolution = self.hit.resolve(drawable_ids);
+        self.hit_areas = resolution.areas;
+        self.hit_report = resolution.degradations;
+        self.hit_resolved = true;
+    }
+
     /// Checks the recovered rig against the model's parameters; a rig the
     /// model cannot use is dropped and the reason kept for the note.
     pub fn validate_look(&mut self, parameters: &[Parameter]) {
@@ -88,6 +104,9 @@ pub(super) fn note_scan(scan: &Scan, report: &mut LoadReport) {
     }
     for note in notes(scan) {
         report.note(note);
+    }
+    for d in &scan.hit_report {
+        report.warn(d.clone());
     }
 }
 
@@ -131,6 +150,7 @@ pub(super) fn scan(file: &SerializedFile, inventory: &Inventory) -> Scan {
     out.look = look.rig;
     out.look_failure = look.failure;
     out.look_caveats = look.caveats;
+    out.hit = hit_area::scan(file, inventory);
     for info in &inventory.objects {
         let Some(script) = &info.script else { continue };
         *out.classes.entry(script.class_name.clone()).or_insert(0) += 1;
@@ -254,6 +274,13 @@ pub(super) fn notes(scan: &Scan) -> Vec<String> {
             out.push(format!("{kind} components are present and not applied: {}", present.join(", ")));
         }
     }
+    if !scan.hit_resolved && !scan.hit.drawables.is_empty() {
+        out.push(format!(
+            "hit area components are present and not applied: {} {} could not be bound to drawables because the MOC3 did not parse",
+            scan.hit.drawables.len(),
+            hit_area::HIT_DRAWABLE
+        ));
+    }
     let assets = count("CubismExpressionData");
     if scan.expression_set || assets > 0 {
         let mut line = String::from("an expression list is present and not applied (expressions are not supported)");
@@ -293,7 +320,6 @@ pub(in crate::unity_cubism) mod tests {
                 ("CubismPoseController", 1),
                 ("CubismRenderController", 1),
                 ("CubismMaskController", 1),
-                ("CubismRaycastable", 1),
                 ("CubismFadeStateObserver", 1),
                 (EXPRESSION_CONTROLLER, 1),
             ],
@@ -375,7 +401,6 @@ pub(in crate::unity_cubism) mod tests {
             ("harmonic motion", "CubismHarmonicMotionController"),
             ("breath", "CubismBreathController"),
             ("pose part", "CubismPosePart"),
-            ("hit area", "CubismHitDrawable"),
         ] {
             let n = notes(&scan_of(&[(class, 3)], &[], (false, false)));
             assert_eq!(n.len(), 1, "{class}");
@@ -651,7 +676,7 @@ pub(in crate::unity_cubism) mod tests {
             got,
             [
                 "look-at rig (CubismLookController) is present and not applied: 2 look parameter(s) drive [ParamAngleX], 1 with no readable owner; not recovered: the controller's owner is unreadable: a component has no local owner",
-                "hit area components are present and not applied: CubismHitDrawable x1",
+                "hit area components are present and not applied: 1 CubismHitDrawable could not be bound to drawables because the MOC3 did not parse",
             ]
         );
     }

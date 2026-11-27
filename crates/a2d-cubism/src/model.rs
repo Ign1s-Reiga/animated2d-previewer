@@ -130,6 +130,44 @@ impl Fade {
     }
 }
 
+/// Whether a point lies in the axis-aligned box around `points`, edges
+/// included. Non-finite vertices are ignored; no finite vertex means no hit.
+fn in_bounding_box(points: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let mut any = false;
+    for (px, py) in points.iter().filter(|(a, b)| a.is_finite() && b.is_finite()) {
+        lo_x = lo_x.min(*px);
+        hi_x = hi_x.max(*px);
+        lo_y = lo_y.min(*py);
+        hi_y = hi_y.max(*py);
+        any = true;
+    }
+    any && x >= lo_x && x <= hi_x && y >= lo_y && y <= hi_y
+}
+
+/// Whether a point lies in any triangle of the mesh, edges included, whichever
+/// way the triangle winds. Out-of-range indices and degenerate triangles are
+/// skipped.
+fn in_triangles(points: &[(f32, f32)], indices: &[u16], x: f32, y: f32) -> bool {
+    indices.chunks_exact(3).any(|tri| {
+        let (Some(a), Some(b), Some(c)) =
+            (points.get(tri[0] as usize), points.get(tri[1] as usize), points.get(tri[2] as usize))
+        else {
+            return false;
+        };
+        let side = |p: &(f32, f32), q: &(f32, f32)| (q.0 - p.0) * (y - p.1) - (q.1 - p.1) * (x - p.0);
+        let area = (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
+        if area == 0.0 || !area.is_finite() {
+            return false;
+        }
+        let (d1, d2, d3) = (side(a, b), side(b, c), side(c, a));
+        // Inside (edges included) when no two of the signs oppose each other.
+        let negative = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+        let positive = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+        !(negative && positive) && d1.is_finite() && d2.is_finite() && d3.is_finite()
+    })
+}
+
 /// A Cubism model, posed and drawable.
 pub struct GenericCubismModel {
     /// The normalized model. A MOC3 is one way to obtain it and a package is
@@ -724,11 +762,44 @@ impl AnimatedModel for GenericCubismModel {
         out
     }
 
-    fn hit_test(&self, _x: f32, _y: f32) -> Option<HitAreaId> {
-        // Once hit areas exist, a point must be divided by `self.scale` into the
-        // model's own space before it is tested.
-        // Cubism hit areas are named drawables listed in the model settings,
-        // which live outside the MOC3 and are not read yet.
+    /// The topmost hit area under a point, in the same space as [`bounds`].
+    ///
+    /// The point is divided by the presentation scale back into the model's own
+    /// space (which also undoes a mirror) and tested against each hit area's
+    /// drawable as currently posed, front to back in paint order. Opacity is
+    /// ignored on purpose: collision meshes are usually transparent.
+    ///
+    /// [`bounds`]: AnimatedModel::bounds
+    fn hit_test(&self, x: f32, y: f32) -> Option<HitAreaId> {
+        if self.moc.hit_areas.is_empty() {
+            return None;
+        }
+        let (sx, sy) = (self.scale.x, self.scale.y);
+        if !(sx.is_finite() && sy.is_finite() && sx != 0.0 && sy != 0.0) {
+            return None;
+        }
+        let (px, py) = (x / sx, y / sy);
+        if !(px.is_finite() && py.is_finite()) {
+            return None;
+        }
+        let order =
+            crate::emit::paint_sequence_of(self.moc.drawables.len(), &self.pose.draw_orders, &self.moc.draw_order);
+        for &index in order.iter().rev() {
+            for area in self.moc.hit_areas.iter().filter(|a| a.drawable as usize == index) {
+                let (Some(drawable), Some(points)) = (self.moc.drawables.get(index), self.pose.drawables.get(index))
+                else {
+                    continue;
+                };
+                let hit = match area.precision {
+                    a2d_core::ir::cubism::HitPrecision::BoundingBox => in_bounding_box(points, px, py),
+                    a2d_core::ir::cubism::HitPrecision::Triangles => in_triangles(points, &drawable.indices, px, py),
+                };
+                if hit {
+                    let name = if area.name.is_empty() { drawable.id.clone() } else { area.name.clone() };
+                    return Some(HitAreaId(name));
+                }
+            }
+        }
         None
     }
 
@@ -2730,5 +2801,165 @@ mod tests {
             seen
         };
         assert_eq!(run(false), run(true));
+    }
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::*;
+    use a2d_core::ir::cubism::{Drawable, HitArea, HitPrecision};
+
+    type Shape = (Vec<(f32, f32)>, Vec<u16>);
+
+    fn drawable(id: &str, indices: Vec<u16>) -> Drawable {
+        Drawable {
+            id: id.into(),
+            parent_deformer: None,
+            uvs: Vec::new(),
+            indices,
+            keyform_begin: 0,
+            keyform_count: 0,
+            keyform_binding: 0,
+            masks: Vec::new(),
+            flags: 0,
+            part: None,
+            texture: 0,
+        }
+    }
+
+    fn area(name: &str, drawable: u32, precision: HitPrecision) -> HitArea {
+        HitArea { name: name.into(), drawable, precision }
+    }
+
+    /// A model whose drawables are posed exactly as given. Drawable `i` is
+    /// described by the vertices and indices at `shapes[i]`.
+    fn rig(shapes: &[Shape], hit_areas: Vec<HitArea>) -> GenericCubismModel {
+        let drawables: Vec<Drawable> =
+            shapes.iter().enumerate().map(|(i, (_, idx))| drawable(&format!("D{i}"), idx.clone())).collect();
+        let ir = CubismIr { drawables, hit_areas, ..CubismIr::default() };
+        let mut m = GenericCubismModel::load(ir, "hit");
+        m.pose = Pose {
+            drawables: shapes.iter().map(|(p, _)| p.clone()).collect(),
+            opacities: vec![0.0; shapes.len()],
+            draw_orders: vec![500.0; shapes.len()],
+            unstable: Vec::new(),
+        };
+        m
+    }
+
+    fn quad(x0: f32, y0: f32, x1: f32, y1: f32) -> Shape {
+        (vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)], vec![0, 1, 2, 0, 2, 3])
+    }
+
+    fn hit(name: &str) -> Option<HitAreaId> {
+        Some(HitAreaId(name.into()))
+    }
+
+    #[test]
+    fn a_quad_hit_area_hits_inside_and_on_its_edge_but_not_outside() {
+        // Fully transparent (opacity 0 in `rig`) and still hit.
+        let m = rig(&[quad(-1.0, -1.0, 1.0, 1.0)], vec![area("Head", 0, HitPrecision::Triangles)]);
+        assert_eq!(m.hit_test(0.0, 0.0), hit("Head"));
+        assert_eq!(m.hit_test(1.0, 0.5), hit("Head"));
+        assert_eq!(m.hit_test(-1.0, -1.0), hit("Head"));
+        assert_eq!(m.hit_test(1.01, 0.0), None);
+        assert_eq!(m.hit_test(0.0, -1.5), None);
+    }
+
+    #[test]
+    fn a_mirrored_scale_maps_the_point_back_into_model_space() {
+        let mut m = rig(&[quad(0.0, 0.0, 2.0, 2.0)], vec![area("Head", 0, HitPrecision::BoundingBox)]);
+        m.set_scale(a2d_core::Vec2::new(-1.0, 1.0));
+        assert_eq!(m.hit_test(-1.0, 1.0), hit("Head"));
+        assert_eq!(m.hit_test(1.0, 1.0), None);
+    }
+
+    #[test]
+    fn a_non_uniform_scale_is_divided_out_per_axis() {
+        let mut m = rig(&[quad(0.0, 0.0, 2.0, 2.0)], vec![area("Head", 0, HitPrecision::BoundingBox)]);
+        m.set_scale(a2d_core::Vec2::new(2.0, 0.5));
+        // The box is drawn at x 0..4, y 0..1.
+        assert_eq!(m.hit_test(3.5, 0.9), hit("Head"));
+        assert_eq!(m.hit_test(3.5, 1.1), None);
+        assert_eq!(m.hit_test(4.1, 0.5), None);
+    }
+
+    #[test]
+    fn bounding_box_and_triangles_differ_on_a_triangle() {
+        let tri = (vec![(0.0, 0.0), (2.0, 0.0), (0.0, 2.0)], vec![0, 1, 2]);
+        let boxed = rig(std::slice::from_ref(&tri), vec![area("A", 0, HitPrecision::BoundingBox)]);
+        let exact = rig(&[tri], vec![area("A", 0, HitPrecision::Triangles)]);
+        // Inside the AABB, past the hypotenuse.
+        assert_eq!(boxed.hit_test(1.8, 1.8), hit("A"));
+        assert_eq!(exact.hit_test(1.8, 1.8), None);
+        assert_eq!(exact.hit_test(0.5, 0.5), hit("A"));
+        // On the hypotenuse itself.
+        assert_eq!(exact.hit_test(1.0, 1.0), hit("A"));
+    }
+
+    #[test]
+    fn triangles_accept_either_winding() {
+        let cw = (vec![(0.0, 0.0), (0.0, 2.0), (2.0, 0.0)], vec![0, 1, 2]);
+        let m = rig(&[cw], vec![area("A", 0, HitPrecision::Triangles)]);
+        assert_eq!(m.hit_test(0.5, 0.5), hit("A"));
+        assert_eq!(m.hit_test(1.8, 1.8), None);
+    }
+
+    #[test]
+    fn the_front_hit_area_in_paint_order_wins() {
+        let shapes = [quad(0.0, 0.0, 2.0, 2.0), quad(1.0, 1.0, 3.0, 3.0)];
+        let areas = vec![area("Back", 0, HitPrecision::BoundingBox), area("Front", 1, HitPrecision::BoundingBox)];
+        let mut m = rig(&shapes, areas);
+        // Equal draw orders and no tie list: the later index is painted last.
+        assert_eq!(m.hit_test(1.5, 1.5), hit("Front"));
+        assert_eq!(m.hit_test(0.5, 0.5), hit("Back"));
+        // Raising drawable 0's draw order puts it in front.
+        m.pose.draw_orders = vec![600.0, 500.0];
+        assert_eq!(m.hit_test(1.5, 1.5), hit("Back"));
+    }
+
+    #[test]
+    fn an_empty_name_falls_back_to_the_drawable_id() {
+        let m = rig(&[quad(0.0, 0.0, 1.0, 1.0)], vec![area("", 0, HitPrecision::BoundingBox)]);
+        assert_eq!(m.hit_test(0.5, 0.5), hit("D0"));
+    }
+
+    #[test]
+    fn no_hit_areas_means_no_hit() {
+        let m = rig(&[quad(0.0, 0.0, 1.0, 1.0)], Vec::new());
+        assert_eq!(m.hit_test(0.5, 0.5), None);
+    }
+
+    #[test]
+    fn an_out_of_range_drawable_index_is_a_miss_not_a_panic() {
+        let m = rig(&[quad(0.0, 0.0, 1.0, 1.0)], vec![area("Gone", 7, HitPrecision::Triangles)]);
+        assert_eq!(m.hit_test(0.5, 0.5), None);
+    }
+
+    #[test]
+    fn a_zero_scale_is_a_miss() {
+        let mut m = rig(&[quad(0.0, 0.0, 1.0, 1.0)], vec![area("A", 0, HitPrecision::BoundingBox)]);
+        m.set_scale(a2d_core::Vec2::new(0.0, 1.0));
+        assert_eq!(m.hit_test(0.5, 0.5), None);
+    }
+
+    #[test]
+    fn setting_a_nan_scale_keeps_the_previous_scale() {
+        let mut m = rig(&[quad(0.0, 0.0, 1.0, 1.0)], vec![area("A", 0, HitPrecision::BoundingBox)]);
+        m.set_scale(a2d_core::Vec2::new(2.0, 2.0));
+        m.set_scale(a2d_core::Vec2::new(1.0, f32::NAN));
+        // Still drawn at 2x: the box is 0..2.
+        assert_eq!(m.hit_test(1.5, 1.5), hit("A"));
+        assert_eq!(m.hit_test(2.5, 1.5), None);
+    }
+
+    #[test]
+    fn a_non_finite_scale_field_is_a_miss_not_a_panic() {
+        // `set_scale` refuses such a value, so the guard is reached by writing the field.
+        let mut m = rig(&[quad(0.0, 0.0, 1.0, 1.0)], vec![area("A", 0, HitPrecision::BoundingBox)]);
+        for scale in [a2d_core::Vec2::new(f32::NAN, 1.0), a2d_core::Vec2::new(1.0, f32::INFINITY)] {
+            m.scale = scale;
+            assert_eq!(m.hit_test(0.5, 0.5), None);
+        }
     }
 }

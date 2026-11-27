@@ -392,6 +392,15 @@ pub fn validate_cubism(ir: &CubismIr, format_version: u32, textures: &[TextureFi
     if ir.drawables.is_empty() {
         report.warn(Degradation::Note("the model has no drawables, so nothing will be seen".into()));
     }
+    // The reader refuses such an index, so this only sees an IR built in memory.
+    for area in &ir.hit_areas {
+        if area.drawable as usize >= ir.drawables.len() {
+            report.warn(Degradation::MissingReference {
+                kind: "hit area drawable".into(),
+                name: format!("{} (drawable {})", area.name, area.drawable),
+            });
+        }
+    }
     if ir.parameters.is_empty() {
         report.warn(Degradation::Note("the model has no parameters, so it cannot be animated".into()));
     }
@@ -1016,6 +1025,25 @@ mod tests {
         assert!(text.contains("missing path constraint bone: pc"), "{text}");
         assert!(text.contains("missing path constraint target slot: pc"), "{text}");
         assert!(text.contains("missing transform constraint bone"), "{text}");
+    }
+
+    #[test]
+    fn a_hit_area_naming_a_missing_drawable_is_reported() {
+        use a2d_core::ir::cubism::{CubismIr, HitArea, HitPrecision};
+        let area = |drawable| HitArea { name: "Head".into(), drawable, precision: HitPrecision::BoundingBox };
+        let mut ir = CubismIr { hit_areas: vec![area(3)], ..CubismIr::default() };
+        let mut report = LoadReport::new();
+        validate_cubism(&ir, crate::FORMAT_VERSION, &[], &mut report);
+        assert!(
+            report.warnings().iter().any(|w| matches!(w, Degradation::MissingReference { kind, name }
+                if kind == "hit area drawable" && name.contains("Head") && name.contains('3'))),
+            "{report}"
+        );
+        // In range: no such finding.
+        ir.hit_areas = vec![];
+        let mut clean = LoadReport::new();
+        validate_cubism(&ir, crate::FORMAT_VERSION, &[], &mut clean);
+        assert!(!clean.to_string().contains("hit area"), "{clean}");
     }
 
     #[test]
